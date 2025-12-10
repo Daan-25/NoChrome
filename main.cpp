@@ -1,6 +1,9 @@
 #include <SDL.h>
 #include <SDL_ttf.h>
 
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
 #include <iostream>
 #include <string>
 #include <sstream>
@@ -93,7 +96,7 @@ static Url parseUrl(const std::string& input) {
         u.port = std::stoi(u.host.substr(colon + 1));
         u.host = u.host.substr(0, colon);
     } else {
-        u.port = 80;
+        u.port = (u.scheme == "https") ? 443 : 80;
     }
 
     if (u.path.empty()) u.path = "/";
@@ -155,6 +158,149 @@ static void closeSock(int s) {
     close(s);
 #endif
 }
+
+// -------------------- TLS (OpenSSL) --------------------
+
+static void sslInitOnce() {
+    static bool inited = false;
+    if (inited) return;
+    OPENSSL_init_ssl(0, nullptr);
+    inited = true;
+}
+
+static void configureDefaultCa(SSL_CTX* ctx) {
+#ifdef __APPLE__
+    // Homebrew OpenSSL ships its own CA bundle on many setups
+    const char* brewCa = "/opt/homebrew/etc/openssl@3/cert.pem";
+    if (FILE* f = fopen(brewCa, "rb")) {
+        fclose(f);
+        if (SSL_CTX_load_verify_locations(ctx, brewCa, nullptr) == 1) {
+            return;
+        }
+    }
+#endif
+    SSL_CTX_set_default_verify_paths(ctx);
+}
+
+static int openTcpSocket(const std::string& host, int port) {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    addrinfo* res = nullptr;
+    std::string portStr = std::to_string(port);
+
+    if (getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res) != 0) {
+        throw std::runtime_error("getaddrinfo failed");
+    }
+
+    int sock = -1;
+    for (addrinfo* p = res; p != nullptr; p = p->ai_next) {
+        sock = (int)::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (sock < 0) continue;
+
+        if (connect(sock, p->ai_addr, (int)p->ai_addrlen) == 0) {
+            break;
+        }
+        closeSock(sock);
+        sock = -1;
+    }
+
+    freeaddrinfo(res);
+
+    if (sock < 0) {
+        throw std::runtime_error("connect failed");
+    }
+
+    return sock;
+}
+
+static std::string httpsGet(const Url& u) {
+    sslInitOnce();
+
+    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) {
+        throw std::runtime_error("SSL_CTX_new failed");
+    }
+
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nullptr);
+    configureDefaultCa(ctx);
+
+    int sock = -1;
+    SSL* ssl = nullptr;
+
+    try {
+        sock = openTcpSocket(u.host, u.port);
+
+        ssl = SSL_new(ctx);
+        if (!ssl) {
+            throw std::runtime_error("SSL_new failed");
+        }
+
+        // SNI is required for many modern hosts
+        SSL_set_tlsext_host_name(ssl, u.host.c_str());
+
+        if (SSL_set_fd(ssl, sock) != 1) {
+            throw std::runtime_error("SSL_set_fd failed");
+        }
+
+        if (SSL_connect(ssl) != 1) {
+            unsigned long err = ERR_get_error();
+            std::string msg = err ? ERR_error_string(err, nullptr) : "SSL_connect failed";
+            throw std::runtime_error(msg);
+        }
+
+        long verify = SSL_get_verify_result(ssl);
+        if (verify != X509_V_OK) {
+            throw std::runtime_error("TLS certificate verification failed");
+        }
+
+        std::ostringstream req;
+        req << "GET " << u.path << " HTTP/1.1\r\n"
+            << "Host: " << u.host << "\r\n"
+            << "User-Agent: TinyGuiBrowser/0.4\r\n"
+            << "Connection: close\r\n\r\n";
+
+        std::string request = req.str();
+
+        int written = 0;
+        while (written < (int)request.size()) {
+            int n = SSL_write(ssl, request.data() + written, (int)request.size() - written);
+            if (n <= 0) {
+                throw std::runtime_error("SSL_write failed");
+            }
+            written += n;
+        }
+
+        std::string response;
+        char buffer[4096];
+
+        while (true) {
+            int n = SSL_read(ssl, buffer, (int)sizeof(buffer));
+            if (n <= 0) break;
+            response.append(buffer, buffer + n);
+        }
+
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+        ssl = nullptr;
+
+        closeSock(sock);
+        sock = -1;
+
+        SSL_CTX_free(ctx);
+        ctx = nullptr;
+
+        return response;
+
+    } catch (...) {
+        if (ssl) SSL_free(ssl);
+        if (sock >= 0) closeSock(sock);
+        if (ctx) SSL_CTX_free(ctx);
+        throw;
+    }
+}
+
 
 static std::string httpGet(const Url& u) {
     addrinfo hints{};
@@ -1104,24 +1250,30 @@ struct Page {
     std::vector<LinkHit> linkHits;
 };
 
+
 static std::string loadPageBody(const std::string& urlString, Url& outUrl) {
     std::string normalized = normalizeUserUrl(urlString);
     outUrl = parseUrl(normalized);
 
-    if (outUrl.scheme != "http") {
-        return "<h2>HTTPS not supported</h2><p>This engine currently supports only http.</p>";
-    }
-
     try {
         netInit();
-        std::string resp = httpGet(outUrl);
+
+        std::string resp;
+        if (outUrl.scheme == "https") {
+            resp = httpsGet(outUrl);
+        } else {
+            resp = httpGet(outUrl);
+        }
+
         netCleanup();
         return extractBody(resp);
+
     } catch (const std::exception& ex) {
         netCleanup();
         return std::string("<h2>Network error</h2><p>") + ex.what() + "</p>";
     }
 }
+
 
 static void rebuildLayout(
     Page& page,
@@ -1340,13 +1492,6 @@ int main(int argc, char** argv) {
 
                                 std::string abs = resolveHref(page.baseUrl, hit.href);
                                 if (abs.empty()) break;
-
-                                if (startsWith(abs, "https://")) {
-                                    page.body = "<h2>HTTPS not supported</h2><p>This engine currently supports only http.</p>";
-                                    rebuildLayout(page, renderer, fonts, contentWidth, padding, lineHeight);
-                                    break;
-                                }
-
                                 loadUrlIntoPage(abs);
                                 scrollYf = 0;
                                 clampScroll();

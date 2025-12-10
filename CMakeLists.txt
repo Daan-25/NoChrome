@@ -6,6 +6,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(HOMEBREW_PREFIX "/opt/homebrew")
 
+# OpenSSL (Homebrew)
+set(OPENSSL_ROOT_DIR "${HOMEBREW_PREFIX}/opt/openssl@3")
+find_package(OpenSSL REQUIRED)
+
+
 # SDL2 include
 find_path(SDL2_INCLUDE_DIR
     NAMES SDL.h
@@ -46,4 +51,6 @@ target_include_directories(TinyGuiBrowser PRIVATE
 target_link_libraries(TinyGuiBrowser PRIVATE
     ${SDL2_LIBRARY}
     ${SDL2TTF_LIBRARY}
+    OpenSSL::SSL
+    OpenSSL::Crypto
 )
