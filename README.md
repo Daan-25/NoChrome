@@ -2,7 +2,7 @@
 
 A from-scratch browser project in C++ with SDL2 and SDL2_ttf.
 
-**Goal:** evolve this project into a fully working browser over time — built step by step without embedding Chromium/WebKit.  
+**Goal:** evolve this project into a fully working browser over time, built step by step without embedding Chromium/WebKit.  
 The current implementation is an early prototype of the rendering and UI pipeline.
 
 ## Current Features
