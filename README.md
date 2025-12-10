@@ -53,10 +53,11 @@ cmake -S . -B build
 cmake --build build
 ```
 
-## Build (Linux - example)
+## Build (Linux)
 ```bash
 # Debian/Ubuntu
 sudo apt-get install cmake g++ libsdl2-dev libsdl2-ttf-dev
+sudo apt install libssl-dev
 
 cmake -S . -B build
 cmake --build build
