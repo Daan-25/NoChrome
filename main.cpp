@@ -1158,11 +1158,14 @@ int main(int argc, char** argv) {
     if (argc >= 2) startUrl = argv[1];
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
-        std::cerr << "SDL init failed: " << SDL_GetError() << "\n";
-        return 1;
+    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                 "SDL init failed: %s", SDL_GetError());
+    return 1;
     }
+
     if (TTF_Init() != 0) {
-        std::cerr << "TTF init failed: " << TTF_GetError() << "\n";
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                    "TTF init failed: %s", TTF_GetError());
         SDL_Quit();
         return 1;
     }
