@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(TinyGuiBrowser LANGUAGES CXX)
+project(NoChrome LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -41,14 +41,14 @@ find_library(SDL2TTF_LIBRARY
     REQUIRED
 )
 
-add_executable(TinyGuiBrowser main.cpp)
+add_executable(NoChrome main.cpp)
 
-target_include_directories(TinyGuiBrowser PRIVATE
+target_include_directories(NoChrome PRIVATE
     ${SDL2_INCLUDE_DIR}
     ${SDL2TTF_INCLUDE_DIR}
 )
 
-target_link_libraries(TinyGuiBrowser PRIVATE
+target_link_libraries(NoChrome PRIVATE
     ${SDL2_LIBRARY}
     ${SDL2TTF_LIBRARY}
     OpenSSL::SSL

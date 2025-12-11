@@ -210,7 +210,7 @@ static std::string httpGet(const Url& u) {
     std::ostringstream req;
     req << "GET " << u.path << " HTTP/1.1\r\n"
         << "Host: " << u.host << "\r\n"
-        << "User-Agent: TinyGuiBrowser/0.7\r\n"
+        << "User-Agent: NoChrome/0.7\r\n"
         << "Connection: close\r\n\r\n";
 
     std::string request = req.str();
@@ -306,7 +306,7 @@ static std::string httpsGet(const Url& u) {
         std::ostringstream req;
         req << "GET " << u.path << " HTTP/1.1\r\n"
             << "Host: " << u.host << "\r\n"
-            << "User-Agent: TinyGuiBrowser/0.7\r\n"
+            << "User-Agent: NoChrome/0.7\r\n"
             << "Connection: close\r\n\r\n";
 
         std::string request = req.str();
@@ -1354,7 +1354,7 @@ int main(int argc, char** argv) {
     }
 
     SDL_Window* window = SDL_CreateWindow(
-        "Tiny GUI Browser",
+        "NoChrome Browser",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         1100, 750,
         SDL_WINDOW_RESIZABLE
@@ -1411,7 +1411,7 @@ int main(int argc, char** argv) {
     page.body = loadPageBody(page.urlString, page.baseUrl);
 
     rebuildLayout(page, renderer, fonts, contentWidth, padding, lineHeight);
-    SDL_SetWindowTitle(window, ("Tiny GUI Browser - " + page.urlString).c_str());
+    SDL_SetWindowTitle(window, ("NoChrome Browser - " + page.urlString).c_str());
 
     bool addressFocused = false;
     std::string addressInput = page.urlString;
@@ -1439,7 +1439,7 @@ int main(int argc, char** argv) {
         rebuildLayout(page, renderer, fonts, contentWidth, padding, lineHeight);
 
         addressInput = page.urlString;
-        SDL_SetWindowTitle(window, ("Tiny GUI Browser - " + page.urlString).c_str());
+        SDL_SetWindowTitle(window, ("NoChrome Browser - " + page.urlString).c_str());
     };
 
     float scrollYf = 0.0f;
