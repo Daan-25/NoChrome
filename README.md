@@ -108,4 +108,4 @@ Issues and PRs are welcome.
 If you want to help, focus on small isolated improvements (parser, CSS rules, layout primitives, or networking).
 
 ## License
-Choose a license that fits your intent (MIT is a common choice for this kind of project).
+MIT
