@@ -1,6 +1,6 @@
 # NoChrome
 
-A from-scratch browser project in C++ with SDL2 and SDL2_ttf.
+A from-scratch browser project in C++ with SDL2, SDL2_ttf and sdl2_image.
 
 **Goal:** evolve this project into a fully working browser over time, built step by step without embedding Chromium/WebKit.  
 The current implementation is an early prototype of the rendering and UI pipeline.
@@ -8,7 +8,7 @@ The current implementation is an early prototype of the rendering and UI pipelin
 ## Current Features
 - Windowed GUI
 - Address bar (Ctrl+L to focus)
-- HTTP page loading (**http only**)
+- HTTPS page loading
 - Basic HTML-to-text rendering
 - Clickable links
 - Trackpad-friendly scrolling
