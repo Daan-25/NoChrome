@@ -1,5 +1,6 @@
 #include <SDL.h>
 #include <SDL_ttf.h>
+#include <SDL_image.h>
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -146,6 +147,16 @@ static std::string resolveHref(const Url& base, const std::string& href) {
     return origin + dir + href;
 }
 
+static std::string hostHeaderValue(const Url& u) {
+    bool isHttpDefault  = (u.scheme == "http"  && u.port == 80);
+    bool isHttpsDefault = (u.scheme == "https" && u.port == 443);
+
+    if (!isHttpDefault && !isHttpsDefault && u.port > 0) {
+        return u.host + ":" + std::to_string(u.port);
+    }
+    return u.host;
+}
+
 // -------------------- Networking (raw HTTP) --------------------
 
 static void netInit() {
@@ -204,13 +215,14 @@ static int openTcpSocket(const std::string& host, int port) {
     return sock;
 }
 
-static std::string httpGet(const Url& u) {
+static std::string httpGetRaw(const Url& u) {
     int sock = openTcpSocket(u.host, u.port);
 
     std::ostringstream req;
     req << "GET " << u.path << " HTTP/1.1\r\n"
-        << "Host: " << u.host << "\r\n"
-        << "User-Agent: NoChrome/0.7\r\n"
+        << "Host: " << hostHeaderValue(u) << "\r\n"
+        << "User-Agent: NoChrome/0.8\r\n"
+        << "Accept: */*\r\n"
         << "Connection: close\r\n\r\n";
 
     std::string request = req.str();
@@ -242,12 +254,6 @@ static std::string httpGet(const Url& u) {
     return response;
 }
 
-static std::string extractBody(const std::string& response) {
-    auto pos = response.find("\r\n\r\n");
-    if (pos == std::string::npos) return response;
-    return response.substr(pos + 4);
-}
-
 // -------------------- TLS (OpenSSL HTTPS) --------------------
 
 static void sslInitOnce() {
@@ -270,7 +276,7 @@ static void configureDefaultCa(SSL_CTX* ctx) {
     SSL_CTX_set_default_verify_paths(ctx);
 }
 
-static std::string httpsGet(const Url& u) {
+static std::string httpsGetRaw(const Url& u) {
     sslInitOnce();
 
     SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
@@ -305,8 +311,9 @@ static std::string httpsGet(const Url& u) {
 
         std::ostringstream req;
         req << "GET " << u.path << " HTTP/1.1\r\n"
-            << "Host: " << u.host << "\r\n"
-            << "User-Agent: NoChrome/0.7\r\n"
+            << "Host: " << hostHeaderValue(u) << "\r\n"
+            << "User-Agent: NoChrome/0.8\r\n"
+            << "Accept: */*\r\n"
             << "Connection: close\r\n\r\n";
 
         std::string request = req.str();
@@ -348,6 +355,85 @@ static std::string httpsGet(const Url& u) {
     }
 }
 
+// -------------------- HTTP parsing (incl. chunked) --------------------
+
+struct HttpParts {
+    std::string headers;
+    std::string body;
+};
+
+static HttpParts splitHeadersBody(const std::string& raw) {
+    HttpParts p;
+    auto pos = raw.find("\r\n\r\n");
+    if (pos == std::string::npos) {
+        p.body = raw;
+        return p;
+    }
+    p.headers = raw.substr(0, pos);
+    p.body = raw.substr(pos + 4);
+    return p;
+}
+
+static bool headerContainsCI(const std::string& headers, const std::string& needleLower) {
+    std::string h = toLowerCopy(headers);
+    return h.find(needleLower) != std::string::npos;
+}
+
+static std::string decodeChunkedBody(const std::string& chunked) {
+    std::string out;
+    size_t i = 0;
+
+    auto readLine = [&](std::string& line)->bool{
+        size_t eol = chunked.find("\r\n", i);
+        if (eol == std::string::npos) return false;
+        line = chunked.substr(i, eol - i);
+        i = eol + 2;
+        return true;
+    };
+
+    while (true) {
+        std::string line;
+        if (!readLine(line)) break;
+
+        auto semi = line.find(';');
+        if (semi != std::string::npos) line = line.substr(0, semi);
+        line = trimCopy(line);
+        if (line.empty()) break;
+
+        size_t chunkSize = 0;
+        try {
+            chunkSize = std::stoul(line, nullptr, 16);
+        } catch (...) {
+            break;
+        }
+
+        if (chunkSize == 0) {
+            break;
+        }
+
+        if (i + chunkSize > chunked.size()) break;
+
+        out.append(chunked.data() + i, chunkSize);
+        i += chunkSize;
+
+        if (i + 2 <= chunked.size() && chunked[i] == '\r' && chunked[i+1] == '\n') {
+            i += 2;
+        } else {
+            break;
+        }
+    }
+
+    return out;
+}
+
+static std::string extractBodyBytes(const std::string& rawResponse) {
+    auto parts = splitHeadersBody(rawResponse);
+    if (headerContainsCI(parts.headers, "transfer-encoding: chunked")) {
+        return decodeChunkedBody(parts.body);
+    }
+    return parts.body;
+}
+
 // -------------------- HTML helpers --------------------
 
 static std::vector<std::string> extractStartTagContents(const std::string& html,
@@ -366,7 +452,6 @@ static std::vector<std::string> extractStartTagContents(const std::string& html,
         if (end == std::string::npos) break;
 
         out.push_back(html.substr(start + 1, end - (start + 1)));
-
         i = end + 1;
     }
 
@@ -613,6 +698,7 @@ static std::optional<StyleRule> parseSingleSelectorRule(const std::string& selec
     std::string sel = trimCopy(toLowerCopy(selectorRaw));
     if (sel.empty()) return std::nullopt;
 
+    // Reject complex selectors for now
     if (sel.find(' ') != std::string::npos ||
         sel.find('>') != std::string::npos ||
         sel.find('[') != std::string::npos ||
@@ -655,6 +741,7 @@ static std::vector<StyleRule> parseCssRules(const std::string& cssText) {
     std::vector<StyleRule> rules;
     std::string s = cssText;
 
+    // Remove /* ... */ comments
     while (true) {
         auto a = s.find("/*");
         if (a == std::string::npos) break;
@@ -728,6 +815,7 @@ static void applyRulesForElement(const std::vector<StyleRule>& rules,
                                  const std::string& id,
                                  const std::vector<std::string>& classes,
                                  Style& st) {
+    // Approximate specificity order: tag -> class -> tag.class -> id
     for (const auto& r : rules) {
         if (r.type == SelectorType::Tag && r.tag == tag) {
             if (r.fontSize) st.fontSize = *r.fontSize;
@@ -761,9 +849,9 @@ static void applyRulesForElement(const std::vector<StyleRule>& rules,
     }
 }
 
-// -------------------- Tokens & spacing --------------------
+// -------------------- Tokens --------------------
 
-enum class TokenKind { Word, Break };
+enum class TokenKind { Word, Break, Image };
 
 struct StyledToken {
     TokenKind kind;
@@ -771,6 +859,12 @@ struct StyledToken {
     std::string href;
     Style style;
     int breakCount = 1;
+
+    // Image
+    std::string imgSrcAbs;
+    int imgAttrW = 0;
+    int imgAttrH = 0;
+    std::string imgAlt;
 };
 
 static bool isBlockTagName(const std::string& name) {
@@ -782,7 +876,8 @@ static bool isBlockTagName(const std::string& name) {
            name == "ul" || name == "/ul" ||
            name == "ol" || name == "/ol" ||
            name == "li" || name == "/li" ||
-           name == "br";
+           name == "br" ||
+           name == "img";
 }
 
 static int defaultBreakCountForTag(const std::string& tagNameLower) {
@@ -800,34 +895,43 @@ static int defaultBreakCountForTag(const std::string& tagNameLower) {
         tagNameLower == "ol" || tagNameLower == "/ol") {
         return 1;
     }
+    if (tagNameLower == "img") return 1;
     if (tagNameLower == "br") return 1;
     return 1;
 }
 
-// Fetch CSS subresource by absolute URL (http/https)
-static std::string fetchSubresourceBody(const std::string& absUrl) {
+// -------------------- Subresource fetching --------------------
+
+static std::string fetchSubresourceBytes(const std::string& absUrl) {
     try {
         Url u = parseUrl(absUrl);
         netInit();
-        std::string resp = (u.scheme == "https") ? httpsGet(u) : httpGet(u);
+        std::string raw = (u.scheme == "https") ? httpsGetRaw(u) : httpGetRaw(u);
         netCleanup();
-        return extractBody(resp);
+        return extractBodyBytes(raw);
     } catch (...) {
         netCleanup();
         return "";
     }
 }
 
+static std::string fetchSubresourceText(const std::string& absUrl) {
+    return fetchSubresourceBytes(absUrl);
+}
+
+// -------------------- HTML -> Styled tokens --------------------
+
 static std::vector<StyledToken> parseHtmlToStyledTokens(const std::string& html,
                                                         const Url& baseUrl,
                                                         SDL_Color* outPageBg) {
+    // 1) Inline CSS from <style>
     std::string cssAll;
-
     for (auto& block : extractTagContents(html, "style")) {
         cssAll += block;
         cssAll.push_back('\n');
     }
 
+    // 2) External CSS from <link rel="stylesheet" href="...">
     int externalCount = 0;
     auto linkTags = extractStartTagContents(html, "link");
     for (const auto& tagContent : linkTags) {
@@ -842,7 +946,7 @@ static std::vector<StyledToken> parseHtmlToStyledTokens(const std::string& html,
         std::string abs = resolveHref(baseUrl, href);
         if (abs.empty()) continue;
 
-        std::string css = fetchSubresourceBody(abs);
+        std::string css = fetchSubresourceText(abs);
         if (!css.empty()) {
             cssAll += "\n";
             cssAll += css;
@@ -857,6 +961,7 @@ static std::vector<StyledToken> parseHtmlToStyledTokens(const std::string& html,
         *outPageBg = extractPageBackgroundFromRules(rules);
     }
 
+    // Remove non-rendered blocks
     std::string cleaned = removeTagBlocks(html, "script");
     cleaned = removeTagBlocks(cleaned, "style");
     cleaned = removeTagBlocks(cleaned, "head");
@@ -917,6 +1022,16 @@ static std::vector<StyledToken> parseHtmlToStyledTokens(const std::string& html,
         if (hrefStack.size() > 1) hrefStack.pop_back();
     };
 
+    auto parseIntAttr = [&](const std::string& s)->int{
+        std::string v = trimCopy(s);
+        if (v.empty()) return 0;
+        try {
+            return std::max(0, std::stoi(v));
+        } catch (...) {
+            return 0;
+        }
+    };
+
     auto processTag = [&](const std::string& raw){
         std::string t = trimCopy(raw);
         if (t.empty()) return;
@@ -935,14 +1050,34 @@ static std::vector<StyledToken> parseHtmlToStyledTokens(const std::string& html,
         if (name.empty()) return;
 
         bool selfClosing = (lower.find("/>") != std::string::npos);
-        std::string fullName = isEnd ? ("/" + name) : name;
 
         if (name == "br") {
             pushBreakN(1);
             return;
         }
 
+        if (!isEnd && name == "img") {
+            // Flush text before inserting an image token
+            flushText();
+
+            std::string src = trimCopy(getAttrValue(t, "src"));
+            if (!src.empty()) {
+                StyledToken it;
+                it.kind = TokenKind::Image;
+                it.imgSrcAbs = resolveHref(baseUrl, src);
+                it.imgAlt = decodeEntities(getAttrValue(t, "alt"));
+                it.imgAttrW = parseIntAttr(getAttrValue(t, "width"));
+                it.imgAttrH = parseIntAttr(getAttrValue(t, "height"));
+                tokens.push_back(std::move(it));
+
+                // Minimal separation
+                pushBreakN(1);
+            }
+            return;
+        }
+
         if (isEnd) {
+            std::string fullName = "/" + name;
             if (isBlockTagName(fullName)) {
                 pushBreakN(defaultBreakCountForTag(fullName));
             }
@@ -1007,7 +1142,7 @@ static std::vector<StyledToken> parseHtmlToStyledTokens(const std::string& html,
     return tokens;
 }
 
-// -------------------- Fonts by size --------------------
+// -------------------- Fonts --------------------
 
 struct FontSet {
     TTF_Font* f16 = nullptr;
@@ -1091,7 +1226,7 @@ static SDL_Surface* renderTextWithStyle(TTF_Font* font, const std::string& text,
     return surf;
 }
 
-// -------------------- Layout structures --------------------
+// -------------------- Layout blocks --------------------
 
 struct StyledWord {
     std::string text;
@@ -1109,81 +1244,48 @@ struct RenderSpan {
     int h = 0;
 };
 
-struct RenderLine {
+struct RenderTextLine {
     std::vector<RenderSpan> spans;
+    int height = 0;
+};
+
+struct RenderImage {
+    SDL_Texture* texture = nullptr;
+    int w = 0;
+    int h = 0;
+    std::string srcAbs;
+};
+
+enum class BlockKind { Text, Spacer, Image };
+
+struct RenderBlock {
+    BlockKind kind = BlockKind::Text;
+    int y = 0;
+    int h = 0;
+
+    RenderTextLine text;
+    RenderImage image;
 };
 
 struct LinkHit {
-    SDL_Rect rect;
+    SDL_Rect rect; // Content coordinates
     std::string href;
 };
 
-static void destroyLines(std::vector<RenderLine>& lines) {
-    for (auto& line : lines) {
-        for (auto& sp : line.spans) {
-            if (sp.texture) SDL_DestroyTexture(sp.texture);
-            sp.texture = nullptr;
-        }
-    }
-    lines.clear();
-}
-
-static std::vector<std::vector<StyledWord>> wrapTokensToWordLines(
-    const FontSet& fonts,
-    const std::vector<StyledToken>& tokens,
-    int maxWidth)
-{
-    std::vector<std::vector<StyledWord>> lines;
-    std::vector<StyledWord> current;
-    int lineW = 0;
-
-    auto flushLine = [&](){
-        if (!current.empty()) {
-            lines.push_back(current);
-            current.clear();
-            lineW = 0;
-        }
-    };
-
-    auto pushEmptyLine = [&](){
-        lines.push_back({});
-    };
-
-    for (const auto& t : tokens) {
-        if (t.kind == TokenKind::Break) {
-            flushLine();
-            for (int k = 0; k < std::max(1, t.breakCount); ++k) {
-                pushEmptyLine();
+static void destroyBlocks(SDL_Renderer* renderer, std::vector<RenderBlock>& blocks) {
+    (void)renderer;
+    for (auto& b : blocks) {
+        if (b.kind == BlockKind::Text) {
+            for (auto& sp : b.text.spans) {
+                if (sp.texture) SDL_DestroyTexture(sp.texture);
+                sp.texture = nullptr;
             }
-            continue;
-        }
-
-        StyledWord w { t.text, t.href, t.style };
-        TTF_Font* f = pickFont(fonts, w.style.fontSize);
-
-        int wW = textWidth(f, w.text);
-        int spaceW = textWidth(f, " ");
-        int add = current.empty() ? wW : (spaceW + wW);
-
-        if (!current.empty() && lineW + add > maxWidth) {
-            flushLine();
-        }
-
-        if (current.empty()) {
-            lineW = wW;
-            current.push_back(std::move(w));
-        } else {
-            lineW += add;
-            current.push_back(std::move(w));
+        } else if (b.kind == BlockKind::Image) {
+            if (b.image.texture) SDL_DestroyTexture(b.image.texture);
+            b.image.texture = nullptr;
         }
     }
-
-    flushLine();
-
-    while (!lines.empty() && lines.back().empty())
-        lines.pop_back();
-
-    return lines;
+    blocks.clear();
 }
 
 static std::vector<RenderSpan> groupWordsToSpans(const std::vector<StyledWord>& words) {
@@ -1213,66 +1315,201 @@ static std::vector<RenderSpan> groupWordsToSpans(const std::vector<StyledWord>& 
     return spans;
 }
 
-static std::vector<RenderLine> buildRenderLines(
-    SDL_Renderer* renderer,
-    const FontSet& fonts,
-    const std::vector<std::vector<StyledWord>>& wordLines)
-{
-    std::vector<RenderLine> out;
-    out.reserve(wordLines.size());
+static SDL_Texture* loadImageTexture(SDL_Renderer* renderer,
+                                     const std::string& imgBytes,
+                                     int* outW,
+                                     int* outH) {
+    if (outW) *outW = 0;
+    if (outH) *outH = 0;
+    if (imgBytes.empty()) return nullptr;
 
-    for (const auto& wl : wordLines) {
-        RenderLine line;
-        auto spans = groupWordsToSpans(wl);
+    SDL_RWops* rw = SDL_RWFromConstMem(imgBytes.data(), (int)imgBytes.size());
+    if (!rw) return nullptr;
+
+    SDL_Surface* surf = IMG_Load_RW(rw, 1);
+    if (!surf) return nullptr;
+
+    SDL_Texture* tex = SDL_CreateTextureFromSurface(renderer, surf);
+    if (tex) {
+        if (outW) *outW = surf->w;
+        if (outH) *outH = surf->h;
+    }
+
+    SDL_FreeSurface(surf);
+    return tex;
+}
+
+static std::vector<RenderBlock> buildBlocksFromTokens(SDL_Renderer* renderer,
+                                                      const FontSet& fonts,
+                                                      const std::vector<StyledToken>& tokens,
+                                                      int contentWidth,
+                                                      int padding,
+                                                      int baseLineHeight,
+                                                      std::vector<LinkHit>& outLinks) {
+    std::vector<RenderBlock> blocks;
+    outLinks.clear();
+
+    const int maxLineW = std::max(10, contentWidth - padding * 2);
+
+    std::vector<StyledWord> currentLine;
+    int lineW = 0;
+
+    auto flushLine = [&](){
+        if (currentLine.empty()) return;
+
+        RenderBlock b;
+        b.kind = BlockKind::Text;
+
+        auto spans = groupWordsToSpans(currentLine);
+        int maxH = 0;
 
         for (auto& sp : spans) {
             TTF_Font* f = pickFont(fonts, sp.style.fontSize);
 
             SDL_Surface* surf = renderTextWithStyle(f, sp.text, sp.style);
             if (!surf) {
-                line.spans.push_back(std::move(sp));
+                b.text.spans.push_back(std::move(sp));
                 continue;
             }
 
             sp.w = surf->w;
             sp.h = surf->h;
+            maxH = std::max(maxH, sp.h);
             sp.texture = SDL_CreateTextureFromSurface(renderer, surf);
             SDL_FreeSurface(surf);
 
-            line.spans.push_back(std::move(sp));
+            b.text.spans.push_back(std::move(sp));
         }
 
-        out.push_back(std::move(line));
+        b.text.height = std::max(baseLineHeight, maxH + 6);
+        b.h = b.text.height;
+
+        blocks.push_back(std::move(b));
+        currentLine.clear();
+        lineW = 0;
+    };
+
+    auto addSpacer = [&](int h){
+        if (h <= 0) return;
+        RenderBlock b;
+        b.kind = BlockKind::Spacer;
+        b.h = h;
+        blocks.push_back(std::move(b));
+    };
+
+    auto addImageBlock = [&](const StyledToken& it){
+        if (it.imgSrcAbs.empty()) return;
+
+        std::string bytes = fetchSubresourceBytes(it.imgSrcAbs);
+        int iw = 0, ih = 0;
+        SDL_Texture* tex = loadImageTexture(renderer, bytes, &iw, &ih);
+
+        if (!tex || iw <= 0 || ih <= 0) {
+            // Fallback: render alt text when image fails
+            std::string alt = it.imgAlt.empty() ? "[image]" : ("[image: " + it.imgAlt + "]");
+            StyledToken t;
+            t.kind = TokenKind::Word;
+            t.text = alt;
+            t.style = Style{};
+            // Push as a simple text block via currentLine
+            currentLine.push_back({t.text, "", t.style});
+            flushLine();
+            addSpacer(baseLineHeight / 2);
+            return;
+        }
+
+        int targetW = iw;
+        int targetH = ih;
+
+        // Respect width/height attributes lightly (optional)
+        if (it.imgAttrW > 0 && it.imgAttrH > 0) {
+            targetW = it.imgAttrW;
+            targetH = it.imgAttrH;
+        } else if (it.imgAttrW > 0 && it.imgAttrH == 0) {
+            float s = (float)it.imgAttrW / (float)iw;
+            targetW = it.imgAttrW;
+            targetH = std::max(1, (int)std::lround(ih * s));
+        } else if (it.imgAttrH > 0 && it.imgAttrW == 0) {
+            float s = (float)it.imgAttrH / (float)ih;
+            targetH = it.imgAttrH;
+            targetW = std::max(1, (int)std::lround(iw * s));
+        }
+
+        // Fit into content width
+        if (targetW > maxLineW) {
+            float s = (float)maxLineW / (float)targetW;
+            targetW = maxLineW;
+            targetH = std::max(1, (int)std::lround(targetH * s));
+        }
+
+        RenderBlock b;
+        b.kind = BlockKind::Image;
+        b.image.texture = tex;
+        b.image.w = targetW;
+        b.image.h = targetH;
+        b.image.srcAbs = it.imgSrcAbs;
+        b.h = targetH + 8; // small bottom padding
+        blocks.push_back(std::move(b));
+    };
+
+    for (const auto& t : tokens) {
+        if (t.kind == TokenKind::Break) {
+            flushLine();
+            addSpacer(baseLineHeight * std::max(1, t.breakCount));
+            continue;
+        }
+
+        if (t.kind == TokenKind::Image) {
+            flushLine();
+            addImageBlock(t);
+            continue;
+        }
+
+        // Word
+        StyledWord w { t.text, t.href, t.style };
+        TTF_Font* f = pickFont(fonts, w.style.fontSize);
+
+        int wW = textWidth(f, w.text);
+        int spaceW = textWidth(f, " ");
+        int add = currentLine.empty() ? wW : (spaceW + wW);
+
+        if (!currentLine.empty() && lineW + add > maxLineW) {
+            flushLine();
+        }
+
+        if (currentLine.empty()) {
+            lineW = wW;
+            currentLine.push_back(std::move(w));
+        } else {
+            lineW += add;
+            currentLine.push_back(std::move(w));
+        }
     }
 
-    return out;
-}
+    flushLine();
 
-static std::vector<LinkHit> buildLinkHits(
-    const std::vector<RenderLine>& lines,
-    const FontSet& fonts,
-    int padding,
-    int lineHeight)
-{
-    std::vector<LinkHit> hits;
+    // Assign y positions + build link hitboxes
+    int y = padding;
+    for (auto& b : blocks) {
+        b.y = y;
+        y += b.h;
 
-    for (int i = 0; i < (int)lines.size(); ++i) {
+        if (b.kind != BlockKind::Text) continue;
+
         int x = padding;
-        int y = padding + i * lineHeight;
+        int lineTop = b.y;
 
-        for (const auto& sp : lines[i].spans) {
-            SDL_Rect r { x, y, sp.w, sp.h };
-
+        for (const auto& sp : b.text.spans) {
+            SDL_Rect r { x, lineTop, sp.w, sp.h };
             if (!sp.href.empty() && sp.w > 0 && sp.h > 0) {
-                hits.push_back({ r, sp.href });
+                outLinks.push_back({ r, sp.href });
             }
-
             TTF_Font* f = pickFont(fonts, sp.style.fontSize);
             x += sp.w + textWidth(f, " ");
         }
     }
 
-    return hits;
+    return blocks;
 }
 
 // -------------------- Page state --------------------
@@ -1284,43 +1521,45 @@ struct Page {
 
     SDL_Color background {245, 245, 245, 255};
 
-    std::vector<RenderLine> lines;
+    std::vector<RenderBlock> blocks;
     std::vector<LinkHit> linkHits;
+    int contentHeight = 0;
 };
 
-static std::string loadPageBody(const std::string& urlString, Url& outUrl) {
+static std::string loadPageBodyText(const std::string& urlString, Url& outUrl) {
     std::string normalized = normalizeUserUrl(urlString);
     outUrl = parseUrl(normalized);
 
     try {
         netInit();
-        std::string resp = (outUrl.scheme == "https") ? httpsGet(outUrl) : httpGet(outUrl);
+        std::string raw = (outUrl.scheme == "https") ? httpsGetRaw(outUrl) : httpGetRaw(outUrl);
         netCleanup();
-        return extractBody(resp);
+        return extractBodyBytes(raw);
     } catch (const std::exception& ex) {
         netCleanup();
         return std::string("<h2>Network error</h2><p>") + ex.what() + "</p>";
     }
 }
 
-static void rebuildLayout(
-    Page& page,
-    SDL_Renderer* renderer,
-    const FontSet& fonts,
-    int contentWidth,
-    int padding,
-    int lineHeight)
-{
-    destroyLines(page.lines);
+static void rebuildLayout(Page& page,
+                          SDL_Renderer* renderer,
+                          const FontSet& fonts,
+                          int contentWidth,
+                          int padding,
+                          int baseLineHeight) {
+    destroyBlocks(renderer, page.blocks);
 
     SDL_Color bg = page.background;
     auto tokens = parseHtmlToStyledTokens(page.body, page.baseUrl, &bg);
     page.background = bg;
 
-    auto wordLines = wrapTokensToWordLines(fonts, tokens, contentWidth - padding * 2);
+    page.blocks = buildBlocksFromTokens(renderer, fonts, tokens, contentWidth, padding, baseLineHeight, page.linkHits);
 
-    page.lines = buildRenderLines(renderer, fonts, wordLines);
-    page.linkHits = buildLinkHits(page.lines, fonts, padding, lineHeight);
+    int last = padding;
+    for (const auto& b : page.blocks) {
+        last = std::max(last, b.y + b.h);
+    }
+    page.contentHeight = last + padding;
 }
 
 // -------------------- UI helpers --------------------
@@ -1342,47 +1581,57 @@ int main(int argc, char** argv) {
     if (argc >= 2) startUrl = argv[1];
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "SDL init failed: %s", SDL_GetError());
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "SDL init failed: %s", SDL_GetError());
         return 1;
     }
     if (TTF_Init() != 0) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "TTF init failed: %s", TTF_GetError());
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "TTF init failed: %s", TTF_GetError());
+        SDL_Quit();
+        return 1;
+    }
+
+    int imgFlags = IMG_INIT_PNG | IMG_INIT_JPG;
+    if ((IMG_Init(imgFlags) & imgFlags) != imgFlags) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "SDL_image init failed: %s", IMG_GetError());
+        // We can still run without images, but user wants img support, so abort.
+        TTF_Quit();
         SDL_Quit();
         return 1;
     }
 
     SDL_Window* window = SDL_CreateWindow(
-        "NoChrome Browser",
+        "NoChrome",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         1100, 750,
         SDL_WINDOW_RESIZABLE
     );
     if (!window) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "Window create failed: %s", SDL_GetError());
-        TTF_Quit(); SDL_Quit();
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Window create failed: %s", SDL_GetError());
+        IMG_Quit();
+        TTF_Quit();
+        SDL_Quit();
         return 1;
     }
 
     SDL_Renderer* renderer = SDL_CreateRenderer(window, -1,
         SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!renderer) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "Renderer create failed: %s", SDL_GetError());
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Renderer create failed: %s", SDL_GetError());
         SDL_DestroyWindow(window);
-        TTF_Quit(); SDL_Quit();
+        IMG_Quit();
+        TTF_Quit();
+        SDL_Quit();
         return 1;
     }
 
     FontSet fonts;
     if (!loadFontSet(fonts)) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "Could not load a font. Add ./fonts/DejaVuSans.ttf");
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Could not load a font. Add ./fonts/DejaVuSans.ttf");
         SDL_DestroyRenderer(renderer);
         SDL_DestroyWindow(window);
-        TTF_Quit(); SDL_Quit();
+        IMG_Quit();
+        TTF_Quit();
+        SDL_Quit();
         return 1;
     }
 
@@ -1393,7 +1642,7 @@ int main(int argc, char** argv) {
     SDL_GetWindowSize(window, &winW, &winH);
 
     int contentWidth = winW;
-    int lineHeight = 32;
+    int baseLineHeight = 32;
 
     auto calcAddressRect = [&](int w){
         SDL_Rect r;
@@ -1408,10 +1657,10 @@ int main(int argc, char** argv) {
 
     Page page;
     page.urlString = normalizeUserUrl(startUrl);
-    page.body = loadPageBody(page.urlString, page.baseUrl);
+    page.body = loadPageBodyText(page.urlString, page.baseUrl);
 
-    rebuildLayout(page, renderer, fonts, contentWidth, padding, lineHeight);
-    SDL_SetWindowTitle(window, ("NoChrome Browser - " + page.urlString).c_str());
+    rebuildLayout(page, renderer, fonts, contentWidth, padding, baseLineHeight);
+    SDL_SetWindowTitle(window, ("NoChrome - " + page.urlString).c_str());
 
     bool addressFocused = false;
     std::string addressInput = page.urlString;
@@ -1430,24 +1679,23 @@ int main(int argc, char** argv) {
     auto loadUrlIntoPage = [&](const std::string& rawUrl){
         std::string norm = normalizeUserUrl(rawUrl);
         Url u;
-        std::string body = loadPageBody(norm, u);
+        std::string body = loadPageBodyText(norm, u);
 
         page.baseUrl = u;
         page.urlString = norm;
         page.body = body;
 
-        rebuildLayout(page, renderer, fonts, contentWidth, padding, lineHeight);
+        rebuildLayout(page, renderer, fonts, contentWidth, padding, baseLineHeight);
 
         addressInput = page.urlString;
-        SDL_SetWindowTitle(window, ("NoChrome Browser - " + page.urlString).c_str());
+        SDL_SetWindowTitle(window, ("NoChrome - " + page.urlString).c_str());
     };
 
     float scrollYf = 0.0f;
 
     auto maxScroll = [&](){
-        int contentH = (int)page.lines.size() * lineHeight + padding * 2;
         int viewH = std::max(10, winH - topBarH);
-        return std::max(0, contentH - viewH);
+        return std::max(0, page.contentHeight - viewH);
     };
 
     auto clampScroll = [&](){
@@ -1485,14 +1733,14 @@ int main(int argc, char** argv) {
                         addressRect = calcAddressRect(winW);
                         contentWidth = winW;
 
-                        rebuildLayout(page, renderer, fonts, contentWidth, padding, lineHeight);
+                        rebuildLayout(page, renderer, fonts, contentWidth, padding, baseLineHeight);
                         clampScroll();
                     }
                     break;
 
                 case SDL_MOUSEWHEEL: {
                     float dy = (e.wheel.preciseY != 0.0f) ? e.wheel.preciseY : (float)e.wheel.y;
-                    scrollYf -= dy * (float)lineHeight * 2.0f;
+                    scrollYf -= dy * (float)baseLineHeight * 2.0f;
                     clampScroll();
                     break;
                 }
@@ -1559,8 +1807,8 @@ int main(int argc, char** argv) {
                             blurAddress();
                         }
                     } else {
-                        if (e.key.keysym.sym == SDLK_DOWN) { scrollYf += lineHeight; clampScroll(); }
-                        if (e.key.keysym.sym == SDLK_UP)   { scrollYf -= lineHeight; clampScroll(); }
+                        if (e.key.keysym.sym == SDLK_DOWN) { scrollYf += baseLineHeight; clampScroll(); }
+                        if (e.key.keysym.sym == SDLK_UP)   { scrollYf -= baseLineHeight; clampScroll(); }
                         if (e.key.keysym.sym == SDLK_PAGEDOWN) { scrollYf += (winH - topBarH) * 0.5f; clampScroll(); }
                         if (e.key.keysym.sym == SDLK_PAGEUP)   { scrollYf -= (winH - topBarH) * 0.5f; clampScroll(); }
                         if (e.key.keysym.sym == SDLK_HOME) { scrollYf = 0; clampScroll(); }
@@ -1572,6 +1820,7 @@ int main(int argc, char** argv) {
             }
         }
 
+        // ---------- Render ----------
         SDL_SetRenderDrawColor(renderer, 16, 16, 18, 255);
         SDL_RenderClear(renderer);
 
@@ -1619,48 +1868,57 @@ int main(int argc, char** argv) {
                        page.background.a);
 
         int scrollY = (int)scrollYf;
-        int viewH = std::max(1, winH - topBarH);
 
-        int startIndex = std::max(0, (scrollY - padding) / lineHeight);
-        int endIndex = std::min((int)page.lines.size(), startIndex + (viewH / lineHeight) + 6);
+        for (const auto& b : page.blocks) {
+            int yScreen = topBarH + b.y - scrollY;
 
-        for (int i = startIndex; i < endIndex; ++i) {
-            int x = padding;
-            int yScreen = topBarH + padding + i * lineHeight - scrollY;
+            if (yScreen > winH) continue;
+            if (yScreen + b.h < topBarH) continue;
 
-            const auto& line = page.lines[i];
+            if (b.kind == BlockKind::Spacer) {
+                continue;
+            }
 
-            for (const auto& sp : line.spans) {
-                if (sp.texture) {
-                    SDL_Rect dst { x, yScreen, sp.w, sp.h };
-                    SDL_RenderCopy(renderer, sp.texture, nullptr, &dst);
+            if (b.kind == BlockKind::Text) {
+                int x = padding;
 
-                    if (!sp.href.empty()) {
-                        SDL_SetRenderDrawColor(renderer,
-                                               sp.style.color.r,
-                                               sp.style.color.g,
-                                               sp.style.color.b, 255);
-                        SDL_Rect ul { x, yScreen + sp.h + 2, sp.w, 1 };
-                        SDL_RenderFillRect(renderer, &ul);
+                for (const auto& sp : b.text.spans) {
+                    if (sp.texture) {
+                        SDL_Rect dst { x, yScreen, sp.w, sp.h };
+                        SDL_RenderCopy(renderer, sp.texture, nullptr, &dst);
+
+                        if (!sp.href.empty()) {
+                            SDL_SetRenderDrawColor(renderer,
+                                                   sp.style.color.r,
+                                                   sp.style.color.g,
+                                                   sp.style.color.b, 255);
+                            SDL_Rect ul { x, yScreen + sp.h + 2, sp.w, 1 };
+                            SDL_RenderFillRect(renderer, &ul);
+                        }
                     }
-                }
 
-                TTF_Font* f = pickFont(fonts, sp.style.fontSize);
-                x += sp.w + textWidth(f, " ");
+                    TTF_Font* f = pickFont(fonts, sp.style.fontSize);
+                    x += sp.w + textWidth(f, " ");
+                }
+            } else if (b.kind == BlockKind::Image) {
+                if (b.image.texture) {
+                    SDL_Rect dst { padding, yScreen, b.image.w, b.image.h };
+                    SDL_RenderCopy(renderer, b.image.texture, nullptr, &dst);
+                }
             }
         }
 
         SDL_RenderPresent(renderer);
     }
 
-    destroyLines(page.lines);
+    destroyBlocks(renderer, page.blocks);
     freeFontSet(fonts);
 
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
 
+    IMG_Quit();
     TTF_Quit();
     SDL_Quit();
-
     return 0;
 }
