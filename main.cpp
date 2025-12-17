@@ -1343,8 +1343,9 @@ static JSValueRef jscGetElementById(JSContextRef ctx, JSObjectRef, JSObjectRef, 
     std::string id = jsToUtf8(ctx, argv[0]);
     if (id.empty()) return JSValueMakeNull(ctx);
 
-    if (g_jsHost->domIds.find(id) == g_jsHost->domIds.end()) return JSValueMakeNull(ctx);
-
+    // If the element is not known, return a "virtual" element instead of null.
+    // This prevents a lot of real-world scripts from crashing immediately.
+    g_jsHost->domIds.insert(id);
     jscEnsureDomClasses();
     JSObjectRef el = JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{id});
     return el;
@@ -1456,10 +1457,11 @@ static std::string runJavaScriptForHtml(JsEngine& js,
     int externalCount = 0;
     for (auto& sc : scripts) {
         if (sc.isModule) {
-            // Modules require an import loader. Skip for now.
-            continue;
+            // Best-effort: treat module scripts like normal scripts.
+            // Many modern sites use type="module". If the source uses
+            // real module syntax (import/export), JavaScriptCore will throw
+            // a SyntaxError and we will ignore it.
         }
-
         std::string code = sc.code;
         std::string filename = "<inline>";
 
@@ -1797,6 +1799,11 @@ static std::vector<StyledToken> parseHtmlToStyledTokens(const std::string& html,
     cleaned = removeTagBlocks(cleaned, "style");
     cleaned = removeTagBlocks(cleaned, "head");
 
+
+#ifdef NOCHROME_ENABLE_JS
+    // If JS is enabled, do not render <noscript> fallbacks.
+    cleaned = removeTagBlocks(cleaned, "noscript");
+#endif
     std::vector<StyledToken> tokens;
 
     bool inTag = false;
