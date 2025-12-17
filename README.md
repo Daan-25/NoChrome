@@ -48,7 +48,7 @@ The current implementation is an early prototype of the rendering and UI pipelin
 
 ## Build (macOS)
 ```bash
-brew install sdl2 sdl2_ttf sdl2_image
+brew install cmake pkg-config sdl2 sdl2_ttf sdl2_image openssl@3 git
 cmake -S . -B build
 cmake --build build
 ```
@@ -56,7 +56,7 @@ cmake --build build
 ## Build (Linux)
 ```bash
 # Debian/Ubuntu
-sudo apt-get install cmake g++ libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev
+sudo apt-get install cmake g++ libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev libssl-dev
 sudo apt install libssl-dev
 
 cmake -S . -B build
