@@ -65,6 +65,29 @@ static std::string toLowerCopy(std::string s) {
     return s;
 }
 
+
+static std::string toUpperCopy(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c){ return (char)std::toupper(c); });
+    return s;
+}
+
+static std::string escapeHtmlEntities(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        switch (c) {
+            case '&': out += "&amp;"; break;
+            case '<': out += "&lt;"; break;
+            case '>': out += "&gt;"; break;
+            case '"': out += "&quot;"; break;
+            case '\'': out += "&#39;"; break;
+            default: out.push_back(c); break;
+        }
+    }
+    return out;
+}
+
 static std::string trimCopy(const std::string& s) {
     size_t a = 0;
     while (a < s.size() && std::isspace((unsigned char)s[a])) a++;
@@ -960,6 +983,25 @@ struct JsHost {
     std::unordered_map<std::string, std::string> styleDisplayById; // id -> display value (e.g. "none")
     bool domDirty = false;
 
+    // --- Realistic-ish JS plumbing (minimal) ---
+    struct TimerItem {
+        int id = 0;
+        double dueMs = 0.0;
+        JSObjectRef fn = nullptr;     // protected
+        bool isCode = false;
+        std::string code;
+    };
+
+    int nextTimerId = 1;
+    std::vector<TimerItem> timers;
+
+    // Event listeners keyed by scope+type, e.g. "window:keydown", "document:DOMContentLoaded", "el:myid:click"
+    std::unordered_map<std::string, std::vector<JSObjectRef>> listeners; // protected
+
+    // Best-effort "DOM" backing store: we mutate this HTML string and re-render when domDirty flips.
+    Url baseUrl;
+    std::string domHtml;
+
     std::chrono::steady_clock::time_point perfStart = std::chrono::steady_clock::now();
 };
 
@@ -1011,10 +1053,72 @@ static JSValueRef jscReturnNull(JSContextRef ctx, JSObjectRef, JSObjectRef, size
     return JSValueMakeNull(ctx);
 }
 
-static JSValueRef jscSetTimeout(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*) {
-    // Stub: real timers require an event loop integration.
-    return JSValueMakeNumber(ctx, 0);
+static double jscNowMs() {
+    if (!g_jsHost) return 0.0;
+    auto now = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(now - g_jsHost->perfStart).count();
 }
+
+static void jscUnprotectAll(JsEngine& js) {
+    if (!js.ctx) return;
+    for (auto& t : js.host.timers) {
+        if (t.fn) JSValueUnprotect(js.ctx, t.fn);
+        t.fn = nullptr;
+    }
+    js.host.timers.clear();
+
+    for (auto& kv : js.host.listeners) {
+        for (auto* fn : kv.second) {
+            if (fn) JSValueUnprotect(js.ctx, fn);
+        }
+    }
+    js.host.listeners.clear();
+}
+
+static JSValueRef jscClearTimeout(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost) return JSValueMakeUndefined(ctx);
+    if (argc < 1) return JSValueMakeUndefined(ctx);
+
+    int id = (int)JSValueToNumber(ctx, argv[0], nullptr);
+    auto& timers = g_jsHost->timers;
+    for (auto it = timers.begin(); it != timers.end(); ++it) {
+        if (it->id == id) {
+            if (it->fn) JSValueUnprotect(ctx, it->fn);
+            timers.erase(it);
+            break;
+        }
+    }
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef jscSetTimeout(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost) return JSValueMakeNumber(ctx, 0);
+
+    if (argc < 1) return JSValueMakeNumber(ctx, 0);
+
+    double delay = 0.0;
+    if (argc >= 2) delay = JSValueToNumber(ctx, argv[1], nullptr);
+    if (delay < 0.0) delay = 0.0;
+
+    JsHost::TimerItem item;
+    item.id = g_jsHost->nextTimerId++;
+    item.dueMs = jscNowMs() + delay;
+
+    if (JSValueIsString(ctx, argv[0])) {
+        item.isCode = true;
+        item.code = jsToUtf8(ctx, argv[0]);
+    } else if (JSValueIsObject(ctx, argv[0])) {
+        JSObjectRef fn = JSValueToObject(ctx, argv[0], nullptr);
+        if (fn && JSObjectIsFunction(ctx, fn)) {
+            item.fn = fn;
+            JSValueProtect(ctx, item.fn);
+        }
+    }
+
+    g_jsHost->timers.push_back(item);
+    return JSValueMakeNumber(ctx, (double)item.id);
+}
+
 
 static JSValueRef jscAlert(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) {
     std::string msg;
@@ -1023,6 +1127,220 @@ static JSValueRef jscAlert(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t ar
     SDL_Window* win = g_jsHost ? g_jsHost->window : nullptr;
     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "alert()", msg.c_str(), win);
     return JSValueMakeUndefined(ctx);
+}
+
+
+static void jscAddListener(const std::string& key, JSObjectRef fn) {
+    if (!g_jsHost || !fn) return;
+    g_jsHost->listeners[key].push_back(fn);
+    // (ctx-aware helper used instead)
+}
+
+// NOTE: JavaScriptCore C API doesn't provide "current context" directly; we pass ctx in callbacks.
+// So we use a ctx-aware helper:
+static void jscAddListenerCtx(JSContextRef ctx, const std::string& key, JSObjectRef fn) {
+    if (!g_jsHost || !fn) return;
+    g_jsHost->listeners[key].push_back(fn);
+    JSValueProtect(ctx, fn);
+}
+
+static void jscDispatchEventSimple(JSContextRef ctx, const std::string& key, JSObjectRef eventObj) {
+    if (!g_jsHost) return;
+    auto it = g_jsHost->listeners.find(key);
+    if (it == g_jsHost->listeners.end()) return;
+
+    for (auto* fn : it->second) {
+        if (!fn) continue;
+        JSValueRef exc = nullptr;
+        JSObjectCallAsFunction(ctx, fn, nullptr, eventObj ? 1 : 0, eventObj ? (JSValueRef*)&eventObj : nullptr, &exc);
+        if (exc) {
+            std::cerr << "[JS Exception] " << jsToUtf8(ctx, exc) << "\n";
+        }
+    }
+}
+
+static std::string stripNoscriptBlocks(const std::string& html) {
+    std::string lower = toLowerCopy(html);
+    std::string out;
+    out.reserve(html.size());
+
+    size_t pos = 0;
+    while (true) {
+        size_t ns = lower.find("<noscript", pos);
+        if (ns == std::string::npos) {
+            out.append(html, pos, std::string::npos);
+            break;
+        }
+        out.append(html, pos, ns - pos);
+
+        size_t gt = lower.find('>', ns);
+        if (gt == std::string::npos) break;
+
+        size_t end = lower.find("</noscript>", gt);
+        if (end == std::string::npos) break;
+
+        pos = end + std::string("</noscript>").size();
+    }
+
+    return out;
+}
+
+static bool replaceElementTextById(std::string& html, const std::string& id, const std::string& newText) {
+    if (id.empty()) return false;
+    std::string lower = toLowerCopy(html);
+
+    // Find id="id" or id='id'
+    std::string needle1 = "id=\"" + id + "\"";
+    std::string needle2 = "id='" + id + "'";
+    size_t p = lower.find(toLowerCopy(needle1));
+    if (p == std::string::npos) p = lower.find(toLowerCopy(needle2));
+    if (p == std::string::npos) return false;
+
+    // Find tag start '<' before id
+    size_t tagStart = lower.rfind('<', p);
+    if (tagStart == std::string::npos) return false;
+
+    // Find tag name
+    size_t nameStart = tagStart + 1;
+    while (nameStart < lower.size() && std::isspace((unsigned char)lower[nameStart])) nameStart++;
+    size_t nameEnd = nameStart;
+    while (nameEnd < lower.size() && std::isalnum((unsigned char)lower[nameEnd])) nameEnd++;
+    if (nameEnd <= nameStart) return false;
+    std::string tag = lower.substr(nameStart, nameEnd - nameStart);
+
+    // Find end of opening tag
+    size_t openEnd = lower.find('>', p);
+    if (openEnd == std::string::npos) return false;
+
+    // Self-closing? then nothing to replace
+    if (openEnd > 0 && lower[openEnd - 1] == '/') return false;
+
+    // Find closing tag
+    std::string closeNeedle = "</" + tag;
+    size_t closeStart = lower.find(closeNeedle, openEnd);
+    if (closeStart == std::string::npos) return false;
+
+    // Replace inner content (best effort; doesn't handle nested same-tags correctly)
+    html = html.substr(0, openEnd + 1) + escapeHtmlEntities(newText) + html.substr(closeStart);
+    return true;
+}
+
+static void insertBeforeClosingTag(std::string& html, const std::string& tag, const std::string& snippet) {
+    std::string lower = toLowerCopy(html);
+    std::string closeNeedle = "</" + toLowerCopy(tag) + ">";
+    size_t pos = lower.rfind(closeNeedle);
+    if (pos != std::string::npos) {
+        html.insert(pos, snippet);
+        return;
+    }
+    // Fallback: append
+    html += snippet;
+}
+
+struct JscResponsePriv {
+    std::string body;
+    int status = 200;
+};
+
+static JSClassRef g_jscResponseClass = nullptr;
+
+static void jscFinalizeResponse(JSObjectRef object) {
+    auto* priv = (JscResponsePriv*)JSObjectGetPrivate(object);
+    delete priv;
+}
+
+static JSValueRef jscResponseText(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t, const JSValueRef[], JSValueRef*) {
+    auto* priv = (JscResponsePriv*)JSObjectGetPrivate(thisObject);
+    std::string body = priv ? priv->body : "";
+
+    // Promise.resolve(body)
+    JSObjectRef global = JSContextGetGlobalObject(ctx);
+    JSStringRef pname = JSStringCreateWithUTF8CString("Promise");
+    JSValueRef pval = JSObjectGetProperty(ctx, global, pname, nullptr);
+    JSStringRelease(pname);
+
+    if (!JSValueIsObject(ctx, pval)) return JSValueMakeString(ctx, JSStringCreateWithUTF8CString(body.c_str()));
+    JSObjectRef pobj = JSValueToObject(ctx, pval, nullptr);
+
+    JSStringRef rname = JSStringCreateWithUTF8CString("resolve");
+    JSValueRef rval = JSObjectGetProperty(ctx, pobj, rname, nullptr);
+    JSStringRelease(rname);
+
+    if (!JSValueIsObject(ctx, rval)) return JSValueMakeString(ctx, JSStringCreateWithUTF8CString(body.c_str()));
+    JSObjectRef resolveFn = JSValueToObject(ctx, rval, nullptr);
+
+    JSStringRef s = JSStringCreateWithUTF8CString(body.c_str());
+    JSValueRef arg = JSValueMakeString(ctx, s);
+    JSStringRelease(s);
+
+    JSValueRef exc = nullptr;
+    JSValueRef args[1] = { arg };
+    JSValueRef prom = JSObjectCallAsFunction(ctx, resolveFn, pobj, 1, args, &exc);
+    if (exc) {
+        std::cerr << "[JS Exception] " << jsToUtf8(ctx, exc) << "\n";
+        return JSValueMakeUndefined(ctx);
+    }
+    return prom;
+}
+
+static JSValueRef jscFetch(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost) return JSValueMakeUndefined(ctx);
+    if (argc < 1) return JSValueMakeUndefined(ctx);
+
+    std::string url = jsToUtf8(ctx, argv[0]);
+    std::string abs = resolveHref(g_jsHost->baseUrl, url);
+    if (abs.empty()) abs = url;
+
+    std::string body = fetchSubresourceText(abs);
+
+    if (!g_jscResponseClass) {
+        JSClassDefinition def = kJSClassDefinitionEmpty;
+        def.finalize = jscFinalizeResponse;
+        g_jscResponseClass = JSClassCreate(&def);
+    }
+
+    JSObjectRef resp = JSObjectMake(ctx, g_jscResponseClass, new JscResponsePriv{body, 200});
+
+    // Attach properties: ok, status, text()
+    {
+        JSStringRef okName = JSStringCreateWithUTF8CString("ok");
+        JSObjectSetProperty(ctx, resp, okName, JSValueMakeBoolean(ctx, true), kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(okName);
+
+        JSStringRef stName = JSStringCreateWithUTF8CString("status");
+        JSObjectSetProperty(ctx, resp, stName, JSValueMakeNumber(ctx, 200), kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(stName);
+
+        JSStringRef textName = JSStringCreateWithUTF8CString("text");
+        JSObjectRef fn = JSObjectMakeFunctionWithCallback(ctx, textName, jscResponseText);
+        JSObjectSetProperty(ctx, resp, textName, fn, kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(textName);
+    }
+
+    // Return Promise.resolve(resp)
+    JSObjectRef global = JSContextGetGlobalObject(ctx);
+    JSStringRef pname = JSStringCreateWithUTF8CString("Promise");
+    JSValueRef pval = JSObjectGetProperty(ctx, global, pname, nullptr);
+    JSStringRelease(pname);
+
+    if (!JSValueIsObject(ctx, pval)) return resp;
+    JSObjectRef pobj = JSValueToObject(ctx, pval, nullptr);
+
+    JSStringRef rname = JSStringCreateWithUTF8CString("resolve");
+    JSValueRef rval = JSObjectGetProperty(ctx, pobj, rname, nullptr);
+    JSStringRelease(rname);
+
+    if (!JSValueIsObject(ctx, rval)) return resp;
+    JSObjectRef resolveFn = JSValueToObject(ctx, rval, nullptr);
+
+    JSValueRef exc = nullptr;
+    JSValueRef args[1] = { resp };
+    JSValueRef prom = JSObjectCallAsFunction(ctx, resolveFn, pobj, 1, args, &exc);
+    if (exc) {
+        std::cerr << "[JS Exception] " << jsToUtf8(ctx, exc) << "\n";
+        return resp;
+    }
+    return prom;
 }
 
 static void jsInstallBaseGlobals(JsEngine& js) {
@@ -1073,17 +1391,34 @@ static void jsInstallBaseGlobals(JsEngine& js) {
     JSObjectSetProperty(js.ctx, global, alertName, alertFn, kJSPropertyAttributeNone, nullptr);
     JSStringRelease(alertName);
 
-    // setTimeout stub
-    JSStringRef stName = JSStringCreateWithUTF8CString("setTimeout");
-    JSObjectRef stFn = JSObjectMakeFunctionWithCallback(js.ctx, stName, jscSetTimeout);
-    JSObjectSetProperty(js.ctx, global, stName, stFn, kJSPropertyAttributeNone, nullptr);
-    JSStringRelease(stName);
+    // setTimeout / clearTimeout (timer queue)
+    {
+        JSStringRef stName = JSStringCreateWithUTF8CString("setTimeout");
+        JSObjectRef stFn = JSObjectMakeFunctionWithCallback(js.ctx, stName, jscSetTimeout);
+        JSObjectSetProperty(js.ctx, global, stName, stFn, kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(stName);
 
-    // addEventListener stub on window
-    JSStringRef aelName = JSStringCreateWithUTF8CString("addEventListener");
-    JSObjectRef aelFn = JSObjectMakeFunctionWithCallback(js.ctx, aelName, jscNoop);
-    JSObjectSetProperty(js.ctx, global, aelName, aelFn, kJSPropertyAttributeNone, nullptr);
-    JSStringRelease(aelName);
+        JSStringRef ctName = JSStringCreateWithUTF8CString("clearTimeout");
+        JSObjectRef ctFn = JSObjectMakeFunctionWithCallback(js.ctx, ctName, jscClearTimeout);
+        JSObjectSetProperty(js.ctx, global, ctName, ctFn, kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(ctName);
+    }
+
+    // fetch (very small subset): returns Promise<response>, response.text() returns Promise<string>
+    {
+        JSStringRef fName = JSStringCreateWithUTF8CString("fetch");
+        JSObjectRef fFn = JSObjectMakeFunctionWithCallback(js.ctx, fName, jscFetch);
+        JSObjectSetProperty(js.ctx, global, fName, fFn, kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(fName);
+    }
+
+    // addEventListener on window
+    {
+        JSStringRef aelName = JSStringCreateWithUTF8CString("addEventListener");
+        JSObjectRef aelFn = JSObjectMakeFunctionWithCallback(js.ctx, aelName, jscNoop); // replaced in page globals for routing
+        JSObjectSetProperty(js.ctx, global, aelName, aelFn, kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(aelName);
+    }
 }
 
 static bool jsInit(JsEngine& js) {
@@ -1096,6 +1431,7 @@ static bool jsInit(JsEngine& js) {
 
 static void jsResetContext(JsEngine& js) {
     if (js.ctx) {
+        jscUnprotectAll(js);
         JSGlobalContextRelease(js.ctx);
         js.ctx = nullptr;
     }
@@ -1160,6 +1496,9 @@ static std::vector<ScriptItem> extractScriptsSimple(const std::string& html, con
 
 struct JscElementPriv {
     std::string id;
+    std::string tagName;
+    std::unordered_map<std::string, std::string> attrs;
+    std::string text;
 };
 
 struct JscStylePriv {
@@ -1220,6 +1559,20 @@ static bool jscStyleSetProperty(JSContextRef ctx, JSObjectRef object, JSStringRe
     return false;
 }
 
+
+#if defined(__APPLE__)
+// Forward declarations for element methods used by the property getter.
+static JSValueRef jscElementAddEventListener(JSContextRef ctx, JSObjectRef function,
+                                             JSObjectRef thisObject, size_t argumentCount,
+                                             const JSValueRef arguments[], JSValueRef* exception);
+static JSValueRef jscElementAppendChild(JSContextRef ctx, JSObjectRef function,
+                                       JSObjectRef thisObject, size_t argumentCount,
+                                       const JSValueRef arguments[], JSValueRef* exception);
+static JSValueRef jscElementSetAttribute(JSContextRef ctx, JSObjectRef function,
+                                        JSObjectRef thisObject, size_t argumentCount,
+                                        const JSValueRef arguments[], JSValueRef* exception);
+#endif
+
 static JSValueRef jscElementGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef* /*exception*/) {
     auto* priv = (JscElementPriv*)JSObjectGetPrivate(object);
     if (!priv) return JSValueMakeUndefined(ctx);
@@ -1239,8 +1592,163 @@ static JSValueRef jscElementGetProperty(JSContextRef ctx, JSObjectRef object, JS
         return styleObj;
     }
 
+
+    if (prop == "tagName") {
+        std::string tn = priv->tagName.empty() ? "DIV" : toUpperCopy(priv->tagName);
+        JSStringRef v = JSStringCreateWithUTF8CString(tn.c_str());
+        JSValueRef vStr = JSValueMakeString(ctx, v);
+        JSStringRelease(v);
+        return vStr;
+    }
+
+    if (prop == "addEventListener") {
+        JSStringRef n = JSStringCreateWithUTF8CString("addEventListener");
+        JSObjectRef fn = JSObjectMakeFunctionWithCallback(ctx, n, jscElementAddEventListener);
+        JSStringRelease(n);
+        return fn;
+    }
+
+    if (prop == "appendChild") {
+        JSStringRef n = JSStringCreateWithUTF8CString("appendChild");
+        JSObjectRef fn = JSObjectMakeFunctionWithCallback(ctx, n, jscElementAppendChild);
+        JSStringRelease(n);
+        return fn;
+    }
+
+    if (prop == "setAttribute") {
+        JSStringRef n = JSStringCreateWithUTF8CString("setAttribute");
+        JSObjectRef fn = JSObjectMakeFunctionWithCallback(ctx, n, jscElementSetAttribute);
+        JSStringRelease(n);
+        return fn;
+    }
     return JSValueMakeUndefined(ctx);
 }
+
+static bool jscElementSetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef value, JSValueRef*) {
+    auto* priv = (JscElementPriv*)JSObjectGetPrivate(object);
+    if (!priv) return false;
+
+    std::string prop = jsStringToUtf8(propertyName);
+
+    if (prop == "id") {
+        std::string newId = jsToUtf8(ctx, value);
+        if (!newId.empty()) {
+            priv->id = newId;
+            if (g_jsHost) g_jsHost->domIds.insert(newId);
+        }
+        return true;
+    }
+
+    if (prop == "textContent" || prop == "innerText") {
+        std::string t = jsToUtf8(ctx, value);
+        priv->text = t;
+        if (g_jsHost) {
+            if (!g_jsHost->domHtml.empty()) {
+                replaceElementTextById(g_jsHost->domHtml, priv->id, t);
+            }
+            g_jsHost->domDirty = true;
+        }
+        return true;
+    }
+
+    if (prop == "src" || prop == "href" || prop == "type") {
+        std::string v = jsToUtf8(ctx, value);
+        priv->attrs[toLowerCopy(prop)] = v;
+        return true;
+    }
+
+    return false;
+}
+
+static JSValueRef jscElementAddEventListener(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost) return JSValueMakeUndefined(ctx);
+    auto* priv = (JscElementPriv*)JSObjectGetPrivate(thisObject);
+    if (!priv) return JSValueMakeUndefined(ctx);
+    if (argc < 2) return JSValueMakeUndefined(ctx);
+
+    std::string type = jsToUtf8(ctx, argv[0]);
+    if (!JSValueIsObject(ctx, argv[1])) return JSValueMakeUndefined(ctx);
+    JSObjectRef fn = JSValueToObject(ctx, argv[1], nullptr);
+    if (!fn || !JSObjectIsFunction(ctx, fn)) return JSValueMakeUndefined(ctx);
+
+    jscAddListenerCtx(ctx, "el:" + priv->id + ":" + type, fn);
+    return JSValueMakeUndefined(ctx);
+}
+
+static std::string jscElementOuterHtml(const JscElementPriv& el) {
+    std::string tag = el.tagName.empty() ? "div" : el.tagName;
+    std::string out = "<" + tag;
+    if (!el.id.empty() && el.id.rfind("__", 0) != 0) {
+        out += " id=\"" + el.id + "\"";
+    }
+    for (const auto& kv : el.attrs) {
+        out += " " + kv.first + "=\"" + escapeHtmlEntities(kv.second) + "\"";
+    }
+    out += ">";
+    out += escapeHtmlEntities(el.text);
+    out += "</" + tag + ">";
+    return out;
+}
+
+static JSValueRef jscElementAppendChild(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost) return JSValueMakeUndefined(ctx);
+    auto* parent = (JscElementPriv*)JSObjectGetPrivate(thisObject);
+    if (!parent) return JSValueMakeUndefined(ctx);
+    if (argc < 1) return JSValueMakeUndefined(ctx);
+
+    if (!JSValueIsObject(ctx, argv[0])) return JSValueMakeUndefined(ctx);
+    JSObjectRef childObj = JSValueToObject(ctx, argv[0], nullptr);
+    auto* child = (JscElementPriv*)JSObjectGetPrivate(childObj);
+    if (!child) return JSValueMakeUndefined(ctx);
+
+    // If appending a <script> into head/body, try to load/execute it.
+    if (toLowerCopy(parent->tagName) == "head" || toLowerCopy(parent->tagName) == "body") {
+        std::string snippet = jscElementOuterHtml(*child);
+
+        if (!g_jsHost->domHtml.empty()) {
+            insertBeforeClosingTag(g_jsHost->domHtml, parent->tagName, snippet);
+        }
+        g_jsHost->domDirty = true;
+
+        if (toLowerCopy(child->tagName) == "script") {
+            std::string src = "";
+            auto it = child->attrs.find("src");
+            if (it != child->attrs.end()) src = it->second;
+
+            if (!src.empty()) {
+                std::string abs = resolveHref(g_jsHost->baseUrl, src);
+                if (abs.empty()) abs = src;
+                std::string code = fetchSubresourceText(abs);
+
+                JSStringRef script = JSStringCreateWithUTF8CString(code.c_str());
+                JSValueRef exc = nullptr;
+                (void)JSEvaluateScript(ctx, script, nullptr, nullptr, 1, &exc);
+                JSStringRelease(script);
+                if (exc) std::cerr << "[JS Exception] " << jsToUtf8(ctx, exc) << "\n";
+            } else if (!child->text.empty()) {
+                JSStringRef script = JSStringCreateWithUTF8CString(child->text.c_str());
+                JSValueRef exc = nullptr;
+                (void)JSEvaluateScript(ctx, script, nullptr, nullptr, 1, &exc);
+                JSStringRelease(script);
+                if (exc) std::cerr << "[JS Exception] " << jsToUtf8(ctx, exc) << "\n";
+            }
+        }
+    }
+
+    return argv[0];
+}
+
+static JSValueRef jscElementSetAttribute(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    auto* priv = (JscElementPriv*)JSObjectGetPrivate(thisObject);
+    if (!priv) return JSValueMakeUndefined(ctx);
+    if (argc < 2) return JSValueMakeUndefined(ctx);
+
+    std::string k = toLowerCopy(jsToUtf8(ctx, argv[0]));
+    std::string v = jsToUtf8(ctx, argv[1]);
+    if (!k.empty()) priv->attrs[k] = v;
+    return JSValueMakeUndefined(ctx);
+}
+
 
 static void jscEnsureDomClasses() {
     if (!g_jscStyleClass) {
@@ -1254,6 +1762,7 @@ static void jscEnsureDomClasses() {
         JSClassDefinition def = kJSClassDefinitionEmpty;
         def.finalize = jscFinalizeElement;
         def.getProperty = jscElementGetProperty;
+        def.setProperty = jscElementSetProperty;
         g_jscElementClass = JSClassCreate(&def);
     }
 }
@@ -1347,7 +1856,7 @@ static JSValueRef jscGetElementById(JSContextRef ctx, JSObjectRef, JSObjectRef, 
     // This prevents a lot of real-world scripts from crashing immediately.
     g_jsHost->domIds.insert(id);
     jscEnsureDomClasses();
-    JSObjectRef el = JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{id});
+    JSObjectRef el = JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{id, "div", {}, ""});
     return el;
 }
 
@@ -1371,16 +1880,54 @@ static void jsSetupPageGlobals(JSContextRef ctx, const std::string& url, const s
         JSStringRelease(v);
         JSStringRelease(k);
 
-        // Minimal DOM stubs
+        // document.addEventListener
         JSStringRef ael = JSStringCreateWithUTF8CString("addEventListener");
-        JSObjectRef aelFn = JSObjectMakeFunctionWithCallback(ctx, ael, jscNoop);
+        JSObjectRef aelFn = JSObjectMakeFunctionWithCallback(ctx, ael, [](JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) -> JSValueRef {
+            if (!g_jsHost) return JSValueMakeUndefined(ctx);
+            if (argc < 2) return JSValueMakeUndefined(ctx);
+            std::string type = jsToUtf8(ctx, argv[0]);
+            if (!JSValueIsObject(ctx, argv[1])) return JSValueMakeUndefined(ctx);
+            JSObjectRef fn = JSValueToObject(ctx, argv[1], nullptr);
+            if (!fn || !JSObjectIsFunction(ctx, fn)) return JSValueMakeUndefined(ctx);
+            jscAddListenerCtx(ctx, "document:" + type, fn);
+            return JSValueMakeUndefined(ctx);
+        });
         JSObjectSetProperty(ctx, document, ael, aelFn, kJSPropertyAttributeNone, nullptr);
         JSStringRelease(ael);
 
+        // document.getElementById
         JSStringRef gebi = JSStringCreateWithUTF8CString("getElementById");
         JSObjectRef gebiFn = JSObjectMakeFunctionWithCallback(ctx, gebi, jscGetElementById);
         JSObjectSetProperty(ctx, document, gebi, gebiFn, kJSPropertyAttributeNone, nullptr);
         JSStringRelease(gebi);
+
+        // document.createElement
+        JSStringRef ce = JSStringCreateWithUTF8CString("createElement");
+        JSObjectRef ceFn = JSObjectMakeFunctionWithCallback(ctx, ce, [](JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) -> JSValueRef {
+            if (!g_jsHost) return JSValueMakeNull(ctx);
+            if (argc < 1) return JSValueMakeNull(ctx);
+            std::string tag = toLowerCopy(jsToUtf8(ctx, argv[0]));
+            if (tag.empty()) tag = "div";
+
+            g_jsHost->domIds.insert("__el" + std::to_string(g_jsHost->nextTimerId)); // minor uniqueness
+            jscEnsureDomClasses();
+            std::string vid = "__el" + std::to_string(g_jsHost->nextTimerId++);
+            JSObjectRef el = JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{vid, tag, {}, ""});
+            return el;
+        });
+        JSObjectSetProperty(ctx, document, ce, ceFn, kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(ce);
+
+        // document.body and document.head
+        jscEnsureDomClasses();
+        JSObjectRef body = JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{"__body", "body", {}, ""});
+        JSObjectRef head = JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{"__head", "head", {}, ""});
+        JSStringRef bname = JSStringCreateWithUTF8CString("body");
+        JSObjectSetProperty(ctx, document, bname, body, kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(bname);
+        JSStringRef hname = JSStringCreateWithUTF8CString("head");
+        JSObjectSetProperty(ctx, document, hname, head, kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(hname);
 
         JSStringRef qs = JSStringCreateWithUTF8CString("querySelector");
         JSObjectRef qsFn = JSObjectMakeFunctionWithCallback(ctx, qs, jscReturnNull);
@@ -1406,7 +1953,24 @@ static void jsSetupPageGlobals(JSContextRef ctx, const std::string& url, const s
     JSObjectSetProperty(ctx, global, locName, location, kJSPropertyAttributeNone, nullptr);
     JSStringRelease(locName);
 
-    // navigator.userAgent
+    
+    // window.addEventListener
+    {
+        JSStringRef ael = JSStringCreateWithUTF8CString("addEventListener");
+        JSObjectRef aelFn = JSObjectMakeFunctionWithCallback(ctx, ael, [](JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) -> JSValueRef {
+            if (!g_jsHost) return JSValueMakeUndefined(ctx);
+            if (argc < 2) return JSValueMakeUndefined(ctx);
+            std::string type = jsToUtf8(ctx, argv[0]);
+            if (!JSValueIsObject(ctx, argv[1])) return JSValueMakeUndefined(ctx);
+            JSObjectRef fn = JSValueToObject(ctx, argv[1], nullptr);
+            if (!fn || !JSObjectIsFunction(ctx, fn)) return JSValueMakeUndefined(ctx);
+            jscAddListenerCtx(ctx, "window:" + type, fn);
+            return JSValueMakeUndefined(ctx);
+        });
+        JSObjectSetProperty(ctx, global, ael, aelFn, kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(ael);
+    }
+// navigator.userAgent
     JSObjectRef navigator = JSObjectMake(ctx, nullptr, nullptr);
     {
         JSStringRef k = JSStringCreateWithUTF8CString("userAgent");
@@ -1444,10 +2008,12 @@ static std::string runJavaScriptForHtml(JsEngine& js,
                                        const Url& baseUrl,
                                        const std::string& urlString) {
     js.host.currentUrl = urlString;
+    js.host.baseUrl = baseUrl;
 
     jsResetContext(js);
 
-    indexDomIdsFromHtml(js.host, html);
+    js.host.domHtml = stripNoscriptBlocks(html);
+    indexDomIdsFromHtml(js.host, js.host.domHtml);
 
     std::string initialTitle = extractTitleFromHtmlSimple(html);
     jsSetupPageGlobals(js.ctx, urlString, initialTitle);
@@ -1489,6 +2055,41 @@ static std::string runJavaScriptForHtml(JsEngine& js,
     return jsReadDocumentTitle(js.ctx);
 }
 
+
+
+static void jsPumpTimers(JsEngine& js) {
+    if (!js.ctx) return;
+    g_jsHost = &js.host;
+
+    double now = jscNowMs();
+    // Execute due timers; copy due list to avoid reentrancy issues.
+    std::vector<JsHost::TimerItem> due;
+    for (auto it = js.host.timers.begin(); it != js.host.timers.end(); ) {
+        if (it->dueMs <= now) {
+            due.push_back(*it);
+            if (it->fn) JSValueUnprotect(js.ctx, it->fn);
+            it = js.host.timers.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    for (auto& t : due) {
+        JSValueRef exc = nullptr;
+
+        if (t.isCode) {
+            JSStringRef script = JSStringCreateWithUTF8CString(t.code.c_str());
+            (void)JSEvaluateScript(js.ctx, script, nullptr, nullptr, 1, &exc);
+            JSStringRelease(script);
+        } else if (t.fn) {
+            JSObjectCallAsFunction(js.ctx, t.fn, nullptr, 0, nullptr, &exc);
+        }
+
+        if (exc) {
+            std::cerr << "[JS Exception] " << jsToUtf8(js.ctx, exc) << "\n";
+        }
+    }
+}
 #else
 // -------------------- JavaScript (QuickJS) --------------------
 
@@ -2585,6 +3186,13 @@ int main(int argc, char** argv) {
         {
             std::string jsTitle = runJavaScriptForHtml(js, t.page.body, t.page.baseUrl, t.page.urlString);
             if (!jsTitle.empty()) pageTitle = jsTitle;
+
+#if defined(__APPLE__)
+            // If JS mutated the HTML backing store, re-render from that.
+            if (!js.host.domHtml.empty()) {
+                t.page.body = js.host.domHtml;
+            }
+#endif
         }
 #endif
 
@@ -2740,7 +3348,31 @@ int main(int argc, char** argv) {
                     int mx = e.button.x;
                     int my = e.button.y;
 
-                    // Tabs bar interactions
+                    
+#ifdef NOCHROME_ENABLE_JS
+#if defined(__APPLE__)
+                    // Dispatch click event (best-effort).
+                    {
+                        g_jsHost = &js.host;
+                        JSObjectRef evt = JSObjectMake(js.ctx, nullptr, nullptr);
+                        JSStringRef tn = JSStringCreateWithUTF8CString("type");
+                        JSObjectSetProperty(js.ctx, evt, tn, JSValueMakeString(js.ctx, JSStringCreateWithUTF8CString("click")), kJSPropertyAttributeNone, nullptr);
+                        JSStringRelease(tn);
+
+                        JSStringRef xn = JSStringCreateWithUTF8CString("clientX");
+                        JSObjectSetProperty(js.ctx, evt, xn, JSValueMakeNumber(js.ctx, (double)mx), kJSPropertyAttributeNone, nullptr);
+                        JSStringRelease(xn);
+
+                        JSStringRef yn = JSStringCreateWithUTF8CString("clientY");
+                        JSObjectSetProperty(js.ctx, evt, yn, JSValueMakeNumber(js.ctx, (double)my), kJSPropertyAttributeNone, nullptr);
+                        JSStringRelease(yn);
+
+                        jscDispatchEventSimple(js.ctx, "window:click", evt);
+                        jscDispatchEventSimple(js.ctx, "document:click", evt);
+                    }
+#endif
+#endif
+// Tabs bar interactions
                     if (my < tabBarH) {
                         if (e.button.button == SDL_BUTTON_LEFT) {
                             if (hitTestPlus(mx, my)) {
@@ -2825,6 +3457,35 @@ int main(int argc, char** argv) {
                 case SDL_KEYDOWN: {
                     bool ctrl = (e.key.keysym.mod & KMOD_CTRL);
                     bool shift = (e.key.keysym.mod & KMOD_SHIFT);
+
+#ifdef NOCHROME_ENABLE_JS
+#if defined(__APPLE__)
+                    // Dispatch window/document keydown (best-effort, no target mapping).
+                    {
+                        g_jsHost = &js.host;
+                        JSObjectRef evt = JSObjectMake(js.ctx, nullptr, nullptr);
+                        JSStringRef tn = JSStringCreateWithUTF8CString("type");
+                        JSObjectSetProperty(js.ctx, evt, tn, JSValueMakeString(js.ctx, JSStringCreateWithUTF8CString("keydown")), kJSPropertyAttributeNone, nullptr);
+                        JSStringRelease(tn);
+
+                        const char* keyName = SDL_GetKeyName(e.key.keysym.sym);
+                        JSStringRef kn = JSStringCreateWithUTF8CString("key");
+                        JSObjectSetProperty(js.ctx, evt, kn, JSValueMakeString(js.ctx, JSStringCreateWithUTF8CString(keyName ? keyName : "")), kJSPropertyAttributeNone, nullptr);
+                        JSStringRelease(kn);
+
+                        JSStringRef cn = JSStringCreateWithUTF8CString("ctrlKey");
+                        JSObjectSetProperty(js.ctx, evt, cn, JSValueMakeBoolean(js.ctx, ctrl), kJSPropertyAttributeNone, nullptr);
+                        JSStringRelease(cn);
+
+                        JSStringRef sn = JSStringCreateWithUTF8CString("shiftKey");
+                        JSObjectSetProperty(js.ctx, evt, sn, JSValueMakeBoolean(js.ctx, shift), kJSPropertyAttributeNone, nullptr);
+                        JSStringRelease(sn);
+
+                        jscDispatchEventSimple(js.ctx, "window:keydown", evt);
+                        jscDispatchEventSimple(js.ctx, "document:keydown", evt);
+                    }
+#endif
+#endif
 
                     if (e.key.keysym.sym == SDLK_ESCAPE) {
                         running = false;
