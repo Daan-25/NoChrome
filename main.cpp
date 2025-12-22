@@ -5,22 +5,6 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
-#ifdef NOCHROME_ENABLE_JS
-#if defined(__APPLE__)
-#include <JavaScriptCore/JavaScriptCore.h>
-#else
-extern "C" {
-#if __has_include(<quickjs.h>)
-#include <quickjs.h>
-#elif __has_include(<quickjs/quickjs.h>)
-#include <quickjs/quickjs.h>
-#else
-#error "QuickJS headers not found. Install QuickJS (brew install quickjs) and ensure include path is set."
-#endif
-}
-#endif
-#endif
-
 #include <iostream>
 #include <string>
 #include <sstream>
@@ -29,9 +13,6 @@ extern "C" {
 #include <cctype>
 #include <optional>
 #include <unordered_map>
-#include <unordered_set>
-#include <chrono>
-#include <regex>
 #include <cmath>
 #include <cstdio>
 
@@ -71,6 +52,27 @@ static std::string trimCopy(const std::string& s) {
     size_t b = s.size();
     while (b > a && std::isspace((unsigned char)s[b - 1])) b--;
     return s.substr(a, b - a);
+}
+
+
+static std::string extractTitleFromHtmlSimple(const std::string& html) {
+    // Very small helper: look for <title>...</title> (case-insensitive).
+    // This is intentionally naive but good enough for tab labels.
+    std::string lower = toLowerCopy(html);
+    const std::string openTag = "<title";
+    size_t a = lower.find(openTag);
+    if (a == std::string::npos) return "";
+    size_t gt = lower.find('>', a);
+    if (gt == std::string::npos) return "";
+    size_t b = lower.find("</title>", gt + 1);
+    if (b == std::string::npos || b <= gt + 1) return "";
+    std::string inner = html.substr(gt + 1, b - (gt + 1));
+    // Collapse whitespace a bit
+    for (char& c : inner) {
+        if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+    }
+    inner = trimCopy(inner);
+    return inner;
 }
 
 static std::vector<std::string> splitBy(const std::string& s, char delim) {
@@ -154,7 +156,6 @@ static std::string resolveHref(const Url& base, const std::string& href) {
     if (href.empty()) return "";
     if (startsWith(href, "http://")) return href;
     if (startsWith(href, "https://")) return href;
-    if (startsWith(href, "//")) return base.scheme + ":" + href;
     if (href[0] == '#') return "";
 
     const std::string origin = buildOrigin(base);
@@ -587,13 +588,13 @@ static std::vector<std::string> parseClassList(const std::string& raw) {
 
 // -------------------- CSS v0.x --------------------
 
-struct TextStyle {
+struct Style {
     int fontSize = 20;
     SDL_Color color {20, 20, 20, 255};
     bool bold = false;
 };
 
-static bool styleEquals(const TextStyle& a, const TextStyle& b) {
+static bool styleEquals(const Style& a, const Style& b) {
     return a.fontSize == b.fontSize &&
            a.bold == b.bold &&
            a.color.r == b.color.r &&
@@ -807,7 +808,7 @@ static SDL_Color extractPageBackgroundFromRules(const std::vector<StyleRule>& ru
     return bg;
 }
 
-static void applyTagDefaults(const std::string& tag, TextStyle& st) {
+static void applyTagDefaults(const std::string& tag, Style& st) {
     if (tag == "h1") { st.fontSize = 34; st.bold = true; }
     else if (tag == "h2") { st.fontSize = 28; st.bold = true; }
     else if (tag == "h3") { st.fontSize = 24; st.bold = true; }
@@ -816,7 +817,7 @@ static void applyTagDefaults(const std::string& tag, TextStyle& st) {
     }
 }
 
-static void applyInlineStyle(const std::string& inlineCss, TextStyle& st) {
+static void applyInlineStyle(const std::string& inlineCss, Style& st) {
     StyleRule tmp;
     applyDeclarationsToRule(tmp, inlineCss);
 
@@ -834,7 +835,7 @@ static void applyRulesForElement(const std::vector<StyleRule>& rules,
                                  const std::string& tag,
                                  const std::string& id,
                                  const std::vector<std::string>& classes,
-                                 TextStyle& st) {
+                                 Style& st) {
     // Approximate specificity order: tag -> class -> tag.class -> id
     for (const auto& r : rules) {
         if (r.type == SelectorType::Tag && r.tag == tag) {
@@ -877,7 +878,7 @@ struct StyledToken {
     TokenKind kind;
     std::string text;
     std::string href;
-    TextStyle style;
+    Style style;
     int breakCount = 1;
 
     // Image
@@ -939,819 +940,6 @@ static std::string fetchSubresourceText(const std::string& absUrl) {
     return fetchSubresourceBytes(absUrl);
 }
 
-// -------------------- Page title helper --------------------
-
-static std::string extractTitleFromHtmlSimple(const std::string& html) {
-    auto titles = extractTagContents(html, "title");
-    if (titles.empty()) return "";
-    return trimCopy(decodeEntities(titles[0]));
-}
-
-#ifdef NOCHROME_ENABLE_JS
-#if defined(__APPLE__)
-// -------------------- JavaScript (JavaScriptCore) --------------------
-
-struct JsHost {
-    SDL_Window* window = nullptr;
-    std::string currentUrl;
-
-    // Minimal DOM state used by JS stubs
-    std::unordered_set<std::string> domIds;
-    std::unordered_map<std::string, std::string> styleDisplayById; // id -> display value (e.g. "none")
-    bool domDirty = false;
-
-    std::chrono::steady_clock::time_point perfStart = std::chrono::steady_clock::now();
-};
-
-struct JsEngine {
-    JSGlobalContextRef ctx = nullptr;
-    JsHost host;
-};
-
-static JsHost* g_jsHost = nullptr;
-
-// Forward declarations for JS callbacks used before their definitions
-static JSValueRef jscPerformanceNow(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*);
-
-static std::string jsToUtf8(JSContextRef ctx, JSValueRef v) {
-    if (!v) return "";
-    JSValueRef exc = nullptr;
-    JSStringRef s = JSValueToStringCopy(ctx, v, &exc);
-    if (!s) return "";
-    size_t maxSize = JSStringGetMaximumUTF8CStringSize(s);
-    std::string out;
-    out.resize(maxSize);
-    size_t written = JSStringGetUTF8CString(s, out.data(), maxSize);
-    JSStringRelease(s);
-    if (written > 0) out.resize(written - 1);
-    else out.clear();
-    return out;
-}
-
-static void jsDumpException(JSContextRef ctx, JSValueRef exc) {
-    if (!exc) return;
-    std::cerr << "[JS Exception] " << jsToUtf8(ctx, exc) << "\n";
-}
-
-static JSValueRef jscConsoleLog(JSContextRef ctx, JSObjectRef /*function*/, JSObjectRef /*thisObject*/,
-                               size_t argc, const JSValueRef argv[], JSValueRef* /*exception*/) {
-    for (size_t i = 0; i < argc; i++) {
-        std::cout << jsToUtf8(ctx, argv[i]);
-        if (i + 1 < argc) std::cout << " ";
-    }
-    std::cout << "\n";
-    return JSValueMakeUndefined(ctx);
-}
-
-static JSValueRef jscNoop(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*) {
-    return JSValueMakeUndefined(ctx);
-}
-
-static JSValueRef jscReturnNull(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*) {
-    return JSValueMakeNull(ctx);
-}
-
-static JSValueRef jscSetTimeout(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*) {
-    // Stub: real timers require an event loop integration.
-    return JSValueMakeNumber(ctx, 0);
-}
-
-static JSValueRef jscAlert(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) {
-    std::string msg;
-    if (argc > 0) msg = jsToUtf8(ctx, argv[0]);
-
-    SDL_Window* win = g_jsHost ? g_jsHost->window : nullptr;
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "alert()", msg.c_str(), win);
-    return JSValueMakeUndefined(ctx);
-}
-
-static void jsInstallBaseGlobals(JsEngine& js) {
-    JSObjectRef global = JSContextGetGlobalObject(js.ctx);
-
-    // console object
-    JSObjectRef consoleObj = JSObjectMake(js.ctx, nullptr, nullptr);
-
-    JSStringRef logName = JSStringCreateWithUTF8CString("log");
-    JSObjectRef logFn = JSObjectMakeFunctionWithCallback(js.ctx, logName, jscConsoleLog);
-    JSObjectSetProperty(js.ctx, consoleObj, logName, logFn, kJSPropertyAttributeNone, nullptr);
-    JSStringRelease(logName);
-
-    JSStringRef errName = JSStringCreateWithUTF8CString("error");
-    JSObjectRef errFn = JSObjectMakeFunctionWithCallback(js.ctx, errName, jscConsoleLog);
-    JSObjectSetProperty(js.ctx, consoleObj, errName, errFn, kJSPropertyAttributeNone, nullptr);
-    JSStringRelease(errName);
-
-    JSStringRef consoleName = JSStringCreateWithUTF8CString("console");
-    JSObjectSetProperty(js.ctx, global, consoleName, consoleObj, kJSPropertyAttributeNone, nullptr);
-    JSStringRelease(consoleName);
-
-    // window = global
-    JSStringRef windowName = JSStringCreateWithUTF8CString("window");
-    JSObjectSetProperty(js.ctx, global, windowName, global, kJSPropertyAttributeNone, nullptr);
-    JSStringRelease(windowName);
-
-    // self = global (common in browsers and workers)
-    JSStringRef selfName = JSStringCreateWithUTF8CString("self");
-    JSObjectSetProperty(js.ctx, global, selfName, global, kJSPropertyAttributeNone, nullptr);
-    JSStringRelease(selfName);
-
-    // performance.now()
-    JSObjectRef perfObj = JSObjectMake(js.ctx, nullptr, nullptr);
-    {
-        JSStringRef nowName = JSStringCreateWithUTF8CString("now");
-        JSObjectRef nowFn = JSObjectMakeFunctionWithCallback(js.ctx, nowName, jscPerformanceNow);
-        JSObjectSetProperty(js.ctx, perfObj, nowName, nowFn, kJSPropertyAttributeNone, nullptr);
-        JSStringRelease(nowName);
-    }
-    JSStringRef perfName = JSStringCreateWithUTF8CString("performance");
-    JSObjectSetProperty(js.ctx, global, perfName, perfObj, kJSPropertyAttributeNone, nullptr);
-    JSStringRelease(perfName);
-
-    // alert
-    JSStringRef alertName = JSStringCreateWithUTF8CString("alert");
-    JSObjectRef alertFn = JSObjectMakeFunctionWithCallback(js.ctx, alertName, jscAlert);
-    JSObjectSetProperty(js.ctx, global, alertName, alertFn, kJSPropertyAttributeNone, nullptr);
-    JSStringRelease(alertName);
-
-    // setTimeout stub
-    JSStringRef stName = JSStringCreateWithUTF8CString("setTimeout");
-    JSObjectRef stFn = JSObjectMakeFunctionWithCallback(js.ctx, stName, jscSetTimeout);
-    JSObjectSetProperty(js.ctx, global, stName, stFn, kJSPropertyAttributeNone, nullptr);
-    JSStringRelease(stName);
-
-    // addEventListener stub on window
-    JSStringRef aelName = JSStringCreateWithUTF8CString("addEventListener");
-    JSObjectRef aelFn = JSObjectMakeFunctionWithCallback(js.ctx, aelName, jscNoop);
-    JSObjectSetProperty(js.ctx, global, aelName, aelFn, kJSPropertyAttributeNone, nullptr);
-    JSStringRelease(aelName);
-}
-
-static bool jsInit(JsEngine& js) {
-    js.ctx = JSGlobalContextCreate(nullptr);
-    if (!js.ctx) return false;
-    g_jsHost = &js.host;
-    jsInstallBaseGlobals(js);
-    return true;
-}
-
-static void jsResetContext(JsEngine& js) {
-    if (js.ctx) {
-        JSGlobalContextRelease(js.ctx);
-        js.ctx = nullptr;
-    }
-    js.ctx = JSGlobalContextCreate(nullptr);
-    g_jsHost = &js.host;
-    jsInstallBaseGlobals(js);
-}
-
-static void jsShutdown(JsEngine& js) {
-    if (js.ctx) {
-        JSGlobalContextRelease(js.ctx);
-        js.ctx = nullptr;
-    }
-    if (g_jsHost == &js.host) g_jsHost = nullptr;
-}
-
-struct ScriptItem {
-    std::string code;
-    std::string srcAbs;
-    bool isModule = false;
-};
-
-static std::vector<ScriptItem> extractScriptsSimple(const std::string& html, const Url& baseUrl) {
-    std::vector<ScriptItem> out;
-
-    std::string lower = toLowerCopy(html);
-    size_t pos = 0;
-
-    while (true) {
-        size_t s = lower.find("<script", pos);
-        if (s == std::string::npos) break;
-
-        size_t gt = lower.find('>', s);
-        if (gt == std::string::npos) break;
-
-        std::string tagContent = html.substr(s + 1, gt - (s + 1)); // "script ..."
-
-        std::string type = toLowerCopy(getAttrValue(tagContent, "type"));
-        bool isModule = (type.find("module") != std::string::npos);
-
-        std::string src = trimCopy(getAttrValue(tagContent, "src"));
-
-        size_t end = lower.find("</script>", gt);
-        if (end == std::string::npos) break;
-
-        std::string inlineCode = html.substr(gt + 1, end - (gt + 1));
-
-        ScriptItem it;
-        it.isModule = isModule;
-        if (!src.empty()) it.srcAbs = resolveHref(baseUrl, src);
-        else it.code = inlineCode;
-
-        out.push_back(std::move(it));
-        pos = end + 9;
-    }
-
-    return out;
-}
-
-
-// -------------------- Minimal DOM stubs (id map + style.display) --------------------
-
-struct JscElementPriv {
-    std::string id;
-};
-
-struct JscStylePriv {
-    std::string id;
-};
-
-static JSClassRef g_jscElementClass = nullptr;
-static JSClassRef g_jscStyleClass = nullptr;
-
-static std::string jsStringToUtf8(JSStringRef s) {
-    size_t maxSize = JSStringGetMaximumUTF8CStringSize(s);
-    std::string out(maxSize, '\0');
-    size_t used = JSStringGetUTF8CString(s, out.data(), out.size());
-    if (used == 0) return "";
-    out.resize(used - 1);
-    return out;
-}
-
-static void jscFinalizeElement(JSObjectRef object) {
-    auto* priv = (JscElementPriv*)JSObjectGetPrivate(object);
-    delete priv;
-}
-
-static void jscFinalizeStyle(JSObjectRef object) {
-    auto* priv = (JscStylePriv*)JSObjectGetPrivate(object);
-    delete priv;
-}
-
-static JSValueRef jscStyleGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef* /*exception*/) {
-    auto* priv = (JscStylePriv*)JSObjectGetPrivate(object);
-    if (!priv || !g_jsHost) return JSValueMakeUndefined(ctx);
-
-    std::string prop = jsStringToUtf8(propertyName);
-    if (prop == "display") {
-        auto it = g_jsHost->styleDisplayById.find(priv->id);
-        if (it == g_jsHost->styleDisplayById.end()) return JSValueMakeUndefined(ctx);
-        JSStringRef v = JSStringCreateWithUTF8CString(it->second.c_str());
-        JSValueRef vStr = JSValueMakeString(ctx, v);
-        JSStringRelease(v);
-        return vStr;
-    }
-
-    return JSValueMakeUndefined(ctx);
-}
-
-static bool jscStyleSetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef value, JSValueRef* /*exception*/) {
-    auto* priv = (JscStylePriv*)JSObjectGetPrivate(object);
-    if (!priv || !g_jsHost) return false;
-
-    std::string prop = jsStringToUtf8(propertyName);
-    if (prop == "display") {
-        std::string v = jsToUtf8(ctx, value);
-        g_jsHost->styleDisplayById[priv->id] = v;
-        g_jsHost->domDirty = true;
-        return true;
-    }
-
-    return false;
-}
-
-static JSValueRef jscElementGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef* /*exception*/) {
-    auto* priv = (JscElementPriv*)JSObjectGetPrivate(object);
-    if (!priv) return JSValueMakeUndefined(ctx);
-
-    std::string prop = jsStringToUtf8(propertyName);
-
-    if (prop == "id") {
-        JSStringRef v = JSStringCreateWithUTF8CString(priv->id.c_str());
-        JSValueRef vStr = JSValueMakeString(ctx, v);
-        JSStringRelease(v);
-        return vStr;
-    }
-
-    if (prop == "style") {
-        // Create a style object bound to this element id
-        JSObjectRef styleObj = JSObjectMake(ctx, g_jscStyleClass, new JscStylePriv{priv->id});
-        return styleObj;
-    }
-
-    return JSValueMakeUndefined(ctx);
-}
-
-static void jscEnsureDomClasses() {
-    if (!g_jscStyleClass) {
-        JSClassDefinition def = kJSClassDefinitionEmpty;
-        def.finalize = jscFinalizeStyle;
-        def.getProperty = jscStyleGetProperty;
-        def.setProperty = jscStyleSetProperty;
-        g_jscStyleClass = JSClassCreate(&def);
-    }
-    if (!g_jscElementClass) {
-        JSClassDefinition def = kJSClassDefinitionEmpty;
-        def.finalize = jscFinalizeElement;
-        def.getProperty = jscElementGetProperty;
-        g_jscElementClass = JSClassCreate(&def);
-    }
-}
-
-static void indexDomIdsFromHtml(JsHost& host, const std::string& html) {
-    host.domIds.clear();
-
-    // Very simple scan for id="..." or id='...'
-    static const std::regex reId(R"(id\s*=\s*(['"])([^'"]+)\1)", std::regex_constants::icase);
-    auto begin = std::sregex_iterator(html.begin(), html.end(), reId);
-    auto end = std::sregex_iterator();
-    for (auto it = begin; it != end; ++it) {
-        host.domIds.insert((*it)[2].str());
-    }
-}
-
-static bool isDisplayNone(const JsHost& host, const std::string& id) {
-    auto it = host.styleDisplayById.find(id);
-    if (it == host.styleDisplayById.end()) return false;
-    std::string v = toLowerCopy(trimCopy(it->second));
-    return (v == "none");
-}
-
-static std::string stripFirstElementById(const std::string& html, const std::string& id) {
-    // Best-effort remover: find first tag containing id="id" and remove that element.
-    std::string needle1 = "id=\"" + id + "\"";
-    std::string needle2 = "id='" + id + "'";
-    size_t pos = html.find(needle1);
-    if (pos == std::string::npos) pos = html.find(needle2);
-    if (pos == std::string::npos) return html;
-
-    size_t tagStart = html.rfind('<', pos);
-    if (tagStart == std::string::npos) return html;
-
-    size_t tagEnd = html.find('>', pos);
-    if (tagEnd == std::string::npos) return html;
-
-    // Extract tag name
-    size_t nameStart = tagStart + 1;
-    while (nameStart < html.size() && std::isspace((unsigned char)html[nameStart])) nameStart++;
-    if (nameStart < html.size() && html[nameStart] == '/') return html;
-
-    size_t nameEnd = nameStart;
-    while (nameEnd < html.size() && std::isalpha((unsigned char)html[nameEnd])) nameEnd++;
-    std::string tag = toLowerCopy(html.substr(nameStart, nameEnd - nameStart));
-    if (tag.empty()) return html;
-
-    // Self-closing?
-    bool selfClose = false;
-    {
-        size_t check = tagEnd;
-        while (check > tagStart && std::isspace((unsigned char)html[check - 1])) check--;
-        if (check > tagStart && html[check - 1] == '/') selfClose = true;
-    }
-
-    if (selfClose || tag == "img" || tag == "br" || tag == "meta" || tag == "link" || tag == "input") {
-        // Remove only the tag itself
-        return html.substr(0, tagStart) + html.substr(tagEnd + 1);
-    }
-
-    std::string closeTag = "</" + tag + ">";
-    size_t closePos = html.find(closeTag, tagEnd + 1);
-    if (closePos == std::string::npos) {
-        // Fallback: remove opening tag only
-        return html.substr(0, tagStart) + html.substr(tagEnd + 1);
-    }
-
-    size_t closeEnd = closePos + closeTag.size();
-    return html.substr(0, tagStart) + html.substr(closeEnd);
-}
-
-static std::string applyDisplayNonePatches(const std::string& html, const JsHost& host) {
-    std::string out = html;
-    // Remove each element with display:none (best effort, first occurrence)
-    for (const auto& kv : host.styleDisplayById) {
-        if (isDisplayNone(host, kv.first)) {
-            out = stripFirstElementById(out, kv.first);
-        }
-    }
-    return out;
-}
-
-static JSValueRef jscGetElementById(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) {
-    if (!g_jsHost) return JSValueMakeNull(ctx);
-    if (argc < 1) return JSValueMakeNull(ctx);
-
-    std::string id = jsToUtf8(ctx, argv[0]);
-    if (id.empty()) return JSValueMakeNull(ctx);
-
-    // If the element is not known, return a "virtual" element instead of null.
-    // This prevents a lot of real-world scripts from crashing immediately.
-    g_jsHost->domIds.insert(id);
-    jscEnsureDomClasses();
-    JSObjectRef el = JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{id});
-    return el;
-}
-
-static JSValueRef jscPerformanceNow(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*) {
-    if (!g_jsHost) return JSValueMakeNumber(ctx, 0.0);
-    auto now = std::chrono::steady_clock::now();
-    double ms = std::chrono::duration<double, std::milli>(now - g_jsHost->perfStart).count();
-    return JSValueMakeNumber(ctx, ms);
-}
-
-static void jsSetupPageGlobals(JSContextRef ctx, const std::string& url, const std::string& title) {
-    JSObjectRef global = JSContextGetGlobalObject(ctx);
-
-    // document
-    JSObjectRef document = JSObjectMake(ctx, nullptr, nullptr);
-    {
-        JSStringRef k = JSStringCreateWithUTF8CString("title");
-        JSStringRef v = JSStringCreateWithUTF8CString(title.c_str());
-        JSValueRef vStr = JSValueMakeString(ctx, v);
-        JSObjectSetProperty(ctx, document, k, vStr, kJSPropertyAttributeNone, nullptr);
-        JSStringRelease(v);
-        JSStringRelease(k);
-
-        // Minimal DOM stubs
-        JSStringRef ael = JSStringCreateWithUTF8CString("addEventListener");
-        JSObjectRef aelFn = JSObjectMakeFunctionWithCallback(ctx, ael, jscNoop);
-        JSObjectSetProperty(ctx, document, ael, aelFn, kJSPropertyAttributeNone, nullptr);
-        JSStringRelease(ael);
-
-        JSStringRef gebi = JSStringCreateWithUTF8CString("getElementById");
-        JSObjectRef gebiFn = JSObjectMakeFunctionWithCallback(ctx, gebi, jscGetElementById);
-        JSObjectSetProperty(ctx, document, gebi, gebiFn, kJSPropertyAttributeNone, nullptr);
-        JSStringRelease(gebi);
-
-        JSStringRef qs = JSStringCreateWithUTF8CString("querySelector");
-        JSObjectRef qsFn = JSObjectMakeFunctionWithCallback(ctx, qs, jscReturnNull);
-        JSObjectSetProperty(ctx, document, qs, qsFn, kJSPropertyAttributeNone, nullptr);
-        JSStringRelease(qs);
-    }
-
-    JSStringRef docName = JSStringCreateWithUTF8CString("document");
-    JSObjectSetProperty(ctx, global, docName, document, kJSPropertyAttributeNone, nullptr);
-    JSStringRelease(docName);
-
-    // location.href
-    JSObjectRef location = JSObjectMake(ctx, nullptr, nullptr);
-    {
-        JSStringRef k = JSStringCreateWithUTF8CString("href");
-        JSStringRef v = JSStringCreateWithUTF8CString(url.c_str());
-        JSValueRef vStr = JSValueMakeString(ctx, v);
-        JSObjectSetProperty(ctx, location, k, vStr, kJSPropertyAttributeNone, nullptr);
-        JSStringRelease(v);
-        JSStringRelease(k);
-    }
-    JSStringRef locName = JSStringCreateWithUTF8CString("location");
-    JSObjectSetProperty(ctx, global, locName, location, kJSPropertyAttributeNone, nullptr);
-    JSStringRelease(locName);
-
-    // navigator.userAgent
-    JSObjectRef navigator = JSObjectMake(ctx, nullptr, nullptr);
-    {
-        JSStringRef k = JSStringCreateWithUTF8CString("userAgent");
-        JSStringRef v = JSStringCreateWithUTF8CString("NoChrome/0.10 (JavaScriptCore)");
-        JSValueRef vStr = JSValueMakeString(ctx, v);
-        JSObjectSetProperty(ctx, navigator, k, vStr, kJSPropertyAttributeNone, nullptr);
-        JSStringRelease(v);
-        JSStringRelease(k);
-    }
-    JSStringRef navName = JSStringCreateWithUTF8CString("navigator");
-    JSObjectSetProperty(ctx, global, navName, navigator, kJSPropertyAttributeNone, nullptr);
-    JSStringRelease(navName);
-}
-
-static std::string jsReadDocumentTitle(JSContextRef ctx) {
-    JSObjectRef global = JSContextGetGlobalObject(ctx);
-
-    JSStringRef docName = JSStringCreateWithUTF8CString("document");
-    JSValueRef docVal = JSObjectGetProperty(ctx, global, docName, nullptr);
-    JSStringRelease(docName);
-    if (!docVal || !JSValueIsObject(ctx, docVal)) return "";
-
-    JSObjectRef docObj = (JSObjectRef)docVal;
-
-    JSStringRef titleName = JSStringCreateWithUTF8CString("title");
-    JSValueRef titleVal = JSObjectGetProperty(ctx, docObj, titleName, nullptr);
-    JSStringRelease(titleName);
-
-    if (!titleVal) return "";
-    return jsToUtf8(ctx, titleVal);
-}
-
-static std::string runJavaScriptForHtml(JsEngine& js,
-                                       const std::string& html,
-                                       const Url& baseUrl,
-                                       const std::string& urlString) {
-    js.host.currentUrl = urlString;
-
-    jsResetContext(js);
-
-    indexDomIdsFromHtml(js.host, html);
-
-    std::string initialTitle = extractTitleFromHtmlSimple(html);
-    jsSetupPageGlobals(js.ctx, urlString, initialTitle);
-
-    auto scripts = extractScriptsSimple(html, baseUrl);
-
-    int externalCount = 0;
-    for (auto& sc : scripts) {
-        if (sc.isModule) {
-            // Best-effort: treat module scripts like normal scripts.
-            // Many modern sites use type="module". If the source uses
-            // real module syntax (import/export), JavaScriptCore will throw
-            // a SyntaxError and we will ignore it.
-        }
-        std::string code = sc.code;
-        std::string filename = "<inline>";
-
-        if (!sc.srcAbs.empty()) {
-            if (externalCount >= 16) break;
-            code = fetchSubresourceText(sc.srcAbs);
-            filename = sc.srcAbs;
-            externalCount++;
-        }
-
-        if (trimCopy(code).empty()) continue;
-
-        JSStringRef scriptStr = JSStringCreateWithUTF8CString(code.c_str());
-        JSStringRef sourceUrl = JSStringCreateWithUTF8CString(filename.c_str());
-
-        JSValueRef exc = nullptr;
-        (void)JSEvaluateScript(js.ctx, scriptStr, nullptr, sourceUrl, 1, &exc);
-
-        JSStringRelease(sourceUrl);
-        JSStringRelease(scriptStr);
-
-        if (exc) jsDumpException(js.ctx, exc);
-    }
-
-    return jsReadDocumentTitle(js.ctx);
-}
-
-#else
-// -------------------- JavaScript (QuickJS) --------------------
-
-struct JsHost {
-    SDL_Window* window = nullptr;
-    std::string currentUrl;
-};
-
-struct JsEngine {
-    JSRuntime* rt = nullptr;
-    JSContext* ctx = nullptr;
-    JsHost host;
-};
-
-static void jsDumpException(JSContext* ctx) {
-    JSValue exc = JS_GetException(ctx);
-
-    const char* msg = JS_ToCString(ctx, exc);
-    if (msg) {
-        std::cerr << "[JS Exception] " << msg << "\n";
-        JS_FreeCString(ctx, msg);
-    }
-
-    JSValue stack = JS_GetPropertyStr(ctx, exc, "stack");
-    if (JS_IsString(stack)) {
-        const char* st = JS_ToCString(ctx, stack);
-        if (st) {
-            std::cerr << st << "\n";
-            JS_FreeCString(ctx, st);
-        }
-    }
-
-    JS_FreeValue(ctx, stack);
-    JS_FreeValue(ctx, exc);
-}
-
-static JSValue jsConsoleLog(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
-    for (int i = 0; i < argc; i++) {
-        const char* s = JS_ToCString(ctx, argv[i]);
-        if (s) {
-            std::cout << s;
-            JS_FreeCString(ctx, s);
-        } else {
-            std::cout << "[unprintable]";
-        }
-        if (i + 1 < argc) std::cout << " ";
-    }
-    std::cout << "\n";
-    return JS_UNDEFINED;
-}
-
-static JSValue jsNoop(JSContext* /*ctx*/, JSValueConst /*this_val*/, int /*argc*/, JSValueConst* /*argv*/) {
-    return JS_UNDEFINED;
-}
-
-static JSValue jsReturnNull(JSContext* /*ctx*/, JSValueConst /*this_val*/, int /*argc*/, JSValueConst* /*argv*/) {
-    return JS_NULL;
-}
-
-static JSValue jsSetTimeout(JSContext* ctx, JSValueConst /*this_val*/, int /*argc*/, JSValueConst* /*argv*/) {
-    // Stub: real timers require an event loop. Return 0 as fake timer id.
-    return JS_NewInt32(ctx, 0);
-}
-
-static JSValue jsAlert(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
-    std::string msg;
-    if (argc > 0) {
-        const char* s = JS_ToCString(ctx, argv[0]);
-        if (s) {
-            msg = s;
-            JS_FreeCString(ctx, s);
-        }
-    }
-
-    JsHost* host = (JsHost*)JS_GetContextOpaque(ctx);
-    SDL_Window* win = host ? host->window : nullptr;
-
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "alert()", msg.c_str(), win);
-    return JS_UNDEFINED;
-}
-
-static bool jsInit(JsEngine& js) {
-    js.rt = JS_NewRuntime();
-    return js.rt != nullptr;
-}
-
-static void jsResetContext(JsEngine& js) {
-    if (js.ctx) {
-        JS_FreeContext(js.ctx);
-        js.ctx = nullptr;
-    }
-
-    js.ctx = JS_NewContext(js.rt);
-    JS_SetContextOpaque(js.ctx, &js.host);
-
-    JSValue global = JS_GetGlobalObject(js.ctx);
-
-    // window = global
-    JS_SetPropertyStr(js.ctx, global, "window", JS_DupValue(js.ctx, global));
-
-    // console.log / console.error
-    JSValue consoleObj = JS_NewObject(js.ctx);
-    JS_SetPropertyStr(js.ctx, consoleObj, "log", JS_NewCFunction(js.ctx, jsConsoleLog, "log", 1));
-    JS_SetPropertyStr(js.ctx, consoleObj, "error", JS_NewCFunction(js.ctx, jsConsoleLog, "error", 1));
-    JS_SetPropertyStr(js.ctx, global, "console", consoleObj);
-
-    // alert()
-    JS_SetPropertyStr(js.ctx, global, "alert", JS_NewCFunction(js.ctx, jsAlert, "alert", 1));
-
-    // setTimeout (stub)
-    JS_SetPropertyStr(js.ctx, global, "setTimeout", JS_NewCFunction(js.ctx, jsSetTimeout, "setTimeout", 2));
-
-    JS_FreeValue(js.ctx, global);
-}
-
-static void jsShutdown(JsEngine& js) {
-    if (js.ctx) JS_FreeContext(js.ctx);
-    if (js.rt) JS_FreeRuntime(js.rt);
-    js.ctx = nullptr;
-    js.rt = nullptr;
-}
-
-struct ScriptItem {
-    std::string code;
-    std::string srcAbs;
-    bool isModule = false;
-};
-
-static std::vector<ScriptItem> extractScriptsSimple(const std::string& html, const Url& baseUrl) {
-    std::vector<ScriptItem> out;
-
-    std::string lower = toLowerCopy(html);
-    size_t pos = 0;
-
-    while (true) {
-        size_t s = lower.find("<script", pos);
-        if (s == std::string::npos) break;
-
-        size_t gt = lower.find('>', s);
-        if (gt == std::string::npos) break;
-
-        std::string tagContent = html.substr(s + 1, gt - (s + 1)); // "script ..."
-
-        std::string type = toLowerCopy(getAttrValue(tagContent, "type"));
-        bool isModule = (type.find("module") != std::string::npos);
-
-        std::string src = trimCopy(getAttrValue(tagContent, "src"));
-
-        size_t end = lower.find("</script>", gt);
-        if (end == std::string::npos) break;
-
-        std::string inlineCode = html.substr(gt + 1, end - (gt + 1));
-
-        ScriptItem it;
-        it.isModule = isModule;
-        if (!src.empty()) it.srcAbs = resolveHref(baseUrl, src);
-        else it.code = inlineCode;
-
-        out.push_back(std::move(it));
-        pos = end + 9;
-    }
-
-    return out;
-}
-
-static void jsSetupPageGlobals(JSContext* ctx, const std::string& url, const std::string& title) {
-    JSValue global = JS_GetGlobalObject(ctx);
-
-    JSValue document = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, document, "title", JS_NewString(ctx, title.c_str()));
-
-    // Minimal DOM stubs so scripts don't crash instantly
-    JS_SetPropertyStr(ctx, document, "addEventListener", JS_NewCFunction(ctx, jsNoop, "addEventListener", 2));
-    JS_SetPropertyStr(ctx, document, "getElementById", JS_NewCFunction(ctx, jsReturnNull, "getElementById", 1));
-    JS_SetPropertyStr(ctx, document, "querySelector", JS_NewCFunction(ctx, jsReturnNull, "querySelector", 1));
-
-    JS_SetPropertyStr(ctx, global, "document", document);
-
-    JSValue location = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, location, "href", JS_NewString(ctx, url.c_str()));
-    JS_SetPropertyStr(ctx, global, "location", location);
-
-    JSValue navigator = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, navigator, "userAgent", JS_NewString(ctx, "NoChrome/0.10 (QuickJS)"));
-    JS_SetPropertyStr(ctx, global, "navigator", navigator);
-
-    // window.addEventListener stub
-    JSValue win = JS_GetPropertyStr(ctx, global, "window");
-    if (JS_IsObject(win)) {
-        JS_SetPropertyStr(ctx, win, "addEventListener", JS_NewCFunction(ctx, jsNoop, "addEventListener", 2));
-    }
-    JS_FreeValue(ctx, win);
-
-    JS_FreeValue(ctx, global);
-}
-
-static std::string jsReadDocumentTitle(JSContext* ctx) {
-    std::string out;
-
-    JSValue global = JS_GetGlobalObject(ctx);
-    JSValue doc = JS_GetPropertyStr(ctx, global, "document");
-
-    if (JS_IsObject(doc)) {
-        JSValue t = JS_GetPropertyStr(ctx, doc, "title");
-        const char* s = JS_ToCString(ctx, t);
-        if (s) {
-            out = s;
-            JS_FreeCString(ctx, s);
-        }
-        JS_FreeValue(ctx, t);
-    }
-
-    JS_FreeValue(ctx, doc);
-    JS_FreeValue(ctx, global);
-
-    return out;
-}
-
-static std::string runJavaScriptForHtml(JsEngine& js,
-                                       const std::string& html,
-                                       const Url& baseUrl,
-                                       const std::string& urlString) {
-    js.host.currentUrl = urlString;
-
-    jsResetContext(js);
-
-    std::string initialTitle = extractTitleFromHtmlSimple(html);
-    jsSetupPageGlobals(js.ctx, urlString, initialTitle);
-
-    auto scripts = extractScriptsSimple(html, baseUrl);
-
-    int externalCount = 0;
-    for (auto& sc : scripts) {
-        if (sc.isModule) {
-            // Modules require an import loader. Skip for now.
-            continue;
-        }
-
-        std::string code = sc.code;
-        std::string filename = "<inline>";
-
-        if (!sc.srcAbs.empty()) {
-            if (externalCount >= 16) break;
-            code = fetchSubresourceText(sc.srcAbs);
-            filename = sc.srcAbs;
-            externalCount++;
-        }
-
-        if (trimCopy(code).empty()) continue;
-
-        JSValue v = JS_Eval(js.ctx, code.c_str(), code.size(), filename.c_str(), JS_EVAL_TYPE_GLOBAL);
-        if (JS_IsException(v)) {
-            jsDumpException(js.ctx);
-        }
-        JS_FreeValue(js.ctx, v);
-    }
-
-    return jsReadDocumentTitle(js.ctx);
-}
-#endif
-#endif
-
-
 // -------------------- HTML -> Styled tokens --------------------
 
 static std::vector<StyledToken> parseHtmlToStyledTokens(const std::string& html,
@@ -1799,25 +987,20 @@ static std::vector<StyledToken> parseHtmlToStyledTokens(const std::string& html,
     cleaned = removeTagBlocks(cleaned, "style");
     cleaned = removeTagBlocks(cleaned, "head");
 
-
-#ifdef NOCHROME_ENABLE_JS
-    // If JS is enabled, do not render <noscript> fallbacks.
-    cleaned = removeTagBlocks(cleaned, "noscript");
-#endif
     std::vector<StyledToken> tokens;
 
     bool inTag = false;
     std::string tagBuf;
     std::string textBuf;
 
-    std::vector<TextStyle> styleStack;
+    std::vector<Style> styleStack;
     std::vector<std::string> hrefStack;
 
-    TextStyle base;
+    Style base;
     styleStack.push_back(base);
     hrefStack.push_back("");
 
-    auto currentStyle = [&]()->TextStyle {
+    auto currentStyle = [&]()->Style {
         return styleStack.empty() ? base : styleStack.back();
     };
     auto currentHref = [&]()->std::string {
@@ -1842,7 +1025,7 @@ static std::vector<StyledToken> parseHtmlToStyledTokens(const std::string& html,
 
         std::istringstream iss(t);
         std::string w;
-        TextStyle st = currentStyle();
+        Style st = currentStyle();
         std::string href = currentHref();
 
         while (iss >> w) {
@@ -1923,7 +1106,7 @@ static std::vector<StyledToken> parseHtmlToStyledTokens(const std::string& html,
             return;
         }
 
-        TextStyle st = currentStyle();
+        Style st = currentStyle();
 
         std::string id = trimCopy(getAttrValue(t, "id"));
         std::string classAttr = getAttrValue(t, "class");
@@ -2050,7 +1233,7 @@ static int textWidth(TTF_Font* font, const std::string& s) {
     return w;
 }
 
-static SDL_Surface* renderTextWithStyle(TTF_Font* font, const std::string& text, const TextStyle& st) {
+static SDL_Surface* renderTextWithStyle(TTF_Font* font, const std::string& text, const Style& st) {
     if (!font) return nullptr;
 
     int old = TTF_GetFontStyle(font);
@@ -2069,13 +1252,13 @@ static SDL_Surface* renderTextWithStyle(TTF_Font* font, const std::string& text,
 struct StyledWord {
     std::string text;
     std::string href;
-    TextStyle style;
+    Style style;
 };
 
 struct RenderSpan {
     std::string text;
     std::string href;
-    TextStyle style;
+    Style style;
 
     SDL_Texture* texture = nullptr;
     int w = 0;
@@ -2248,7 +1431,7 @@ static std::vector<RenderBlock> buildBlocksFromTokens(SDL_Renderer* renderer,
             StyledToken t;
             t.kind = TokenKind::Word;
             t.text = alt;
-            t.style = TextStyle{};
+            t.style = Style{};
             // Push as a simple text block via currentLine
             currentLine.push_back({t.text, "", t.style});
             flushLine();
@@ -2385,7 +1568,7 @@ static void rebuildLayout(Page& page,
                           int contentWidth,
                           int padding,
                           int baseLineHeight) {
-    destroyBlocks(renderer, page.blocks);
+    // (per-tab) blocks are freed below
 
     SDL_Color bg = page.background;
     auto tokens = parseHtmlToStyledTokens(page.body, page.baseUrl, &bg);
@@ -2473,23 +1656,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-
-#ifdef NOCHROME_ENABLE_JS
-    JsEngine js;
-    if (!jsInit(js)) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "QuickJS init failed");
-        freeFontSet(fonts);
-        SDL_DestroyRenderer(renderer);
-        SDL_DestroyWindow(window);
-        IMG_Quit();
-        TTF_Quit();
-        SDL_Quit();
-        return 1;
-    }
-    js.host.window = window;
-#endif
-
-    const int topBarH = 56;
+    const int tabBarH = 26;
+    const int addrBarH = 56;
+    const int topBarH = tabBarH + addrBarH;
     const int padding = 18;
 
     int winW = 1100, winH = 750;
@@ -2501,98 +1670,132 @@ int main(int argc, char** argv) {
     auto calcAddressRect = [&](int w){
         SDL_Rect r;
         r.x = 12;
-        r.y = 10;
+        r.y = tabBarH + 10;
         r.w = std::max(200, w - 24);
-        r.h = topBarH - 20;
+        r.h = addrBarH - 20;
         return r;
     };
 
     SDL_Rect addressRect = calcAddressRect(winW);
 
-    Page page;
-    page.urlString = normalizeUserUrl(startUrl);
-    page.body = loadPageBodyText(page.urlString, page.baseUrl);
+    struct TabState {
+        Page page;
+        std::string title;
+        std::string addressInput;
+        bool addressFocused = false;
+        float scrollYf = 0.0f;
+    };
 
-    std::string pageTitle = extractTitleFromHtmlSimple(page.body);
-#ifdef NOCHROME_ENABLE_JS
-    {
-        std::string jsTitle = runJavaScriptForHtml(js, page.body, page.baseUrl, page.urlString);
-        if (!jsTitle.empty()) pageTitle = jsTitle;
-    }
-#endif
+    std::vector<TabState> tabs;
+    tabs.reserve(8);
+    int activeTab = 0;
 
-#ifdef NOCHROME_ENABLE_JS
-    if (js.host.domDirty) {
-        page.body = applyDisplayNonePatches(page.body, js.host);
-        js.host.domDirty = false;
-    }
-#endif
-
-#ifdef NOCHROME_ENABLE_JS
-    if (js.host.domDirty) {
-        page.body = applyDisplayNonePatches(page.body, js.host);
-        js.host.domDirty = false;
-    }
-#endif
-
-    rebuildLayout(page, renderer, fonts, contentWidth, padding, baseLineHeight);
-
-    if (!pageTitle.empty()) SDL_SetWindowTitle(window, ("NoChrome - " + pageTitle).c_str());
-    else SDL_SetWindowTitle(window, ("NoChrome - " + page.urlString).c_str());
-
-    bool addressFocused = false;
-    std::string addressInput = page.urlString;
+    auto updateWindowTitle = [&](){
+        const TabState& t = tabs[activeTab];
+        std::string label = t.title.empty() ? t.page.urlString : t.title;
+        SDL_SetWindowTitle(window, ("NoChrome - " + label).c_str());
+    };
 
     auto focusAddress = [&](){
-        addressFocused = true;
+        TabState& t = tabs[activeTab];
+        t.addressFocused = true;
         SDL_StartTextInput();
-        addressInput = page.urlString;
+        t.addressInput = t.page.urlString;
     };
 
     auto blurAddress = [&](){
-        addressFocused = false;
+        TabState& t = tabs[activeTab];
+        t.addressFocused = false;
         SDL_StopTextInput();
     };
 
-    auto loadUrlIntoPage = [&](const std::string& rawUrl){
+    auto loadUrlIntoTab = [&](TabState& t, const std::string& rawUrl){
         std::string norm = normalizeUserUrl(rawUrl);
         Url u;
         std::string body = loadPageBodyText(norm, u);
 
-        page.baseUrl = u;
-        page.urlString = norm;
-        page.body = body;
+        t.page.baseUrl = u;
+        t.page.urlString = norm;
+        t.page.body = body;
 
-        std::string pageTitle = extractTitleFromHtmlSimple(page.body);
-#ifdef NOCHROME_ENABLE_JS
-        {
-            std::string jsTitle = runJavaScriptForHtml(js, page.body, page.baseUrl, page.urlString);
-            if (!jsTitle.empty()) pageTitle = jsTitle;
+        rebuildLayout(t.page, renderer, fonts, contentWidth, padding, baseLineHeight);
+
+        t.addressInput = t.page.urlString;
+
+        t.title = extractTitleFromHtmlSimple(t.page.body);
+        if (t.title.empty()) {
+            if (!t.page.baseUrl.host.empty()) t.title = t.page.baseUrl.host;
+            else t.title = t.page.urlString;
         }
-#endif
-
-        rebuildLayout(page, renderer, fonts, contentWidth, padding, baseLineHeight);
-
-        addressInput = page.urlString;
-        if (!pageTitle.empty()) SDL_SetWindowTitle(window, ("NoChrome - " + pageTitle).c_str());
-        else SDL_SetWindowTitle(window, ("NoChrome - " + page.urlString).c_str());
     };
 
-    float scrollYf = 0.0f;
+    auto setActiveTab = [&](int idx){
+        if (idx < 0 || idx >= (int)tabs.size()) return;
+
+        // Handle text input on focus change
+        bool leavingFocused = tabs[activeTab].addressFocused;
+        activeTab = idx;
+
+        if (leavingFocused && !tabs[activeTab].addressFocused) {
+            SDL_StopTextInput();
+        }
+        if (tabs[activeTab].addressFocused) {
+            SDL_StartTextInput();
+        }
+
+        updateWindowTitle();
+    };
+
+    auto newTab = [&](const std::string& url){
+        TabState t;
+        t.addressFocused = false;
+        t.scrollYf = 0.0f;
+
+        loadUrlIntoTab(t, url);
+
+        tabs.push_back(std::move(t));
+        setActiveTab((int)tabs.size() - 1);
+    };
+
+    auto closeTab = [&](int idx){
+        if ((int)tabs.size() <= 1) return;
+        if (idx < 0 || idx >= (int)tabs.size()) return;
+
+        // If we're closing the currently focused address bar, stop text input.
+        if (idx == activeTab && tabs[idx].addressFocused) {
+            SDL_StopTextInput();
+        }
+
+        destroyBlocks(renderer, tabs[idx].page.blocks);
+        tabs.erase(tabs.begin() + idx);
+
+        if (idx < activeTab) {
+            activeTab--;
+        } else if (idx == activeTab) {
+            activeTab = std::max(0, activeTab - 1);
+        }
+
+        if (activeTab >= (int)tabs.size()) activeTab = (int)tabs.size() - 1;
+        updateWindowTitle();
+    };
+
+    // Create first tab
+    newTab(startUrl);
 
     auto maxScroll = [&](){
         int viewH = std::max(10, winH - topBarH);
-        return std::max(0, page.contentHeight - viewH);
+        return std::max(0, tabs[activeTab].page.contentHeight - viewH);
     };
 
     auto clampScroll = [&](){
         float m = (float)maxScroll();
-        if (scrollYf < 0) scrollYf = 0;
-        if (scrollYf > m) scrollYf = m;
+        float& s = tabs[activeTab].scrollYf;
+        if (s < 0) s = 0;
+        if (s > m) s = m;
     };
     clampScroll();
 
-    TTF_Font* uiFont = fonts.f16;
+TTF_Font* uiFont = fonts.f16;
 
     auto renderUiText = [&](const std::string& text, SDL_Color col){
         if (!uiFont) return (SDL_Texture*)nullptr;
@@ -2620,21 +1823,85 @@ int main(int argc, char** argv) {
                         addressRect = calcAddressRect(winW);
                         contentWidth = winW;
 
-                        rebuildLayout(page, renderer, fonts, contentWidth, padding, baseLineHeight);
+                        for (auto& t : tabs) {
+                            rebuildLayout(t.page, renderer, fonts, contentWidth, padding, baseLineHeight);
+                        }
                         clampScroll();
                     }
                     break;
 
                 case SDL_MOUSEWHEEL: {
                     float dy = (e.wheel.preciseY != 0.0f) ? e.wheel.preciseY : (float)e.wheel.y;
-                    scrollYf -= dy * (float)baseLineHeight * 2.0f;
+                    tabs[activeTab].scrollYf -= dy * (float)baseLineHeight * 2.0f;
                     clampScroll();
-                    break;
+break;
                 }
 
                 case SDL_MOUSEBUTTONDOWN: {
                     int mx = e.button.x;
                     int my = e.button.y;
+
+                    // Clicks in the tab bar
+                    if (my < tabBarH) {
+                        // Recompute tab UI for hit testing
+                        const int plusW = 28;
+                        SDL_Rect plusRect{ winW - plusW - 10, 4, plusW, tabBarH - 8 };
+
+                        int availableW = std::max(100, plusRect.x - 10);
+                        int count = std::max(1, (int)tabs.size());
+                        int gap = 6;
+                        int desired = 170;
+                        int tabW = desired;
+                        if (count > 0) {
+                            tabW = (availableW - (count - 1) * gap - 10) / count;
+                            tabW = std::max(110, std::min(desired, tabW));
+                        }
+
+                        int x = 10;
+                        int h = tabBarH - 8;
+
+                        // Plus button
+                        if (pointInRect(mx, my, plusRect) && e.button.button == SDL_BUTTON_LEFT) {
+                            newTab("https://example.com/");
+                            tabs[activeTab].scrollYf = 0.0f;
+                            clampScroll();
+                            break;
+                        }
+
+                        for (int ti = 0; ti < count; ++ti) {
+                            SDL_Rect tr{ x, 4, tabW, h };
+                            SDL_Rect cr{ tr.x + tr.w - 18, tr.y + (tr.h - 14) / 2, 14, 14 };
+
+                            bool inTab = pointInRect(mx, my, tr);
+                            bool inClose = pointInRect(mx, my, cr);
+
+                            if (inClose && e.button.button == SDL_BUTTON_LEFT) {
+                                closeTab(ti);
+                                clampScroll();
+                                break;
+                            }
+
+                            if (inTab) {
+                                if (e.button.button == SDL_BUTTON_MIDDLE) {
+                                    closeTab(ti);
+                                    clampScroll();
+                                    break;
+                                }
+                                if (e.button.button == SDL_BUTTON_LEFT) {
+                                    setActiveTab(ti);
+                                    clampScroll();
+                                    break;
+                                }
+                            }
+
+                            x += tabW + gap;
+                            if (x + 30 >= plusRect.x) break;
+                        }
+
+                        break;
+                    }
+
+
 
                     if (pointInRect(mx, my, addressRect)) {
                         focusAddress();
@@ -2644,21 +1911,22 @@ int main(int argc, char** argv) {
                     }
 
                     if (my >= topBarH && e.button.button == SDL_BUTTON_LEFT) {
-                        int scrollY = (int)scrollYf;
+                        int scrollY = (int)tabs[activeTab].scrollYf;
                         int contentY = (my - topBarH) + scrollY;
 
-                        for (const auto& hit : page.linkHits) {
+                        for (const auto& hit : tabs[activeTab].page.linkHits) {
                             SDL_Rect r = hit.rect;
 
                             if (mx >= r.x && mx < r.x + r.w &&
                                 contentY >= r.y && contentY < r.y + r.h) {
 
-                                std::string abs = resolveHref(page.baseUrl, hit.href);
+                                std::string abs = resolveHref(tabs[activeTab].page.baseUrl, hit.href);
                                 if (abs.empty()) break;
 
-                                loadUrlIntoPage(abs);
-                                scrollYf = 0;
+                                loadUrlIntoTab(tabs[activeTab], abs);
+                                tabs[activeTab].scrollYf = 0;
                                 clampScroll();
+                                updateWindowTitle();
                                 break;
                             }
                         }
@@ -2667,13 +1935,37 @@ int main(int argc, char** argv) {
                 }
 
                 case SDL_TEXTINPUT:
-                    if (addressFocused) {
-                        addressInput += e.text.text;
+                    if (tabs[activeTab].addressFocused) {
+                        tabs[activeTab].addressInput += e.text.text;
                     }
                     break;
 
                 case SDL_KEYDOWN: {
                     bool ctrl = (e.key.keysym.mod & KMOD_CTRL);
+
+                    if (ctrl && e.key.keysym.sym == SDLK_t) {
+                        newTab("https://example.com/");
+                        tabs[activeTab].scrollYf = 0.0f;
+                        clampScroll();
+                        break;
+                    }
+                    if (ctrl && e.key.keysym.sym == SDLK_w) {
+                        closeTab(activeTab);
+                        clampScroll();
+                        break;
+                    }
+                    if (ctrl && e.key.keysym.sym == SDLK_TAB) {
+                        bool shift = (e.key.keysym.mod & KMOD_SHIFT);
+                        int n = (int)tabs.size();
+                        if (n > 0) {
+                            int next = shift ? (activeTab - 1 + n) % n : (activeTab + 1) % n;
+                            setActiveTab(next);
+                            clampScroll();
+                        }
+                        break;
+                    }
+
+
 
                     if (e.key.keysym.sym == SDLK_ESCAPE) {
                         running = false;
@@ -2684,22 +1976,23 @@ int main(int argc, char** argv) {
                         break;
                     }
 
-                    if (addressFocused) {
+                    if (tabs[activeTab].addressFocused) {
                         if (e.key.keysym.sym == SDLK_BACKSPACE) {
-                            if (!addressInput.empty()) addressInput.pop_back();
+                            if (!tabs[activeTab].addressInput.empty()) tabs[activeTab].addressInput.pop_back();
                         } else if (e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_KP_ENTER) {
-                            loadUrlIntoPage(addressInput);
-                            scrollYf = 0;
+                            loadUrlIntoTab(tabs[activeTab], tabs[activeTab].addressInput);
+                            tabs[activeTab].scrollYf = 0;
                             clampScroll();
+                            updateWindowTitle();
                             blurAddress();
                         }
                     } else {
-                        if (e.key.keysym.sym == SDLK_DOWN) { scrollYf += baseLineHeight; clampScroll(); }
-                        if (e.key.keysym.sym == SDLK_UP)   { scrollYf -= baseLineHeight; clampScroll(); }
-                        if (e.key.keysym.sym == SDLK_PAGEDOWN) { scrollYf += (winH - topBarH) * 0.5f; clampScroll(); }
-                        if (e.key.keysym.sym == SDLK_PAGEUP)   { scrollYf -= (winH - topBarH) * 0.5f; clampScroll(); }
-                        if (e.key.keysym.sym == SDLK_HOME) { scrollYf = 0; clampScroll(); }
-                        if (e.key.keysym.sym == SDLK_END)  { scrollYf = (float)maxScroll(); clampScroll(); }
+                        if (e.key.keysym.sym == SDLK_DOWN) { tabs[activeTab].scrollYf += baseLineHeight; clampScroll(); }
+                        if (e.key.keysym.sym == SDLK_UP)   { tabs[activeTab].scrollYf -= baseLineHeight; clampScroll(); }
+                        if (e.key.keysym.sym == SDLK_PAGEDOWN) { tabs[activeTab].scrollYf += (winH - topBarH) * 0.5f; clampScroll(); }
+                        if (e.key.keysym.sym == SDLK_PAGEUP)   { tabs[activeTab].scrollYf -= (winH - topBarH) * 0.5f; clampScroll(); }
+                        if (e.key.keysym.sym == SDLK_HOME) { tabs[activeTab].scrollYf = 0; clampScroll(); }
+                        if (e.key.keysym.sym == SDLK_END)  { tabs[activeTab].scrollYf = (float)maxScroll(); clampScroll(); }
                     }
 
                     break;
@@ -2714,21 +2007,107 @@ int main(int argc, char** argv) {
         SDL_Rect topBar { 0, 0, winW, topBarH };
         drawFilledRect(renderer, topBar, 24, 24, 28);
 
+        // ---------- Tabs ----------
+        auto calcTabUi = [&](){
+            struct TabUi { std::vector<SDL_Rect> tabs; std::vector<SDL_Rect> closes; SDL_Rect plus; };
+            TabUi ui;
+
+            const int plusW = 28;
+            ui.plus = SDL_Rect{ winW - plusW - 10, 4, plusW, tabBarH - 8 };
+
+            int availableW = std::max(100, ui.plus.x - 10);
+            int count = std::max(1, (int)tabs.size());
+            int gap = 6;
+            int desired = 170;
+            int tabW = desired;
+            if (count > 0) {
+                tabW = (availableW - (count - 1) * gap - 10) / count;
+                tabW = std::max(110, std::min(desired, tabW));
+            }
+
+            int x = 10;
+            int h = tabBarH - 8;
+            for (int ti = 0; ti < count; ++ti) {
+                SDL_Rect r{ x, 4, tabW, h };
+                ui.tabs.push_back(r);
+
+                SDL_Rect cx{ r.x + r.w - 18, r.y + (r.h - 14) / 2, 14, 14 };
+                ui.closes.push_back(cx);
+
+                x += tabW + gap;
+                if (x + 30 >= ui.plus.x) break;
+            }
+            return ui;
+        };
+
+        // Tab bar background
+        SDL_Rect tabBar{ 0, 0, winW, tabBarH };
+        drawFilledRect(renderer, tabBar, 18, 18, 22);
+
+        auto tabUi = calcTabUi();
+
+        // Draw tabs
+        for (int ti = 0; ti < (int)tabUi.tabs.size(); ++ti) {
+            bool isActive = (ti == activeTab);
+            SDL_Rect tr = tabUi.tabs[ti];
+            drawFilledRect(renderer, tr,
+                           isActive ? 34 : 26,
+                           isActive ? 34 : 26,
+                           isActive ? 40 : 30);
+
+            // Title
+            std::string label = tabs[ti].title.empty() ? tabs[ti].page.urlString : tabs[ti].title;
+            if ((int)label.size() > 22) label = label.substr(0, 22) + "...";
+
+            SDL_Texture* ttex = renderUiText(label, SDL_Color{ 220, 220, 220, 255 });
+            if (ttex) {
+                int tw = 0, th = 0;
+                SDL_QueryTexture(ttex, nullptr, nullptr, &tw, &th);
+                SDL_Rect dst{ tr.x + 10, tr.y + (tr.h - th) / 2, std::min(tw, tr.w - 34), th };
+                SDL_RenderCopy(renderer, ttex, nullptr, &dst);
+                SDL_DestroyTexture(ttex);
+            }
+
+            // Close "x"
+            SDL_Texture* xtex = renderUiText("x", SDL_Color{ 200, 200, 200, 255 });
+            if (xtex) {
+                int tw = 0, th = 0;
+                SDL_QueryTexture(xtex, nullptr, nullptr, &tw, &th);
+                SDL_Rect dst{ tabUi.closes[ti].x, tabUi.closes[ti].y - 1, tw, th };
+                SDL_RenderCopy(renderer, xtex, nullptr, &dst);
+                SDL_DestroyTexture(xtex);
+            }
+        }
+
+        // Plus button
+        drawFilledRect(renderer, tabUi.plus, 30, 30, 36);
+        SDL_Texture* ptex = renderUiText("+", SDL_Color{ 240, 240, 240, 255 });
+        if (ptex) {
+            int tw = 0, th = 0;
+            SDL_QueryTexture(ptex, nullptr, nullptr, &tw, &th);
+            SDL_Rect dst{ tabUi.plus.x + (tabUi.plus.w - tw) / 2, tabUi.plus.y + (tabUi.plus.h - th) / 2, tw, th };
+            SDL_RenderCopy(renderer, ptex, nullptr, &dst);
+            SDL_DestroyTexture(ptex);
+        }
+
+        // ---------- Address bar ----------
+
+
         drawFilledRect(renderer, addressRect,
-                       addressFocused ? 38 : 32,
-                       addressFocused ? 38 : 32,
-                       addressFocused ? 44 : 40);
+                       tabs[activeTab].addressFocused ? 38 : 32,
+                       tabs[activeTab].addressFocused ? 38 : 32,
+                       tabs[activeTab].addressFocused ? 44 : 40);
 
         SDL_SetRenderDrawColor(renderer,
-                               addressFocused ? 90 : 60,
-                               addressFocused ? 140 : 60,
-                               addressFocused ? 200 : 60,
+                               tabs[activeTab].addressFocused ? 90 : 60,
+                               tabs[activeTab].addressFocused ? 140 : 60,
+                               tabs[activeTab].addressFocused ? 200 : 60,
                                255);
         SDL_RenderDrawRect(renderer, &addressRect);
 
         {
             SDL_Color col { 230, 230, 230, 255 };
-            std::string shown = addressFocused ? addressInput : page.urlString;
+            std::string shown = tabs[activeTab].addressFocused ? tabs[activeTab].addressInput : tabs[activeTab].page.urlString;
             if (shown.empty()) shown = "http://";
 
             SDL_Texture* tex = renderUiText(shown, col);
@@ -2749,14 +2128,14 @@ int main(int argc, char** argv) {
 
         SDL_Rect contentBg { 0, topBarH, winW, winH - topBarH };
         drawFilledRect(renderer, contentBg,
-                       page.background.r,
-                       page.background.g,
-                       page.background.b,
-                       page.background.a);
+                       tabs[activeTab].page.background.r,
+                       tabs[activeTab].page.background.g,
+                       tabs[activeTab].page.background.b,
+                       tabs[activeTab].page.background.a);
 
-        int scrollY = (int)scrollYf;
+        int scrollY = (int)tabs[activeTab].scrollYf;
 
-        for (const auto& b : page.blocks) {
+        for (const auto& b : tabs[activeTab].page.blocks) {
             int yScreen = topBarH + b.y - scrollY;
 
             if (yScreen > winH) continue;
@@ -2798,12 +2177,13 @@ int main(int argc, char** argv) {
         SDL_RenderPresent(renderer);
     }
 
-    destroyBlocks(renderer, page.blocks);
-    freeFontSet(fonts);
+    // (per-tab) blocks are freed below
+        // Free all tabs
+    for (auto& t : tabs) {
+        destroyBlocks(renderer, t.page.blocks);
+    }
 
-#ifdef NOCHROME_ENABLE_JS
-    jsShutdown(js);
-#endif
+freeFontSet(fonts);
 
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
