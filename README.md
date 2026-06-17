@@ -6,35 +6,36 @@ A from-scratch browser project in C++ with SDL2, SDL2_ttf and sdl2_image.
 The current implementation is an early prototype of the rendering and UI pipeline.
 
 ## Current Features
-- Windowed GUI
-- Address bar (Ctrl+L to focus)
-- HTTPS page loading
-- Basic HTML-to-text rendering
-- Clickable links
-- Trackpad-friendly scrolling
-- Basic CSS support (early v0.x)
-  - tag selectors (`h1`, `p`, `a`, ...)
-  - class selectors (`.card`)
-  - id selectors (`#main`)
-  - `tag.class` selectors (`div.card`)
-  - comma groups (`h1, h2 { ... }`)
-  - inline styles
-  - properties: `color`, `font-size`, `font-weight`
-- Simple spacing heuristics for headings/paragraphs
+- Windowed GUI with tabs (Ctrl+T new tab, Ctrl+W close tab, Ctrl+L focus address bar)
+- HTTP and HTTPS page loading (OpenSSL) with chunked transfer decoding
+- HTML-to-text rendering with inline images (PNG/JPEG via SDL2_image)
+- Clickable links and trackpad-friendly scrolling
+- CSS support (early v0.x)
+  - tag, class, id and `tag.class` selectors, comma groups, inline styles
+  - external stylesheets (`<link rel="stylesheet">`)
+  - properties: `color`, `font-size`, `font-weight`, page `background`
+- JavaScript support (JavaScriptCore on macOS, QuickJS elsewhere)
+  - `console`, `alert`, `performance.now`, `setTimeout`/`clearTimeout`, `fetch` (Promise + `.then`)
+  - DOM: `getElementById`, `querySelector("#id")`, `createElement`, `document.body`/`head`,
+    `textContent`/`innerHTML`, `style.display`, `setAttribute`/`getAttribute`, `appendChild`
+  - events: `window`/`document`/element `addEventListener` with `click` and `keydown` dispatch
 
 ## Limitations (Current Stage)
-- No HTTPS
-- No JavaScript execution
-- No full DOM/box model layout
-- No external stylesheets (`<link rel="stylesheet">`) yet
-- Rendering is text-focused with line-based layout
+- No full DOM tree or box model layout (line-based rendering; HTML parsed best-effort)
+- DOM mutations are applied to a backing HTML string, not a live tree
+- JavaScript is a useful subset, not a complete engine integration:
+  - no ES module loading, event bubbling, or `removeEventListener`
+  - `querySelector` supports only `#id`
+  - a single shared JS context (multi-tab JS is not isolated)
+- No form controls / input widgets yet
 
 ## Requirements
 - C++17 compiler
 - CMake
-- SDL2
-- SDL2_ttf
-- A TTF font file (recommended: `fonts/DejaVuSans.ttf`)
+- SDL2, SDL2_ttf, SDL2_image
+- OpenSSL (for HTTPS)
+- A JavaScript engine: JavaScriptCore (bundled on macOS) or QuickJS (other platforms)
+- A TTF font (DejaVu Sans ships in `fonts/`; common system fonts are used as a fallback)
 
 ## Project Structure
 ```text
@@ -56,8 +57,7 @@ cmake --build build
 ## Build (Linux)
 ```bash
 # Debian/Ubuntu
-sudo apt-get install cmake g++ libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev libssl-dev quickjs
-sudo apt install libssl-dev
+sudo apt-get install cmake g++ libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev libssl-dev quickjs libquickjs
 
 cmake -S . -B build
 cmake --build build
@@ -65,7 +65,7 @@ cmake --build build
 
 ## Run
 ```bash
-./build/TinyGuiBrowser http://example.com/
+./build/NoChrome http://example.com/
 ```
 
 ## Roadmap (High Level)

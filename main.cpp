@@ -903,6 +903,8 @@ struct StyledToken {
     TextStyle style;
     int breakCount = 1;
 
+    std::string elementId; // nearest ancestor element id (for click routing)
+
     // Image
     std::string imgSrcAbs;
     int imgAttrW = 0;
@@ -3153,16 +3155,21 @@ static std::vector<StyledToken> parseHtmlToStyledTokens(const std::string& html,
 
     std::vector<TextStyle> styleStack;
     std::vector<std::string> hrefStack;
+    std::vector<std::string> idStack;
 
     TextStyle base;
     styleStack.push_back(base);
     hrefStack.push_back("");
+    idStack.push_back("");
 
     auto currentStyle = [&]()->TextStyle {
         return styleStack.empty() ? base : styleStack.back();
     };
     auto currentHref = [&]()->std::string {
         return hrefStack.empty() ? "" : hrefStack.back();
+    };
+    auto currentId = [&]()->std::string {
+        return idStack.empty() ? "" : idStack.back();
     };
 
     auto pushBreakN = [&](int n){
@@ -3185,6 +3192,7 @@ static std::vector<StyledToken> parseHtmlToStyledTokens(const std::string& html,
         std::string w;
         TextStyle st = currentStyle();
         std::string href = currentHref();
+        std::string eid = currentId();
 
         while (iss >> w) {
             StyledToken tok;
@@ -3192,6 +3200,7 @@ static std::vector<StyledToken> parseHtmlToStyledTokens(const std::string& html,
             tok.text = w;
             tok.href = href;
             tok.style = st;
+            tok.elementId = eid;
             tokens.push_back(std::move(tok));
         }
     };
@@ -3199,6 +3208,7 @@ static std::vector<StyledToken> parseHtmlToStyledTokens(const std::string& html,
     auto popOne = [&](){
         if (styleStack.size() > 1) styleStack.pop_back();
         if (hrefStack.size() > 1) hrefStack.pop_back();
+        if (idStack.size() > 1) idStack.pop_back();
     };
 
     auto parseIntAttr = [&](const std::string& s)->int{
@@ -3283,6 +3293,7 @@ static std::vector<StyledToken> parseHtmlToStyledTokens(const std::string& html,
             href = trimCopy(getAttrValue(t, "href"));
         }
         hrefStack.push_back(href);
+        idStack.push_back(id.empty() ? currentId() : id);
 
         if (isBlockTagName(name)) {
             pushBreakN(defaultBreakCountForTag(name));
@@ -3331,33 +3342,47 @@ struct FontSet {
     TTF_Font* f34 = nullptr;
 };
 
-static std::string findFontPath() {
-    if (FILE* f = fopen("fonts/DejaVuSans.ttf", "rb")) { fclose(f); return "fonts/DejaVuSans.ttf"; }
-    if (FILE* f = fopen("DejaVuSans.ttf", "rb")) { fclose(f); return "DejaVuSans.ttf"; }
-
+static std::vector<std::string> fontCandidates() {
+    return {
+        "fonts/DejaVuSans.ttf",
+        "DejaVuSans.ttf",
 #ifdef __APPLE__
-    if (FILE* f = fopen("/System/Library/Fonts/Supplemental/Arial.ttf", "rb")) { fclose(f); return "/System/Library/Fonts/Supplemental/Arial.ttf"; }
-    if (FILE* f = fopen("/System/Library/Fonts/Supplemental/Helvetica.ttf", "rb")) { fclose(f); return "/System/Library/Fonts/Supplemental/Helvetica.ttf"; }
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Helvetica.ttf",
+        "/Library/Fonts/Arial.ttf",
 #endif
-
-#ifdef __linux__
-    if (FILE* f = fopen("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "rb")) { fclose(f); return "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"; }
-#endif
-
-    return "";
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    };
 }
 
 static bool loadFontSet(FontSet& fs) {
-    std::string path = findFontPath();
-    if (path.empty()) return false;
+    // Try each candidate; skip ones that fail to open (e.g. missing or a
+    // zero-byte placeholder) and fall through to the next.
+    for (const auto& path : fontCandidates()) {
+        TTF_Font* probe = TTF_OpenFont(path.c_str(), 16);
+        if (!probe) continue;
+        TTF_CloseFont(probe);
 
-    fs.f16 = TTF_OpenFont(path.c_str(), 16);
-    fs.f20 = TTF_OpenFont(path.c_str(), 20);
-    fs.f24 = TTF_OpenFont(path.c_str(), 24);
-    fs.f28 = TTF_OpenFont(path.c_str(), 28);
-    fs.f34 = TTF_OpenFont(path.c_str(), 34);
+        fs.f16 = TTF_OpenFont(path.c_str(), 16);
+        fs.f20 = TTF_OpenFont(path.c_str(), 20);
+        fs.f24 = TTF_OpenFont(path.c_str(), 24);
+        fs.f28 = TTF_OpenFont(path.c_str(), 28);
+        fs.f34 = TTF_OpenFont(path.c_str(), 34);
 
-    return fs.f16 && fs.f20 && fs.f24 && fs.f28 && fs.f34;
+        if (fs.f16 && fs.f20 && fs.f24 && fs.f28 && fs.f34) return true;
+
+        // Partial open: close whatever opened and try the next candidate.
+        if (fs.f16) TTF_CloseFont(fs.f16);
+        if (fs.f20) TTF_CloseFont(fs.f20);
+        if (fs.f24) TTF_CloseFont(fs.f24);
+        if (fs.f28) TTF_CloseFont(fs.f28);
+        if (fs.f34) TTF_CloseFont(fs.f34);
+        fs = {};
+    }
+    return false;
 }
 
 static void freeFontSet(FontSet& fs) {
@@ -3411,12 +3436,14 @@ struct StyledWord {
     std::string text;
     std::string href;
     TextStyle style;
+    std::string elementId;
 };
 
 struct RenderSpan {
     std::string text;
     std::string href;
     TextStyle style;
+    std::string elementId;
 
     SDL_Texture* texture = nullptr;
     int w = 0;
@@ -3451,6 +3478,11 @@ struct LinkHit {
     std::string href;
 };
 
+struct ElementHit {
+    SDL_Rect rect; // Content coordinates (bounding box of an element's rendered text)
+    std::string id;
+};
+
 static void destroyBlocks(SDL_Renderer* renderer, std::vector<RenderBlock>& blocks) {
     (void)renderer;
     for (auto& b : blocks) {
@@ -3475,18 +3507,21 @@ static std::vector<RenderSpan> groupWordsToSpans(const std::vector<StyledWord>& 
     cur.text = words[0].text;
     cur.href = words[0].href;
     cur.style = words[0].style;
+    cur.elementId = words[0].elementId;
 
     for (size_t i = 1; i < words.size(); ++i) {
         bool sameHref = (words[i].href == cur.href);
         bool sameStyle = styleEquals(words[i].style, cur.style);
+        bool sameId = (words[i].elementId == cur.elementId);
 
-        if (sameHref && sameStyle) {
+        if (sameHref && sameStyle && sameId) {
             cur.text += " " + words[i].text;
         } else {
             spans.push_back(cur);
             cur.text = words[i].text;
             cur.href = words[i].href;
             cur.style = words[i].style;
+            cur.elementId = words[i].elementId;
         }
     }
 
@@ -3524,9 +3559,11 @@ static std::vector<RenderBlock> buildBlocksFromTokens(SDL_Renderer* renderer,
                                                       int contentWidth,
                                                       int padding,
                                                       int baseLineHeight,
-                                                      std::vector<LinkHit>& outLinks) {
+                                                      std::vector<LinkHit>& outLinks,
+                                                      std::vector<ElementHit>& outElements) {
     std::vector<RenderBlock> blocks;
     outLinks.clear();
+    outElements.clear();
 
     const int maxLineW = std::max(10, contentWidth - padding * 2);
 
@@ -3591,7 +3628,7 @@ static std::vector<RenderBlock> buildBlocksFromTokens(SDL_Renderer* renderer,
             t.text = alt;
             t.style = TextStyle{};
             // Push as a simple text block via currentLine
-            currentLine.push_back({t.text, "", t.style});
+            currentLine.push_back({t.text, "", t.style, ""});
             flushLine();
             addSpacer(baseLineHeight / 2);
             return;
@@ -3645,7 +3682,7 @@ static std::vector<RenderBlock> buildBlocksFromTokens(SDL_Renderer* renderer,
         }
 
         // Word
-        StyledWord w { t.text, t.href, t.style };
+        StyledWord w { t.text, t.href, t.style, t.elementId };
         TTF_Font* f = pickFont(fonts, w.style.fontSize);
 
         int wW = textWidth(f, w.text);
@@ -3667,8 +3704,9 @@ static std::vector<RenderBlock> buildBlocksFromTokens(SDL_Renderer* renderer,
 
     flushLine();
 
-    // Assign y positions + build link hitboxes
+    // Assign y positions + build link / element hitboxes
     int y = padding;
+    std::unordered_map<std::string, SDL_Rect> idRects;
     for (auto& b : blocks) {
         b.y = y;
         y += b.h;
@@ -3683,9 +3721,26 @@ static std::vector<RenderBlock> buildBlocksFromTokens(SDL_Renderer* renderer,
             if (!sp.href.empty() && sp.w > 0 && sp.h > 0) {
                 outLinks.push_back({ r, sp.href });
             }
+            if (!sp.elementId.empty() && sp.w > 0 && sp.h > 0) {
+                auto it = idRects.find(sp.elementId);
+                if (it == idRects.end()) {
+                    idRects[sp.elementId] = r;
+                } else {
+                    SDL_Rect& u = it->second;
+                    int x0 = std::min(u.x, r.x);
+                    int y0 = std::min(u.y, r.y);
+                    int x1 = std::max(u.x + u.w, r.x + r.w);
+                    int y1 = std::max(u.y + u.h, r.y + r.h);
+                    u = SDL_Rect{ x0, y0, x1 - x0, y1 - y0 };
+                }
+            }
             TTF_Font* f = pickFont(fonts, sp.style.fontSize);
             x += sp.w + textWidth(f, " ");
         }
+    }
+
+    for (auto& kv : idRects) {
+        outElements.push_back(ElementHit{ kv.second, kv.first });
     }
 
     return blocks;
@@ -3702,6 +3757,7 @@ struct Page {
 
     std::vector<RenderBlock> blocks;
     std::vector<LinkHit> linkHits;
+    std::vector<ElementHit> elementHits;
     int contentHeight = 0;
 };
 
@@ -3732,7 +3788,7 @@ static void rebuildLayout(Page& page,
     auto tokens = parseHtmlToStyledTokens(page.body, page.baseUrl, &bg);
     page.background = bg;
 
-    page.blocks = buildBlocksFromTokens(renderer, fonts, tokens, contentWidth, padding, baseLineHeight, page.linkHits);
+    page.blocks = buildBlocksFromTokens(renderer, fonts, tokens, contentWidth, padding, baseLineHeight, page.linkHits, page.elementHits);
 
     int last = padding;
     for (const auto& b : page.blocks) {
@@ -4179,6 +4235,43 @@ int main(int argc, char** argv) {
                         int contentY = (my - chromeH) + scrollY;
 
                         auto& page = tabs[activeTab].page;
+
+#ifdef NOCHROME_ENABLE_JS
+                        // Dispatch a click to the innermost element with an id under the cursor.
+                        if (js.ctx && activeJsTab == activeTab) {
+                            std::string hitId;
+                            long bestArea = -1;
+                            for (const auto& eh : page.elementHits) {
+                                const SDL_Rect& r = eh.rect;
+                                if (mx >= r.x && mx < r.x + r.w &&
+                                    contentY >= r.y && contentY < r.y + r.h) {
+                                    long area = (long)r.w * (long)r.h;
+                                    if (bestArea < 0 || area < bestArea) {
+                                        bestArea = area;
+                                        hitId = eh.id;
+                                    }
+                                }
+                            }
+                            if (!hitId.empty()) {
+#if defined(__APPLE__)
+                                g_jsHost = &js.host;
+                                JSObjectRef evt = JSObjectMake(js.ctx, nullptr, nullptr);
+                                JSStringRef tn = JSStringCreateWithUTF8CString("type");
+                                JSObjectSetProperty(js.ctx, evt, tn, JSValueMakeString(js.ctx, JSStringCreateWithUTF8CString("click")), kJSPropertyAttributeNone, nullptr);
+                                JSStringRelease(tn);
+                                jscDispatchEventSimple(js.ctx, "el:" + hitId + ":click", evt);
+#else
+                                JSValue evt = JS_NewObject(js.ctx);
+                                JS_SetPropertyStr(js.ctx, evt, "type", JS_NewString(js.ctx, "click"));
+                                JS_SetPropertyStr(js.ctx, evt, "clientX", JS_NewInt32(js.ctx, mx));
+                                JS_SetPropertyStr(js.ctx, evt, "clientY", JS_NewInt32(js.ctx, my));
+                                jsDispatchEventSimple(js.ctx, "el:" + hitId + ":click", evt);
+                                JS_FreeValue(js.ctx, evt);
+                                jsDrainJobs(js);
+#endif
+                            }
+                        }
+#endif
 
                         for (const auto& hit : page.linkHits) {
                             SDL_Rect r = hit.rect;

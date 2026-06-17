@@ -59,8 +59,8 @@ if(NOCHROME_ENABLE_JS)
     # Non-macOS: embed QuickJS (requires headers + libquickjs).
     # If your distro doesn't ship libquickjs, build QuickJS from source and point CMake to it:
     #   -DQUICKJS_INCLUDE_DIR=/path/include -DQUICKJS_LIBRARY=/path/libquickjs.a
-    find_path(QUICKJS_INCLUDE_DIR quickjs.h)
-    find_library(QUICKJS_LIBRARY NAMES quickjs libquickjs)
+    find_path(QUICKJS_INCLUDE_DIR quickjs.h PATH_SUFFIXES quickjs)
+    find_library(QUICKJS_LIBRARY NAMES quickjs libquickjs PATH_SUFFIXES quickjs)
 
     if(NOT (QUICKJS_INCLUDE_DIR AND QUICKJS_LIBRARY))
       message(FATAL_ERROR
