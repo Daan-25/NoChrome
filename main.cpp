@@ -2096,6 +2096,31 @@ static void jsPumpTimers(JsEngine& js) {
 struct JsHost {
     SDL_Window* window = nullptr;
     std::string currentUrl;
+
+    // Minimal DOM state used by the JS bindings.
+    std::unordered_set<std::string> domIds;
+    std::unordered_map<std::string, std::string> styleDisplayById; // id -> display value (e.g. "none")
+    bool domDirty = false;
+
+    // setTimeout/clearTimeout queue (no threads; pumped from the UI loop).
+    struct TimerItem {
+        int id = 0;
+        double dueMs = 0.0;
+        JSValue fn = JS_UNDEFINED; // duplicated; freed when the timer fires or is cleared
+        bool isCode = false;
+        std::string code;
+    };
+    int nextTimerId = 1;
+    std::vector<TimerItem> timers;
+
+    // Event listeners keyed by scope+type, e.g. "window:click", "document:keydown", "el:myid:click".
+    std::unordered_map<std::string, std::vector<JSValue>> listeners; // duplicated
+
+    // Best-effort "DOM": we mutate this HTML string and re-render when domDirty flips.
+    Url baseUrl;
+    std::string domHtml;
+
+    std::chrono::steady_clock::time_point perfStart = std::chrono::steady_clock::now();
 };
 
 struct JsEngine {
@@ -2103,6 +2128,198 @@ struct JsEngine {
     JSContext* ctx = nullptr;
     JsHost host;
 };
+
+// QuickJS class ids for our minimal DOM wrappers (registered once for the runtime).
+static JSClassID g_qjsElementClassId = 0;
+static JSClassID g_qjsStyleClassId = 0;
+
+struct QjsElementPriv {
+    std::string id;
+    std::string tagName;
+    std::unordered_map<std::string, std::string> attrs;
+    std::string text;
+};
+
+struct QjsStylePriv {
+    std::string id;
+};
+
+static JsHost* qjsHost(JSContext* ctx) {
+    return (JsHost*)JS_GetContextOpaque(ctx);
+}
+
+static std::string jsToUtf8(JSContext* ctx, JSValueConst v) {
+    const char* s = JS_ToCString(ctx, v);
+    if (!s) return "";
+    std::string out(s);
+    JS_FreeCString(ctx, s);
+    return out;
+}
+
+// -------------------- best-effort HTML mutation helpers --------------------
+
+static std::string stripNoscriptBlocks(const std::string& html) {
+    std::string lower = toLowerCopy(html);
+    std::string out;
+    out.reserve(html.size());
+
+    size_t pos = 0;
+    while (true) {
+        size_t ns = lower.find("<noscript", pos);
+        if (ns == std::string::npos) {
+            out.append(html, pos, std::string::npos);
+            break;
+        }
+        out.append(html, pos, ns - pos);
+
+        size_t gt = lower.find('>', ns);
+        if (gt == std::string::npos) break;
+
+        size_t end = lower.find("</noscript>", gt);
+        if (end == std::string::npos) break;
+
+        pos = end + std::string("</noscript>").size();
+    }
+
+    return out;
+}
+
+// Replace the inner content of the first element carrying id="id". When escape
+// is true the content is treated as text (entities escaped); otherwise it is
+// inserted as raw HTML (used by innerHTML).
+static bool replaceElementInnerById(std::string& html, const std::string& id,
+                                    const std::string& inner, bool escape) {
+    if (id.empty()) return false;
+    std::string lower = toLowerCopy(html);
+
+    std::string needle1 = toLowerCopy("id=\"" + id + "\"");
+    std::string needle2 = toLowerCopy("id='" + id + "'");
+    size_t p = lower.find(needle1);
+    if (p == std::string::npos) p = lower.find(needle2);
+    if (p == std::string::npos) return false;
+
+    size_t tagStart = lower.rfind('<', p);
+    if (tagStart == std::string::npos) return false;
+
+    size_t nameStart = tagStart + 1;
+    while (nameStart < lower.size() && std::isspace((unsigned char)lower[nameStart])) nameStart++;
+    size_t nameEnd = nameStart;
+    while (nameEnd < lower.size() && std::isalnum((unsigned char)lower[nameEnd])) nameEnd++;
+    if (nameEnd <= nameStart) return false;
+    std::string tag = lower.substr(nameStart, nameEnd - nameStart);
+
+    size_t openEnd = lower.find('>', p);
+    if (openEnd == std::string::npos) return false;
+    if (openEnd > 0 && lower[openEnd - 1] == '/') return false; // self-closing
+
+    std::string closeNeedle = "</" + tag;
+    size_t closeStart = lower.find(closeNeedle, openEnd);
+    if (closeStart == std::string::npos) return false;
+
+    std::string content = escape ? escapeHtmlEntities(inner) : inner;
+    html = html.substr(0, openEnd + 1) + content + html.substr(closeStart);
+    return true;
+}
+
+static bool replaceElementTextById(std::string& html, const std::string& id, const std::string& newText) {
+    return replaceElementInnerById(html, id, newText, true);
+}
+
+static void insertBeforeClosingTag(std::string& html, const std::string& tag, const std::string& snippet) {
+    std::string lower = toLowerCopy(html);
+    std::string closeNeedle = "</" + toLowerCopy(tag) + ">";
+    size_t pos = lower.rfind(closeNeedle);
+    if (pos != std::string::npos) {
+        html.insert(pos, snippet);
+        return;
+    }
+    html += snippet;
+}
+
+static std::string stripFirstElementById(const std::string& html, const std::string& id) {
+    std::string needle1 = "id=\"" + id + "\"";
+    std::string needle2 = "id='" + id + "'";
+    size_t pos = html.find(needle1);
+    if (pos == std::string::npos) pos = html.find(needle2);
+    if (pos == std::string::npos) return html;
+
+    size_t tagStart = html.rfind('<', pos);
+    if (tagStart == std::string::npos) return html;
+
+    size_t tagEnd = html.find('>', pos);
+    if (tagEnd == std::string::npos) return html;
+
+    size_t nameStart = tagStart + 1;
+    while (nameStart < html.size() && std::isspace((unsigned char)html[nameStart])) nameStart++;
+    if (nameStart < html.size() && html[nameStart] == '/') return html;
+
+    size_t nameEnd = nameStart;
+    while (nameEnd < html.size() && std::isalpha((unsigned char)html[nameEnd])) nameEnd++;
+    std::string tag = toLowerCopy(html.substr(nameStart, nameEnd - nameStart));
+    if (tag.empty()) return html;
+
+    bool selfClose = false;
+    {
+        size_t check = tagEnd;
+        while (check > tagStart && std::isspace((unsigned char)html[check - 1])) check--;
+        if (check > tagStart && html[check - 1] == '/') selfClose = true;
+    }
+
+    if (selfClose || tag == "img" || tag == "br" || tag == "meta" || tag == "link" || tag == "input") {
+        return html.substr(0, tagStart) + html.substr(tagEnd + 1);
+    }
+
+    std::string closeTag = "</" + tag + ">";
+    size_t closePos = html.find(closeTag, tagEnd + 1);
+    if (closePos == std::string::npos) {
+        return html.substr(0, tagStart) + html.substr(tagEnd + 1);
+    }
+
+    size_t closeEnd = closePos + closeTag.size();
+    return html.substr(0, tagStart) + html.substr(closeEnd);
+}
+
+static void indexDomIdsFromHtml(JsHost& host, const std::string& html) {
+    host.domIds.clear();
+    static const std::regex reId(R"(id\s*=\s*(['"])([^'"]+)\1)", std::regex_constants::icase);
+    auto begin = std::sregex_iterator(html.begin(), html.end(), reId);
+    auto end = std::sregex_iterator();
+    for (auto it = begin; it != end; ++it) {
+        host.domIds.insert((*it)[2].str());
+    }
+}
+
+static bool isDisplayNone(const JsHost& host, const std::string& id) {
+    auto it = host.styleDisplayById.find(id);
+    if (it == host.styleDisplayById.end()) return false;
+    std::string v = toLowerCopy(trimCopy(it->second));
+    return (v == "none");
+}
+
+static std::string applyDisplayNonePatches(const std::string& html, const JsHost& host) {
+    std::string out = html;
+    for (const auto& kv : host.styleDisplayById) {
+        if (isDisplayNone(host, kv.first)) {
+            out = stripFirstElementById(out, kv.first);
+        }
+    }
+    return out;
+}
+
+static std::string qjsElementOuterHtml(const QjsElementPriv& el) {
+    std::string tag = el.tagName.empty() ? "div" : el.tagName;
+    std::string out = "<" + tag;
+    if (!el.id.empty() && el.id.rfind("__", 0) != 0) {
+        out += " id=\"" + el.id + "\"";
+    }
+    for (const auto& kv : el.attrs) {
+        out += " " + kv.first + "=\"" + escapeHtmlEntities(kv.second) + "\"";
+    }
+    out += ">";
+    out += escapeHtmlEntities(el.text);
+    out += "</" + tag + ">";
+    return out;
+}
 
 static void jsDumpException(JSContext* ctx) {
     JSValue exc = JS_GetException(ctx);
@@ -2137,7 +2354,7 @@ static JSValue jsConsoleLog(JSContext* ctx, JSValueConst /*this_val*/, int argc,
         }
         if (i + 1 < argc) std::cout << " ";
     }
-    std::cout << "\n";
+    std::cout << std::endl;
     return JS_UNDEFINED;
 }
 
@@ -2149,9 +2366,504 @@ static JSValue jsReturnNull(JSContext* /*ctx*/, JSValueConst /*this_val*/, int /
     return JS_NULL;
 }
 
-static JSValue jsSetTimeout(JSContext* ctx, JSValueConst /*this_val*/, int /*argc*/, JSValueConst* /*argv*/) {
-    // Stub: real timers require an event loop. Return 0 as fake timer id.
-    return JS_NewInt32(ctx, 0);
+static double qjsNowMs(JsHost* host) {
+    if (!host) return 0.0;
+    auto now = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(now - host->perfStart).count();
+}
+
+static JSValue jsSetTimeout(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (!host || argc < 1) return JS_NewInt32(ctx, 0);
+
+    double delay = 0.0;
+    if (argc >= 2) JS_ToFloat64(ctx, &delay, argv[1]);
+    if (delay < 0.0) delay = 0.0;
+
+    JsHost::TimerItem item;
+    int timerId = host->nextTimerId++;
+    item.id = timerId;
+    item.dueMs = qjsNowMs(host) + delay;
+
+    if (JS_IsString(argv[0])) {
+        item.isCode = true;
+        item.code = jsToUtf8(ctx, argv[0]);
+    } else if (JS_IsFunction(ctx, argv[0])) {
+        item.fn = JS_DupValue(ctx, argv[0]);
+    } else {
+        return JS_NewInt32(ctx, 0);
+    }
+
+    host->timers.push_back(std::move(item));
+    return JS_NewInt32(ctx, timerId);
+}
+
+static JSValue jsClearTimeout(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (!host || argc < 1) return JS_UNDEFINED;
+
+    int32_t id = 0;
+    JS_ToInt32(ctx, &id, argv[0]);
+    for (auto it = host->timers.begin(); it != host->timers.end(); ++it) {
+        if (it->id == id) {
+            if (!JS_IsUndefined(it->fn)) JS_FreeValue(ctx, it->fn);
+            host->timers.erase(it);
+            break;
+        }
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue jsPerformanceNow(JSContext* ctx, JSValueConst /*this_val*/, int /*argc*/, JSValueConst* /*argv*/) {
+    return JS_NewFloat64(ctx, qjsNowMs(qjsHost(ctx)));
+}
+
+// -------------------- fetch (very small synchronous subset) --------------------
+
+static JSValue qjsPromiseResolve(JSContext* ctx, JSValue value) {
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue promiseCtor = JS_GetPropertyStr(ctx, global, "Promise");
+    JSValue resolveFn = JS_GetPropertyStr(ctx, promiseCtor, "resolve");
+
+    JSValue result = value;
+    if (JS_IsFunction(ctx, resolveFn)) {
+        JSValueConst args[1] = { value };
+        result = JS_Call(ctx, resolveFn, promiseCtor, 1, args);
+        JS_FreeValue(ctx, value);
+    }
+
+    JS_FreeValue(ctx, resolveFn);
+    JS_FreeValue(ctx, promiseCtor);
+    JS_FreeValue(ctx, global);
+    return result;
+}
+
+static JSValue jsResponseText(JSContext* ctx, JSValueConst this_val, int /*argc*/, JSValueConst* /*argv*/) {
+    JSValue body = JS_GetPropertyStr(ctx, this_val, "_bodyText");
+    return qjsPromiseResolve(ctx, body);
+}
+
+static JSValue jsResponseJson(JSContext* ctx, JSValueConst this_val, int /*argc*/, JSValueConst* /*argv*/) {
+    JSValue body = JS_GetPropertyStr(ctx, this_val, "_bodyText");
+    std::string text = jsToUtf8(ctx, body);
+    JS_FreeValue(ctx, body);
+    JSValue parsed = JS_ParseJSON(ctx, text.c_str(), text.size(), "<fetch>");
+    if (JS_IsException(parsed)) {
+        jsDumpException(ctx);
+        parsed = JS_NULL;
+    }
+    return qjsPromiseResolve(ctx, parsed);
+}
+
+static JSValue jsFetch(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (!host || argc < 1) return JS_UNDEFINED;
+
+    std::string url = jsToUtf8(ctx, argv[0]);
+    std::string abs = resolveHref(host->baseUrl, url);
+    if (abs.empty()) abs = url;
+
+    std::string body = fetchSubresourceText(abs);
+
+    JSValue resp = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, resp, "ok", JS_NewBool(ctx, 1));
+    JS_SetPropertyStr(ctx, resp, "status", JS_NewInt32(ctx, 200));
+    JS_SetPropertyStr(ctx, resp, "url", JS_NewString(ctx, abs.c_str()));
+    JS_SetPropertyStr(ctx, resp, "_bodyText", JS_NewString(ctx, body.c_str()));
+    JS_SetPropertyStr(ctx, resp, "text", JS_NewCFunction(ctx, jsResponseText, "text", 0));
+    JS_SetPropertyStr(ctx, resp, "json", JS_NewCFunction(ctx, jsResponseJson, "json", 0));
+
+    return qjsPromiseResolve(ctx, resp);
+}
+
+// -------------------- DOM element / style wrappers --------------------
+
+static void qjsElementFinalizer(JSRuntime* /*rt*/, JSValue val) {
+    auto* p = (QjsElementPriv*)JS_GetOpaque(val, g_qjsElementClassId);
+    delete p;
+}
+
+static void qjsStyleFinalizer(JSRuntime* /*rt*/, JSValue val) {
+    auto* p = (QjsStylePriv*)JS_GetOpaque(val, g_qjsStyleClassId);
+    delete p;
+}
+
+static JSValue qjsMakeElement(JSContext* ctx, const std::string& id, const std::string& tag) {
+    JSValue obj = JS_NewObjectClass(ctx, g_qjsElementClassId);
+    if (JS_IsException(obj)) return obj;
+    auto* p = new QjsElementPriv();
+    p->id = id;
+    p->tagName = tag;
+    JS_SetOpaque(obj, p);
+    return obj;
+}
+
+static JSValue qjsElGetId(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
+    return p ? JS_NewString(ctx, p->id.c_str()) : JS_UNDEFINED;
+}
+
+static JSValue qjsElSetId(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
+    if (p && argc > 0) {
+        std::string newId = jsToUtf8(ctx, argv[0]);
+        if (!newId.empty()) {
+            p->id = newId;
+            if (JsHost* host = qjsHost(ctx)) host->domIds.insert(newId);
+        }
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue qjsElGetTagName(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
+    std::string tn = (p && !p->tagName.empty()) ? toUpperCopy(p->tagName) : "DIV";
+    return JS_NewString(ctx, tn.c_str());
+}
+
+static JSValue qjsElGetText(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
+    return p ? JS_NewString(ctx, p->text.c_str()) : JS_UNDEFINED;
+}
+
+static JSValue qjsElSetText(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
+    if (!p) return JS_UNDEFINED;
+    std::string t = (argc > 0) ? jsToUtf8(ctx, argv[0]) : "";
+    p->text = t;
+    if (JsHost* host = qjsHost(ctx)) {
+        if (!host->domHtml.empty()) replaceElementTextById(host->domHtml, p->id, t);
+        host->domDirty = true;
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue qjsElSetInnerHtml(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
+    if (!p) return JS_UNDEFINED;
+    std::string raw = (argc > 0) ? jsToUtf8(ctx, argv[0]) : "";
+    p->text = raw;
+    if (JsHost* host = qjsHost(ctx)) {
+        if (!host->domHtml.empty()) replaceElementInnerById(host->domHtml, p->id, raw, false);
+        host->domDirty = true;
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue qjsElGetStyle(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
+    if (!p) return JS_UNDEFINED;
+    JSValue s = JS_NewObjectClass(ctx, g_qjsStyleClassId);
+    if (JS_IsException(s)) return s;
+    auto* sp = new QjsStylePriv();
+    sp->id = p->id;
+    JS_SetOpaque(s, sp);
+    return s;
+}
+
+static JSValue qjsElAttrGet(JSContext* ctx, JSValueConst this_val, int, JSValueConst*, int, JSValue* data) {
+    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
+    if (!p) return JS_UNDEFINED;
+    std::string name = jsToUtf8(ctx, data[0]);
+    auto it = p->attrs.find(name);
+    return JS_NewString(ctx, it == p->attrs.end() ? "" : it->second.c_str());
+}
+
+static JSValue qjsElAttrSet(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv, int, JSValue* data) {
+    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
+    if (!p) return JS_UNDEFINED;
+    std::string name = jsToUtf8(ctx, data[0]);
+    p->attrs[name] = (argc > 0) ? jsToUtf8(ctx, argv[0]) : "";
+    return JS_UNDEFINED;
+}
+
+// Forward declarations for element methods used while building the prototype.
+static JSValue qjsElAddEventListener(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
+static JSValue qjsElAppendChild(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
+static JSValue qjsElSetAttribute(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
+static JSValue qjsElGetAttribute(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
+
+static JSValue qjsStyleGetDisplay(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    auto* p = (QjsStylePriv*)JS_GetOpaque(this_val, g_qjsStyleClassId);
+    JsHost* host = qjsHost(ctx);
+    if (!p || !host) return JS_UNDEFINED;
+    auto it = host->styleDisplayById.find(p->id);
+    return JS_NewString(ctx, it == host->styleDisplayById.end() ? "" : it->second.c_str());
+}
+
+static JSValue qjsStyleSetDisplay(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    auto* p = (QjsStylePriv*)JS_GetOpaque(this_val, g_qjsStyleClassId);
+    JsHost* host = qjsHost(ctx);
+    if (!p || !host) return JS_UNDEFINED;
+    host->styleDisplayById[p->id] = (argc > 0) ? jsToUtf8(ctx, argv[0]) : "";
+    host->domDirty = true;
+    return JS_UNDEFINED;
+}
+
+static void qjsRegisterDomClasses(JSRuntime* rt) {
+    if (g_qjsElementClassId == 0) {
+        JS_NewClassID(&g_qjsElementClassId);
+        JSClassDef def{};
+        def.class_name = "Element";
+        def.finalizer = qjsElementFinalizer;
+        JS_NewClass(rt, g_qjsElementClassId, &def);
+    }
+    if (g_qjsStyleClassId == 0) {
+        JS_NewClassID(&g_qjsStyleClassId);
+        JSClassDef def{};
+        def.class_name = "CSSStyleDeclaration";
+        def.finalizer = qjsStyleFinalizer;
+        JS_NewClass(rt, g_qjsStyleClassId, &def);
+    }
+}
+
+static void qjsDefineAccessor(JSContext* ctx, JSValueConst proto, const char* name,
+                              JSCFunction* getter, JSCFunction* setter) {
+    JSValue g = getter ? JS_NewCFunction(ctx, getter, name, 0) : JS_UNDEFINED;
+    JSValue s = setter ? JS_NewCFunction(ctx, setter, name, 1) : JS_UNDEFINED;
+    JSAtom atom = JS_NewAtom(ctx, name);
+    JS_DefinePropertyGetSet(ctx, proto, atom, g, s, JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE);
+    JS_FreeAtom(ctx, atom);
+}
+
+static void qjsDefineAttrAccessor(JSContext* ctx, JSValueConst proto, const char* name) {
+    JSValue nameVal = JS_NewString(ctx, name);
+    JSValueConst data[1] = { nameVal };
+    JSValue g = JS_NewCFunctionData(ctx, qjsElAttrGet, 0, 0, 1, data);
+    JSValue s = JS_NewCFunctionData(ctx, qjsElAttrSet, 1, 0, 1, data);
+    JS_FreeValue(ctx, nameVal);
+    JSAtom atom = JS_NewAtom(ctx, name);
+    JS_DefinePropertyGetSet(ctx, proto, atom, g, s, JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE);
+    JS_FreeAtom(ctx, atom);
+}
+
+// Installs element/style prototypes for the current context. Must run after the
+// context is created and before any DOM wrapper objects are made.
+static void qjsSetupDomProtos(JSContext* ctx) {
+    JSValue elProto = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, elProto, "addEventListener", JS_NewCFunction(ctx, qjsElAddEventListener, "addEventListener", 2));
+    JS_SetPropertyStr(ctx, elProto, "appendChild", JS_NewCFunction(ctx, qjsElAppendChild, "appendChild", 1));
+    JS_SetPropertyStr(ctx, elProto, "setAttribute", JS_NewCFunction(ctx, qjsElSetAttribute, "setAttribute", 2));
+    JS_SetPropertyStr(ctx, elProto, "getAttribute", JS_NewCFunction(ctx, qjsElGetAttribute, "getAttribute", 1));
+    qjsDefineAccessor(ctx, elProto, "id", qjsElGetId, qjsElSetId);
+    qjsDefineAccessor(ctx, elProto, "tagName", qjsElGetTagName, nullptr);
+    qjsDefineAccessor(ctx, elProto, "style", qjsElGetStyle, nullptr);
+    qjsDefineAccessor(ctx, elProto, "textContent", qjsElGetText, qjsElSetText);
+    qjsDefineAccessor(ctx, elProto, "innerText", qjsElGetText, qjsElSetText);
+    qjsDefineAccessor(ctx, elProto, "innerHTML", qjsElGetText, qjsElSetInnerHtml);
+    qjsDefineAttrAccessor(ctx, elProto, "src");
+    qjsDefineAttrAccessor(ctx, elProto, "href");
+    qjsDefineAttrAccessor(ctx, elProto, "type");
+    qjsDefineAttrAccessor(ctx, elProto, "value");
+    qjsDefineAttrAccessor(ctx, elProto, "name");
+    JS_SetClassProto(ctx, g_qjsElementClassId, elProto);
+
+    JSValue stProto = JS_NewObject(ctx);
+    qjsDefineAccessor(ctx, stProto, "display", qjsStyleGetDisplay, qjsStyleSetDisplay);
+    JS_SetClassProto(ctx, g_qjsStyleClassId, stProto);
+}
+
+static void qjsAddListener(JSContext* ctx, const std::string& key, JSValueConst fn) {
+    if (JsHost* host = qjsHost(ctx)) {
+        host->listeners[key].push_back(JS_DupValue(ctx, fn));
+    }
+}
+
+static JSValue qjsElAddEventListener(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
+    if (!p || argc < 2 || !JS_IsFunction(ctx, argv[1])) return JS_UNDEFINED;
+    std::string type = jsToUtf8(ctx, argv[0]);
+    qjsAddListener(ctx, "el:" + p->id + ":" + type, argv[1]);
+    return JS_UNDEFINED;
+}
+
+static JSValue qjsElAppendChild(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    auto* parent = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
+    if (!host || !parent || argc < 1) return JS_UNDEFINED;
+
+    auto* child = (QjsElementPriv*)JS_GetOpaque(argv[0], g_qjsElementClassId);
+    if (!child) return JS_DupValue(ctx, argv[0]);
+
+    std::string parentTag = toLowerCopy(parent->tagName);
+    if (parentTag == "head" || parentTag == "body") {
+        std::string snippet = qjsElementOuterHtml(*child);
+        if (!host->domHtml.empty()) insertBeforeClosingTag(host->domHtml, parent->tagName, snippet);
+        host->domDirty = true;
+
+        if (toLowerCopy(child->tagName) == "script") {
+            std::string code;
+            auto it = child->attrs.find("src");
+            if (it != child->attrs.end() && !it->second.empty()) {
+                std::string abs = resolveHref(host->baseUrl, it->second);
+                if (abs.empty()) abs = it->second;
+                code = fetchSubresourceText(abs);
+            } else {
+                code = child->text;
+            }
+            if (!trimCopy(code).empty()) {
+                JSValue r = JS_Eval(ctx, code.c_str(), code.size(), "<appended>", JS_EVAL_TYPE_GLOBAL);
+                if (JS_IsException(r)) jsDumpException(ctx);
+                JS_FreeValue(ctx, r);
+            }
+        }
+    }
+
+    return JS_DupValue(ctx, argv[0]);
+}
+
+static JSValue qjsElSetAttribute(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
+    if (!p || argc < 2) return JS_UNDEFINED;
+    std::string k = toLowerCopy(jsToUtf8(ctx, argv[0]));
+    std::string v = jsToUtf8(ctx, argv[1]);
+    if (!k.empty()) {
+        p->attrs[k] = v;
+        if (k == "id" && !v.empty()) {
+            p->id = v;
+            if (JsHost* host = qjsHost(ctx)) host->domIds.insert(v);
+        }
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue qjsElGetAttribute(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
+    if (!p || argc < 1) return JS_NULL;
+    std::string k = toLowerCopy(jsToUtf8(ctx, argv[0]));
+    if (k == "id") return JS_NewString(ctx, p->id.c_str());
+    auto it = p->attrs.find(k);
+    return it == p->attrs.end() ? JS_NULL : JS_NewString(ctx, it->second.c_str());
+}
+
+// Best-effort lookup of an element's tag name from the backing HTML by id.
+static std::string qjsTagNameForId(const std::string& html, const std::string& id) {
+    if (html.empty() || id.empty()) return "div";
+    std::string lower = toLowerCopy(html);
+    size_t p = lower.find(toLowerCopy("id=\"" + id + "\""));
+    if (p == std::string::npos) p = lower.find(toLowerCopy("id='" + id + "'"));
+    if (p == std::string::npos) return "div";
+    size_t tagStart = lower.rfind('<', p);
+    if (tagStart == std::string::npos) return "div";
+    size_t nameStart = tagStart + 1;
+    while (nameStart < lower.size() && std::isspace((unsigned char)lower[nameStart])) nameStart++;
+    size_t nameEnd = nameStart;
+    while (nameEnd < lower.size() && std::isalnum((unsigned char)lower[nameEnd])) nameEnd++;
+    if (nameEnd <= nameStart) return "div";
+    return lower.substr(nameStart, nameEnd - nameStart);
+}
+
+static JSValue jsGetElementById(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (!host || argc < 1) return JS_NULL;
+    std::string id = jsToUtf8(ctx, argv[0]);
+    if (id.empty()) return JS_NULL;
+    // Return a virtual element even when the id is unknown, so that scripts doing
+    // getElementById(...).something don't crash on a hard null.
+    host->domIds.insert(id);
+    return qjsMakeElement(ctx, id, qjsTagNameForId(host->domHtml, id));
+}
+
+static JSValue jsCreateElement(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (!host || argc < 1) return JS_NULL;
+    std::string tag = toLowerCopy(jsToUtf8(ctx, argv[0]));
+    if (tag.empty()) tag = "div";
+    std::string vid = "__el" + std::to_string(host->nextTimerId++);
+    return qjsMakeElement(ctx, vid, tag);
+}
+
+static JSValue jsQuerySelector(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (!host || argc < 1) return JS_NULL;
+    std::string sel = trimCopy(jsToUtf8(ctx, argv[0]));
+    // Minimal support: "#id" selectors map to getElementById.
+    if (sel.size() > 1 && sel[0] == '#' && sel.find(' ') == std::string::npos) {
+        std::string id = sel.substr(1);
+        host->domIds.insert(id);
+        return qjsMakeElement(ctx, id, qjsTagNameForId(host->domHtml, id));
+    }
+    return JS_NULL;
+}
+
+static JSValue jsDocAddEventListener(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    if (argc < 2 || !JS_IsFunction(ctx, argv[1])) return JS_UNDEFINED;
+    qjsAddListener(ctx, "document:" + jsToUtf8(ctx, argv[0]), argv[1]);
+    return JS_UNDEFINED;
+}
+
+static JSValue jsWinAddEventListener(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    if (argc < 2 || !JS_IsFunction(ctx, argv[1])) return JS_UNDEFINED;
+    qjsAddListener(ctx, "window:" + jsToUtf8(ctx, argv[0]), argv[1]);
+    return JS_UNDEFINED;
+}
+
+static void jsDispatchEventSimple(JSContext* ctx, const std::string& key, JSValueConst evt) {
+    JsHost* host = qjsHost(ctx);
+    if (!host) return;
+    auto it = host->listeners.find(key);
+    if (it == host->listeners.end()) return;
+
+    std::vector<JSValue> fns = it->second; // entries stay owned by host->listeners
+    for (auto& fn : fns) {
+        JSValueConst args[1] = { evt };
+        JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 1, args);
+        if (JS_IsException(r)) jsDumpException(ctx);
+        JS_FreeValue(ctx, r);
+    }
+}
+
+static void qjsFreeHostRefs(JsEngine& js) {
+    if (!js.ctx) return;
+    for (auto& t : js.host.timers) {
+        if (!JS_IsUndefined(t.fn)) JS_FreeValue(js.ctx, t.fn);
+    }
+    js.host.timers.clear();
+    for (auto& kv : js.host.listeners) {
+        for (auto& fn : kv.second) JS_FreeValue(js.ctx, fn);
+    }
+    js.host.listeners.clear();
+}
+
+static void jsDrainJobs(JsEngine& js) {
+    if (!js.rt) return;
+    JSContext* c = nullptr;
+    for (;;) {
+        int r = JS_ExecutePendingJob(js.rt, &c);
+        if (r == 0) break;
+        if (r < 0) { jsDumpException(c ? c : js.ctx); break; }
+    }
+}
+
+static void jsPumpTimers(JsEngine& js) {
+    if (!js.ctx) return;
+
+    double now = qjsNowMs(&js.host);
+    std::vector<JsHost::TimerItem> due;
+    for (auto it = js.host.timers.begin(); it != js.host.timers.end(); ) {
+        if (it->dueMs <= now) {
+            due.push_back(std::move(*it));
+            it = js.host.timers.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    for (auto& t : due) {
+        JSValue r;
+        if (t.isCode) {
+            r = JS_Eval(js.ctx, t.code.c_str(), t.code.size(), "<timeout>", JS_EVAL_TYPE_GLOBAL);
+        } else if (!JS_IsUndefined(t.fn)) {
+            r = JS_Call(js.ctx, t.fn, JS_UNDEFINED, 0, nullptr);
+        } else {
+            r = JS_UNDEFINED;
+        }
+        if (JS_IsException(r)) jsDumpException(js.ctx);
+        JS_FreeValue(js.ctx, r);
+        if (!JS_IsUndefined(t.fn)) JS_FreeValue(js.ctx, t.fn);
+    }
+
+    if (!due.empty()) jsDrainJobs(js);
 }
 
 static JSValue jsAlert(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
@@ -2173,11 +2885,14 @@ static JSValue jsAlert(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSVa
 
 static bool jsInit(JsEngine& js) {
     js.rt = JS_NewRuntime();
-    return js.rt != nullptr;
+    if (!js.rt) return false;
+    qjsRegisterDomClasses(js.rt);
+    return true;
 }
 
 static void jsResetContext(JsEngine& js) {
     if (js.ctx) {
+        qjsFreeHostRefs(js);
         JS_FreeContext(js.ctx);
         js.ctx = nullptr;
     }
@@ -2185,28 +2900,45 @@ static void jsResetContext(JsEngine& js) {
     js.ctx = JS_NewContext(js.rt);
     JS_SetContextOpaque(js.ctx, &js.host);
 
+    qjsSetupDomProtos(js.ctx);
+
     JSValue global = JS_GetGlobalObject(js.ctx);
 
-    // window = global
+    // window === self === global
     JS_SetPropertyStr(js.ctx, global, "window", JS_DupValue(js.ctx, global));
+    JS_SetPropertyStr(js.ctx, global, "self", JS_DupValue(js.ctx, global));
 
-    // console.log / console.error
+    // console.log / error / warn / info
     JSValue consoleObj = JS_NewObject(js.ctx);
     JS_SetPropertyStr(js.ctx, consoleObj, "log", JS_NewCFunction(js.ctx, jsConsoleLog, "log", 1));
     JS_SetPropertyStr(js.ctx, consoleObj, "error", JS_NewCFunction(js.ctx, jsConsoleLog, "error", 1));
+    JS_SetPropertyStr(js.ctx, consoleObj, "warn", JS_NewCFunction(js.ctx, jsConsoleLog, "warn", 1));
+    JS_SetPropertyStr(js.ctx, consoleObj, "info", JS_NewCFunction(js.ctx, jsConsoleLog, "info", 1));
     JS_SetPropertyStr(js.ctx, global, "console", consoleObj);
 
     // alert()
     JS_SetPropertyStr(js.ctx, global, "alert", JS_NewCFunction(js.ctx, jsAlert, "alert", 1));
 
-    // setTimeout (stub)
+    // timers
     JS_SetPropertyStr(js.ctx, global, "setTimeout", JS_NewCFunction(js.ctx, jsSetTimeout, "setTimeout", 2));
+    JS_SetPropertyStr(js.ctx, global, "clearTimeout", JS_NewCFunction(js.ctx, jsClearTimeout, "clearTimeout", 1));
+
+    // performance.now()
+    JSValue perfObj = JS_NewObject(js.ctx);
+    JS_SetPropertyStr(js.ctx, perfObj, "now", JS_NewCFunction(js.ctx, jsPerformanceNow, "now", 0));
+    JS_SetPropertyStr(js.ctx, global, "performance", perfObj);
+
+    // fetch()
+    JS_SetPropertyStr(js.ctx, global, "fetch", JS_NewCFunction(js.ctx, jsFetch, "fetch", 1));
 
     JS_FreeValue(js.ctx, global);
 }
 
 static void jsShutdown(JsEngine& js) {
-    if (js.ctx) JS_FreeContext(js.ctx);
+    if (js.ctx) {
+        qjsFreeHostRefs(js);
+        JS_FreeContext(js.ctx);
+    }
     if (js.rt) JS_FreeRuntime(js.rt);
     js.ctx = nullptr;
     js.rt = nullptr;
@@ -2260,11 +2992,14 @@ static void jsSetupPageGlobals(JSContext* ctx, const std::string& url, const std
 
     JSValue document = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, document, "title", JS_NewString(ctx, title.c_str()));
+    JS_SetPropertyStr(ctx, document, "addEventListener", JS_NewCFunction(ctx, jsDocAddEventListener, "addEventListener", 2));
+    JS_SetPropertyStr(ctx, document, "getElementById", JS_NewCFunction(ctx, jsGetElementById, "getElementById", 1));
+    JS_SetPropertyStr(ctx, document, "createElement", JS_NewCFunction(ctx, jsCreateElement, "createElement", 1));
+    JS_SetPropertyStr(ctx, document, "querySelector", JS_NewCFunction(ctx, jsQuerySelector, "querySelector", 1));
 
-    // Minimal DOM stubs so scripts don't crash instantly
-    JS_SetPropertyStr(ctx, document, "addEventListener", JS_NewCFunction(ctx, jsNoop, "addEventListener", 2));
-    JS_SetPropertyStr(ctx, document, "getElementById", JS_NewCFunction(ctx, jsReturnNull, "getElementById", 1));
-    JS_SetPropertyStr(ctx, document, "querySelector", JS_NewCFunction(ctx, jsReturnNull, "querySelector", 1));
+    // document.body / document.head as virtual elements so appendChild() works.
+    JS_SetPropertyStr(ctx, document, "body", qjsMakeElement(ctx, "__body", "body"));
+    JS_SetPropertyStr(ctx, document, "head", qjsMakeElement(ctx, "__head", "head"));
 
     JS_SetPropertyStr(ctx, global, "document", document);
 
@@ -2276,12 +3011,8 @@ static void jsSetupPageGlobals(JSContext* ctx, const std::string& url, const std
     JS_SetPropertyStr(ctx, navigator, "userAgent", JS_NewString(ctx, "NoChrome/0.10 (QuickJS)"));
     JS_SetPropertyStr(ctx, global, "navigator", navigator);
 
-    // window.addEventListener stub
-    JSValue win = JS_GetPropertyStr(ctx, global, "window");
-    if (JS_IsObject(win)) {
-        JS_SetPropertyStr(ctx, win, "addEventListener", JS_NewCFunction(ctx, jsNoop, "addEventListener", 2));
-    }
-    JS_FreeValue(ctx, win);
+    // window/global addEventListener (window === global here).
+    JS_SetPropertyStr(ctx, global, "addEventListener", JS_NewCFunction(ctx, jsWinAddEventListener, "addEventListener", 2));
 
     JS_FreeValue(ctx, global);
 }
@@ -2313,8 +3044,14 @@ static std::string runJavaScriptForHtml(JsEngine& js,
                                        const Url& baseUrl,
                                        const std::string& urlString) {
     js.host.currentUrl = urlString;
+    js.host.baseUrl = baseUrl;
+    js.host.styleDisplayById.clear();
+    js.host.domDirty = false;
 
     jsResetContext(js);
+
+    js.host.domHtml = stripNoscriptBlocks(html);
+    indexDomIdsFromHtml(js.host, js.host.domHtml);
 
     std::string initialTitle = extractTitleFromHtmlSimple(html);
     jsSetupPageGlobals(js.ctx, urlString, initialTitle);
@@ -2345,6 +3082,9 @@ static std::string runJavaScriptForHtml(JsEngine& js,
             jsDumpException(js.ctx);
         }
         JS_FreeValue(js.ctx, v);
+
+        // Run any microtasks (e.g. fetch().then(...)) queued by this script.
+        jsDrainJobs(js);
     }
 
     return jsReadDocumentTitle(js.ctx);
@@ -3122,6 +3862,9 @@ int main(int argc, char** argv) {
 
     std::vector<TabState> tabs;
     int activeTab = 0;
+#ifdef NOCHROME_ENABLE_JS
+    int activeJsTab = -1; // which tab the shared JS context currently belongs to
+#endif
 
     bool addressFocused = false;
 
@@ -3187,12 +3930,16 @@ int main(int argc, char** argv) {
             std::string jsTitle = runJavaScriptForHtml(js, t.page.body, t.page.baseUrl, t.page.urlString);
             if (!jsTitle.empty()) pageTitle = jsTitle;
 
-#if defined(__APPLE__)
             // If JS mutated the HTML backing store, re-render from that.
             if (!js.host.domHtml.empty()) {
+#if defined(__APPLE__)
                 t.page.body = js.host.domHtml;
-            }
+#else
+                t.page.body = applyDisplayNonePatches(js.host.domHtml, js.host);
 #endif
+            }
+            js.host.domDirty = false;
+            activeJsTab = idx;
         }
 #endif
 
@@ -3370,6 +4117,17 @@ int main(int argc, char** argv) {
                         jscDispatchEventSimple(js.ctx, "window:click", evt);
                         jscDispatchEventSimple(js.ctx, "document:click", evt);
                     }
+#else
+                    if (js.ctx) {
+                        JSValue evt = JS_NewObject(js.ctx);
+                        JS_SetPropertyStr(js.ctx, evt, "type", JS_NewString(js.ctx, "click"));
+                        JS_SetPropertyStr(js.ctx, evt, "clientX", JS_NewInt32(js.ctx, mx));
+                        JS_SetPropertyStr(js.ctx, evt, "clientY", JS_NewInt32(js.ctx, my));
+                        jsDispatchEventSimple(js.ctx, "window:click", evt);
+                        jsDispatchEventSimple(js.ctx, "document:click", evt);
+                        JS_FreeValue(js.ctx, evt);
+                        jsDrainJobs(js);
+                    }
 #endif
 #endif
 // Tabs bar interactions
@@ -3484,6 +4242,19 @@ int main(int argc, char** argv) {
                         jscDispatchEventSimple(js.ctx, "window:keydown", evt);
                         jscDispatchEventSimple(js.ctx, "document:keydown", evt);
                     }
+#else
+                    if (js.ctx) {
+                        JSValue evt = JS_NewObject(js.ctx);
+                        JS_SetPropertyStr(js.ctx, evt, "type", JS_NewString(js.ctx, "keydown"));
+                        const char* keyName = SDL_GetKeyName(e.key.keysym.sym);
+                        JS_SetPropertyStr(js.ctx, evt, "key", JS_NewString(js.ctx, keyName ? keyName : ""));
+                        JS_SetPropertyStr(js.ctx, evt, "ctrlKey", JS_NewBool(js.ctx, ctrl));
+                        JS_SetPropertyStr(js.ctx, evt, "shiftKey", JS_NewBool(js.ctx, shift));
+                        jsDispatchEventSimple(js.ctx, "window:keydown", evt);
+                        jsDispatchEventSimple(js.ctx, "document:keydown", evt);
+                        JS_FreeValue(js.ctx, evt);
+                        jsDrainJobs(js);
+                    }
 #endif
 #endif
 
@@ -3552,6 +4323,29 @@ int main(int argc, char** argv) {
                 }
             }
         }
+
+#ifdef NOCHROME_ENABLE_JS
+        // Run due timers + microtasks, then re-render if JS mutated the active tab's DOM.
+        jsPumpTimers(js);
+        if (js.host.domDirty) {
+            js.host.domDirty = false;
+            if (activeJsTab == activeTab && !tabs.empty() && !js.host.domHtml.empty()) {
+#if defined(__APPLE__)
+                tabs[activeTab].page.body = js.host.domHtml;
+#else
+                tabs[activeTab].page.body = applyDisplayNonePatches(js.host.domHtml, js.host);
+#endif
+                rebuildTabLayout(activeTab);
+                clampScroll();
+
+                std::string jsTitle = jsReadDocumentTitle(js.ctx);
+                if (!jsTitle.empty() && jsTitle != tabs[activeTab].title) {
+                    tabs[activeTab].title = jsTitle;
+                    setWindowTitleFromActive();
+                }
+            }
+        }
+#endif
 
         // ---------- Render ----------
         SDL_SetRenderDrawColor(renderer, 16, 16, 18, 255);
