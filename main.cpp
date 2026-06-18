@@ -6,8 +6,19 @@
 #include <openssl/err.h>
 
 #ifdef NOCHROME_ENABLE_JS
+
+// Choose the JavaScript engine: JavaScriptCore on macOS (or when explicitly
+// forced, e.g. WebKitGTK's JSC for testing on Linux); QuickJS otherwise.
+#if defined(__APPLE__) || defined(NOCHROME_FORCE_JSC)
+#define NOCHROME_USE_JSC 1
+#endif
+
+#if defined(NOCHROME_USE_JSC)
 #if defined(__APPLE__)
 #include <JavaScriptCore/JavaScriptCore.h>
+#else
+#include <JavaScriptCore/JavaScript.h>
+#endif
 #else
 extern "C" {
 #if __has_include(<quickjs.h>)
@@ -973,16 +984,17 @@ static std::string extractTitleFromHtmlSimple(const std::string& html) {
 }
 
 #ifdef NOCHROME_ENABLE_JS
-#if defined(__APPLE__)
+#include "dom.h"
+#if defined(NOCHROME_USE_JSC)
 // -------------------- JavaScript (JavaScriptCore) --------------------
 
 struct JsHost {
     SDL_Window* window = nullptr;
     std::string currentUrl;
 
-    // Minimal DOM state used by JS stubs
-    std::unordered_set<std::string> domIds;
-    std::unordered_map<std::string, std::string> styleDisplayById; // id -> display value (e.g. "none")
+    // Real DOM tree (source of truth). domHtml below is a serialized snapshot
+    // used by the renderer; it is refreshed from the tree after JS runs.
+    DomTree dom;
     bool domDirty = false;
 
     // --- Realistic-ish JS plumbing (minimal) ---
@@ -1043,7 +1055,7 @@ static JSValueRef jscConsoleLog(JSContextRef ctx, JSObjectRef /*function*/, JSOb
         std::cout << jsToUtf8(ctx, argv[i]);
         if (i + 1 < argc) std::cout << " ";
     }
-    std::cout << "\n";
+    std::cout << std::endl;
     return JSValueMakeUndefined(ctx);
 }
 
@@ -1497,14 +1509,11 @@ static std::vector<ScriptItem> extractScriptsSimple(const std::string& html, con
 // -------------------- Minimal DOM stubs (id map + style.display) --------------------
 
 struct JscElementPriv {
-    std::string id;
-    std::string tagName;
-    std::unordered_map<std::string, std::string> attrs;
-    std::string text;
+    int nodeId = -1; // index into JsHost::dom
 };
 
 struct JscStylePriv {
-    std::string id;
+    int nodeId = -1; // element this style belongs to
 };
 
 static JSClassRef g_jscElementClass = nullptr;
@@ -1529,17 +1538,28 @@ static void jscFinalizeStyle(JSObjectRef object) {
     delete priv;
 }
 
+static DomNode* jscElNode(JSObjectRef object) {
+    auto* priv = (JscElementPriv*)JSObjectGetPrivate(object);
+    if (!priv || !g_jsHost) return nullptr;
+    return g_jsHost->dom.get(priv->nodeId);
+}
+
+static int jscElNodeId(JSObjectRef object) {
+    auto* priv = (JscElementPriv*)JSObjectGetPrivate(object);
+    return priv ? priv->nodeId : -1;
+}
+
 static JSValueRef jscStyleGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef* /*exception*/) {
     auto* priv = (JscStylePriv*)JSObjectGetPrivate(object);
     if (!priv || !g_jsHost) return JSValueMakeUndefined(ctx);
 
     std::string prop = jsStringToUtf8(propertyName);
     if (prop == "display") {
-        auto it = g_jsHost->styleDisplayById.find(priv->id);
-        if (it == g_jsHost->styleDisplayById.end()) return JSValueMakeUndefined(ctx);
-        JSStringRef v = JSStringCreateWithUTF8CString(it->second.c_str());
-        JSValueRef vStr = JSValueMakeString(ctx, v);
-        JSStringRelease(v);
+        DomNode* n = g_jsHost->dom.get(priv->nodeId);
+        std::string v = n ? n->styleDisplay : "";
+        JSStringRef s = JSStringCreateWithUTF8CString(v.c_str());
+        JSValueRef vStr = JSValueMakeString(ctx, s);
+        JSStringRelease(s);
         return vStr;
     }
 
@@ -1552,9 +1572,10 @@ static bool jscStyleSetProperty(JSContextRef ctx, JSObjectRef object, JSStringRe
 
     std::string prop = jsStringToUtf8(propertyName);
     if (prop == "display") {
-        std::string v = jsToUtf8(ctx, value);
-        g_jsHost->styleDisplayById[priv->id] = v;
-        g_jsHost->domDirty = true;
+        if (DomNode* n = g_jsHost->dom.get(priv->nodeId)) {
+            n->styleDisplay = jsToUtf8(ctx, value);
+            g_jsHost->domDirty = true;
+        }
         return true;
     }
 
@@ -1562,7 +1583,7 @@ static bool jscStyleSetProperty(JSContextRef ctx, JSObjectRef object, JSStringRe
 }
 
 
-#if defined(__APPLE__)
+#if defined(NOCHROME_USE_JSC)
 // Forward declarations for element methods used by the property getter.
 static JSValueRef jscElementAddEventListener(JSContextRef ctx, JSObjectRef function,
                                              JSObjectRef thisObject, size_t argumentCount,
@@ -1570,92 +1591,93 @@ static JSValueRef jscElementAddEventListener(JSContextRef ctx, JSObjectRef funct
 static JSValueRef jscElementAppendChild(JSContextRef ctx, JSObjectRef function,
                                        JSObjectRef thisObject, size_t argumentCount,
                                        const JSValueRef arguments[], JSValueRef* exception);
+static JSValueRef jscElementRemoveChild(JSContextRef ctx, JSObjectRef function,
+                                        JSObjectRef thisObject, size_t argumentCount,
+                                        const JSValueRef arguments[], JSValueRef* exception);
 static JSValueRef jscElementSetAttribute(JSContextRef ctx, JSObjectRef function,
+                                        JSObjectRef thisObject, size_t argumentCount,
+                                        const JSValueRef arguments[], JSValueRef* exception);
+static JSValueRef jscElementGetAttribute(JSContextRef ctx, JSObjectRef function,
                                         JSObjectRef thisObject, size_t argumentCount,
                                         const JSValueRef arguments[], JSValueRef* exception);
 #endif
 
 static JSValueRef jscElementGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef* /*exception*/) {
-    auto* priv = (JscElementPriv*)JSObjectGetPrivate(object);
-    if (!priv) return JSValueMakeUndefined(ctx);
+    DomNode* n = jscElNode(object);
+    if (!n) return nullptr; // not our element: fall through to normal lookup
 
     std::string prop = jsStringToUtf8(propertyName);
+    int nid = jscElNodeId(object);
 
-    if (prop == "id") {
-        JSStringRef v = JSStringCreateWithUTF8CString(priv->id.c_str());
-        JSValueRef vStr = JSValueMakeString(ctx, v);
+    auto makeStr = [&](const std::string& s) -> JSValueRef {
+        JSStringRef v = JSStringCreateWithUTF8CString(s.c_str());
+        JSValueRef r = JSValueMakeString(ctx, v);
         JSStringRelease(v);
-        return vStr;
-    }
+        return r;
+    };
+    auto makeFn = [&](const char* name, JSObjectCallAsFunctionCallback cb) -> JSValueRef {
+        JSStringRef nm = JSStringCreateWithUTF8CString(name);
+        JSObjectRef fn = JSObjectMakeFunctionWithCallback(ctx, nm, cb);
+        JSStringRelease(nm);
+        return fn;
+    };
+
+    if (prop == "id")        return makeStr(domGetAttr(*n, "id"));
+    if (prop == "tagName")   return makeStr(n->tag.empty() ? "DIV" : toUpperCopy(n->tag));
+    if (prop == "textContent" || prop == "innerText")
+        return makeStr(domTextContent(g_jsHost->dom, nid));
+    if (prop == "innerHTML") return makeStr(domSerializeChildren(g_jsHost->dom, nid));
+    if (prop == "className") return makeStr(domGetAttr(*n, "class"));
+    if (prop == "src" || prop == "href" || prop == "type" || prop == "value" || prop == "name")
+        return makeStr(domGetAttr(*n, prop));
 
     if (prop == "style") {
-        // Create a style object bound to this element id
-        JSObjectRef styleObj = JSObjectMake(ctx, g_jscStyleClass, new JscStylePriv{priv->id});
-        return styleObj;
+        return JSObjectMake(ctx, g_jscStyleClass, new JscStylePriv{ nid });
+    }
+    if (prop == "parentNode") {
+        if (n->parent < 0 || n->parent == g_jsHost->dom.root) return JSValueMakeNull(ctx);
+        return JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ n->parent });
     }
 
+    if (prop == "addEventListener") return makeFn("addEventListener", jscElementAddEventListener);
+    if (prop == "appendChild")      return makeFn("appendChild", jscElementAppendChild);
+    if (prop == "removeChild")      return makeFn("removeChild", jscElementRemoveChild);
+    if (prop == "setAttribute")     return makeFn("setAttribute", jscElementSetAttribute);
+    if (prop == "getAttribute")     return makeFn("getAttribute", jscElementGetAttribute);
 
-    if (prop == "tagName") {
-        std::string tn = priv->tagName.empty() ? "DIV" : toUpperCopy(priv->tagName);
-        JSStringRef v = JSStringCreateWithUTF8CString(tn.c_str());
-        JSValueRef vStr = JSValueMakeString(ctx, v);
-        JSStringRelease(v);
-        return vStr;
-    }
-
-    if (prop == "addEventListener") {
-        JSStringRef n = JSStringCreateWithUTF8CString("addEventListener");
-        JSObjectRef fn = JSObjectMakeFunctionWithCallback(ctx, n, jscElementAddEventListener);
-        JSStringRelease(n);
-        return fn;
-    }
-
-    if (prop == "appendChild") {
-        JSStringRef n = JSStringCreateWithUTF8CString("appendChild");
-        JSObjectRef fn = JSObjectMakeFunctionWithCallback(ctx, n, jscElementAppendChild);
-        JSStringRelease(n);
-        return fn;
-    }
-
-    if (prop == "setAttribute") {
-        JSStringRef n = JSStringCreateWithUTF8CString("setAttribute");
-        JSObjectRef fn = JSObjectMakeFunctionWithCallback(ctx, n, jscElementSetAttribute);
-        JSStringRelease(n);
-        return fn;
-    }
-    return JSValueMakeUndefined(ctx);
+    return nullptr; // delegate (stored props / prototype)
 }
 
 static bool jscElementSetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef value, JSValueRef*) {
-    auto* priv = (JscElementPriv*)JSObjectGetPrivate(object);
-    if (!priv) return false;
+    DomNode* n = jscElNode(object);
+    if (!n) return false;
 
     std::string prop = jsStringToUtf8(propertyName);
+    int nid = jscElNodeId(object);
 
     if (prop == "id") {
-        std::string newId = jsToUtf8(ctx, value);
-        if (!newId.empty()) {
-            priv->id = newId;
-            if (g_jsHost) g_jsHost->domIds.insert(newId);
-        }
+        domSetAttr(*n, "id", jsToUtf8(ctx, value));
+        if (g_jsHost) g_jsHost->domDirty = true;
         return true;
     }
-
     if (prop == "textContent" || prop == "innerText") {
-        std::string t = jsToUtf8(ctx, value);
-        priv->text = t;
-        if (g_jsHost) {
-            if (!g_jsHost->domHtml.empty()) {
-                replaceElementTextById(g_jsHost->domHtml, priv->id, t);
-            }
-            g_jsHost->domDirty = true;
-        }
+        domSetTextContent(g_jsHost->dom, nid, jsToUtf8(ctx, value));
+        g_jsHost->domDirty = true;
         return true;
     }
-
-    if (prop == "src" || prop == "href" || prop == "type") {
-        std::string v = jsToUtf8(ctx, value);
-        priv->attrs[toLowerCopy(prop)] = v;
+    if (prop == "innerHTML") {
+        domSetInnerHtml(g_jsHost->dom, nid, jsToUtf8(ctx, value));
+        g_jsHost->domDirty = true;
+        return true;
+    }
+    if (prop == "className") {
+        domSetAttr(*n, "class", jsToUtf8(ctx, value));
+        g_jsHost->domDirty = true;
+        return true;
+    }
+    if (prop == "src" || prop == "href" || prop == "type" || prop == "value" || prop == "name") {
+        domSetAttr(*n, prop, jsToUtf8(ctx, value));
+        g_jsHost->domDirty = true;
         return true;
     }
 
@@ -1664,8 +1686,8 @@ static bool jscElementSetProperty(JSContextRef ctx, JSObjectRef object, JSString
 
 static JSValueRef jscElementAddEventListener(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
     if (!g_jsHost) return JSValueMakeUndefined(ctx);
-    auto* priv = (JscElementPriv*)JSObjectGetPrivate(thisObject);
-    if (!priv) return JSValueMakeUndefined(ctx);
+    DomNode* n = jscElNode(thisObject);
+    if (!n) return JSValueMakeUndefined(ctx);
     if (argc < 2) return JSValueMakeUndefined(ctx);
 
     std::string type = jsToUtf8(ctx, argv[0]);
@@ -1673,62 +1695,37 @@ static JSValueRef jscElementAddEventListener(JSContextRef ctx, JSObjectRef, JSOb
     JSObjectRef fn = JSValueToObject(ctx, argv[1], nullptr);
     if (!fn || !JSObjectIsFunction(ctx, fn)) return JSValueMakeUndefined(ctx);
 
-    jscAddListenerCtx(ctx, "el:" + priv->id + ":" + type, fn);
+    jscAddListenerCtx(ctx, "el:" + domGetAttr(*n, "id") + ":" + type, fn);
     return JSValueMakeUndefined(ctx);
-}
-
-static std::string jscElementOuterHtml(const JscElementPriv& el) {
-    std::string tag = el.tagName.empty() ? "div" : el.tagName;
-    std::string out = "<" + tag;
-    if (!el.id.empty() && el.id.rfind("__", 0) != 0) {
-        out += " id=\"" + el.id + "\"";
-    }
-    for (const auto& kv : el.attrs) {
-        out += " " + kv.first + "=\"" + escapeHtmlEntities(kv.second) + "\"";
-    }
-    out += ">";
-    out += escapeHtmlEntities(el.text);
-    out += "</" + tag + ">";
-    return out;
 }
 
 static JSValueRef jscElementAppendChild(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
     if (!g_jsHost) return JSValueMakeUndefined(ctx);
-    auto* parent = (JscElementPriv*)JSObjectGetPrivate(thisObject);
-    if (!parent) return JSValueMakeUndefined(ctx);
-    if (argc < 1) return JSValueMakeUndefined(ctx);
+    if (argc < 1 || !JSValueIsObject(ctx, argv[0])) return JSValueMakeUndefined(ctx);
 
-    if (!JSValueIsObject(ctx, argv[0])) return JSValueMakeUndefined(ctx);
+    int parentId = jscElNodeId(thisObject);
     JSObjectRef childObj = JSValueToObject(ctx, argv[0], nullptr);
-    auto* child = (JscElementPriv*)JSObjectGetPrivate(childObj);
-    if (!child) return JSValueMakeUndefined(ctx);
+    auto* childPriv = (JscElementPriv*)JSObjectGetPrivate(childObj);
+    if (parentId < 0 || !childPriv) return argv[0];
+    int childId = childPriv->nodeId;
 
-    // If appending a <script> into head/body, try to load/execute it.
-    if (toLowerCopy(parent->tagName) == "head" || toLowerCopy(parent->tagName) == "body") {
-        std::string snippet = jscElementOuterHtml(*child);
+    domAppendChild(g_jsHost->dom, parentId, childId);
+    g_jsHost->domDirty = true;
 
-        if (!g_jsHost->domHtml.empty()) {
-            insertBeforeClosingTag(g_jsHost->domHtml, parent->tagName, snippet);
-        }
-        g_jsHost->domDirty = true;
-
-        if (toLowerCopy(child->tagName) == "script") {
-            std::string src = "";
-            auto it = child->attrs.find("src");
-            if (it != child->attrs.end()) src = it->second;
-
+    // Appending a <script> element runs it (matches browser behavior).
+    if (DomNode* child = g_jsHost->dom.get(childId)) {
+        if (child->tag == "script") {
+            std::string src = domGetAttr(*child, "src");
+            std::string code;
             if (!src.empty()) {
                 std::string abs = resolveHref(g_jsHost->baseUrl, src);
                 if (abs.empty()) abs = src;
-                std::string code = fetchSubresourceText(abs);
-
+                code = fetchSubresourceText(abs);
+            } else {
+                code = domTextContent(g_jsHost->dom, childId);
+            }
+            if (!trimCopy(code).empty()) {
                 JSStringRef script = JSStringCreateWithUTF8CString(code.c_str());
-                JSValueRef exc = nullptr;
-                (void)JSEvaluateScript(ctx, script, nullptr, nullptr, 1, &exc);
-                JSStringRelease(script);
-                if (exc) std::cerr << "[JS Exception] " << jsToUtf8(ctx, exc) << "\n";
-            } else if (!child->text.empty()) {
-                JSStringRef script = JSStringCreateWithUTF8CString(child->text.c_str());
                 JSValueRef exc = nullptr;
                 (void)JSEvaluateScript(ctx, script, nullptr, nullptr, 1, &exc);
                 JSStringRelease(script);
@@ -1740,15 +1737,41 @@ static JSValueRef jscElementAppendChild(JSContextRef ctx, JSObjectRef, JSObjectR
     return argv[0];
 }
 
-static JSValueRef jscElementSetAttribute(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
-    auto* priv = (JscElementPriv*)JSObjectGetPrivate(thisObject);
-    if (!priv) return JSValueMakeUndefined(ctx);
-    if (argc < 2) return JSValueMakeUndefined(ctx);
+static JSValueRef jscElementRemoveChild(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost) return JSValueMakeUndefined(ctx);
+    if (argc < 1 || !JSValueIsObject(ctx, argv[0])) return JSValueMakeUndefined(ctx);
+    int parentId = jscElNodeId(thisObject);
+    JSObjectRef childObj = JSValueToObject(ctx, argv[0], nullptr);
+    auto* childPriv = (JscElementPriv*)JSObjectGetPrivate(childObj);
+    if (parentId < 0 || !childPriv) return argv[0];
+    domRemoveChild(g_jsHost->dom, parentId, childPriv->nodeId);
+    g_jsHost->domDirty = true;
+    return argv[0];
+}
 
+static JSValueRef jscElementSetAttribute(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    DomNode* n = jscElNode(thisObject);
+    if (!n || argc < 2) return JSValueMakeUndefined(ctx);
     std::string k = toLowerCopy(jsToUtf8(ctx, argv[0]));
     std::string v = jsToUtf8(ctx, argv[1]);
-    if (!k.empty()) priv->attrs[k] = v;
+    if (!k.empty()) {
+        domSetAttr(*n, k, v);
+        if (k == "style") domCaptureStyleDisplay(*n, v);
+        if (g_jsHost) g_jsHost->domDirty = true;
+    }
     return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef jscElementGetAttribute(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    DomNode* n = jscElNode(thisObject);
+    if (!n || argc < 1) return JSValueMakeNull(ctx);
+    std::string k = toLowerCopy(jsToUtf8(ctx, argv[0]));
+    const std::string* p = domGetAttrPtr(*n, k);
+    if (!p) return JSValueMakeNull(ctx);
+    JSStringRef s = JSStringCreateWithUTF8CString(p->c_str());
+    JSValueRef r = JSValueMakeString(ctx, s);
+    JSStringRelease(s);
+    return r;
 }
 
 
@@ -1769,97 +1792,36 @@ static void jscEnsureDomClasses() {
     }
 }
 
-static void indexDomIdsFromHtml(JsHost& host, const std::string& html) {
-    host.domIds.clear();
-
-    // Very simple scan for id="..." or id='...'
-    static const std::regex reId(R"(id\s*=\s*(['"])([^'"]+)\1)", std::regex_constants::icase);
-    auto begin = std::sregex_iterator(html.begin(), html.end(), reId);
-    auto end = std::sregex_iterator();
-    for (auto it = begin; it != end; ++it) {
-        host.domIds.insert((*it)[2].str());
-    }
-}
-
-static bool isDisplayNone(const JsHost& host, const std::string& id) {
-    auto it = host.styleDisplayById.find(id);
-    if (it == host.styleDisplayById.end()) return false;
-    std::string v = toLowerCopy(trimCopy(it->second));
-    return (v == "none");
-}
-
-static std::string stripFirstElementById(const std::string& html, const std::string& id) {
-    // Best-effort remover: find first tag containing id="id" and remove that element.
-    std::string needle1 = "id=\"" + id + "\"";
-    std::string needle2 = "id='" + id + "'";
-    size_t pos = html.find(needle1);
-    if (pos == std::string::npos) pos = html.find(needle2);
-    if (pos == std::string::npos) return html;
-
-    size_t tagStart = html.rfind('<', pos);
-    if (tagStart == std::string::npos) return html;
-
-    size_t tagEnd = html.find('>', pos);
-    if (tagEnd == std::string::npos) return html;
-
-    // Extract tag name
-    size_t nameStart = tagStart + 1;
-    while (nameStart < html.size() && std::isspace((unsigned char)html[nameStart])) nameStart++;
-    if (nameStart < html.size() && html[nameStart] == '/') return html;
-
-    size_t nameEnd = nameStart;
-    while (nameEnd < html.size() && std::isalpha((unsigned char)html[nameEnd])) nameEnd++;
-    std::string tag = toLowerCopy(html.substr(nameStart, nameEnd - nameStart));
-    if (tag.empty()) return html;
-
-    // Self-closing?
-    bool selfClose = false;
-    {
-        size_t check = tagEnd;
-        while (check > tagStart && std::isspace((unsigned char)html[check - 1])) check--;
-        if (check > tagStart && html[check - 1] == '/') selfClose = true;
-    }
-
-    if (selfClose || tag == "img" || tag == "br" || tag == "meta" || tag == "link" || tag == "input") {
-        // Remove only the tag itself
-        return html.substr(0, tagStart) + html.substr(tagEnd + 1);
-    }
-
-    std::string closeTag = "</" + tag + ">";
-    size_t closePos = html.find(closeTag, tagEnd + 1);
-    if (closePos == std::string::npos) {
-        // Fallback: remove opening tag only
-        return html.substr(0, tagStart) + html.substr(tagEnd + 1);
-    }
-
-    size_t closeEnd = closePos + closeTag.size();
-    return html.substr(0, tagStart) + html.substr(closeEnd);
-}
-
-static std::string applyDisplayNonePatches(const std::string& html, const JsHost& host) {
-    std::string out = html;
-    // Remove each element with display:none (best effort, first occurrence)
-    for (const auto& kv : host.styleDisplayById) {
-        if (isDisplayNone(host, kv.first)) {
-            out = stripFirstElementById(out, kv.first);
-        }
-    }
-    return out;
-}
-
 static JSValueRef jscGetElementById(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) {
-    if (!g_jsHost) return JSValueMakeNull(ctx);
-    if (argc < 1) return JSValueMakeNull(ctx);
-
+    if (!g_jsHost || argc < 1) return JSValueMakeNull(ctx);
     std::string id = jsToUtf8(ctx, argv[0]);
     if (id.empty()) return JSValueMakeNull(ctx);
 
-    // If the element is not known, return a "virtual" element instead of null.
-    // This prevents a lot of real-world scripts from crashing immediately.
-    g_jsHost->domIds.insert(id);
+    int nid = domFindById(g_jsHost->dom, g_jsHost->dom.root, id);
+    if (nid < 0) {
+        // Unknown id: hand back a detached element so getElementById(...).x
+        // doesn't throw. It is not part of the rendered tree.
+        nid = g_jsHost->dom.alloc(DomNodeType::Element);
+        g_jsHost->dom.nodes[nid].tag = "div";
+        domSetAttr(g_jsHost->dom.nodes[nid], "id", id);
+    }
     jscEnsureDomClasses();
-    JSObjectRef el = JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{id, "div", {}, ""});
-    return el;
+    return JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ nid });
+}
+
+static JSValueRef jscQuerySelector(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost || argc < 1) return JSValueMakeNull(ctx);
+    std::string sel = trimCopy(jsToUtf8(ctx, argv[0]));
+    if (sel.empty() || sel.find(' ') != std::string::npos) return JSValueMakeNull(ctx);
+
+    int nid = -1;
+    if (sel[0] == '#')      nid = domFindById(g_jsHost->dom, g_jsHost->dom.root, sel.substr(1));
+    else if (sel[0] == '.') nid = domFindByClass(g_jsHost->dom, g_jsHost->dom.root, sel.substr(1));
+    else                    nid = domFindByTag(g_jsHost->dom, g_jsHost->dom.root, toLowerCopy(sel));
+
+    if (nid < 0) return JSValueMakeNull(ctx);
+    jscEnsureDomClasses();
+    return JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ nid });
 }
 
 static JSValueRef jscPerformanceNow(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*) {
@@ -1906,24 +1868,23 @@ static void jsSetupPageGlobals(JSContextRef ctx, const std::string& url, const s
         // document.createElement
         JSStringRef ce = JSStringCreateWithUTF8CString("createElement");
         JSObjectRef ceFn = JSObjectMakeFunctionWithCallback(ctx, ce, [](JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) -> JSValueRef {
-            if (!g_jsHost) return JSValueMakeNull(ctx);
-            if (argc < 1) return JSValueMakeNull(ctx);
+            if (!g_jsHost || argc < 1) return JSValueMakeNull(ctx);
             std::string tag = toLowerCopy(jsToUtf8(ctx, argv[0]));
             if (tag.empty()) tag = "div";
 
-            g_jsHost->domIds.insert("__el" + std::to_string(g_jsHost->nextTimerId)); // minor uniqueness
+            int nid = g_jsHost->dom.alloc(DomNodeType::Element);
+            g_jsHost->dom.nodes[nid].tag = tag;
             jscEnsureDomClasses();
-            std::string vid = "__el" + std::to_string(g_jsHost->nextTimerId++);
-            JSObjectRef el = JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{vid, tag, {}, ""});
-            return el;
+            return JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ nid });
         });
         JSObjectSetProperty(ctx, document, ce, ceFn, kJSPropertyAttributeNone, nullptr);
         JSStringRelease(ce);
 
-        // document.body and document.head
+        // document.body / document.head resolve to the real <body>/<head> nodes
+        // (created if the page omitted them) so appendChild() actually renders.
         jscEnsureDomClasses();
-        JSObjectRef body = JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{"__body", "body", {}, ""});
-        JSObjectRef head = JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{"__head", "head", {}, ""});
+        JSObjectRef body = JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ domFindOrCreateTag(g_jsHost->dom, "body") });
+        JSObjectRef head = JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ domFindOrCreateTag(g_jsHost->dom, "head") });
         JSStringRef bname = JSStringCreateWithUTF8CString("body");
         JSObjectSetProperty(ctx, document, bname, body, kJSPropertyAttributeNone, nullptr);
         JSStringRelease(bname);
@@ -1932,7 +1893,7 @@ static void jsSetupPageGlobals(JSContextRef ctx, const std::string& url, const s
         JSStringRelease(hname);
 
         JSStringRef qs = JSStringCreateWithUTF8CString("querySelector");
-        JSObjectRef qsFn = JSObjectMakeFunctionWithCallback(ctx, qs, jscReturnNull);
+        JSObjectRef qsFn = JSObjectMakeFunctionWithCallback(ctx, qs, jscQuerySelector);
         JSObjectSetProperty(ctx, document, qs, qsFn, kJSPropertyAttributeNone, nullptr);
         JSStringRelease(qs);
     }
@@ -2011,11 +1972,14 @@ static std::string runJavaScriptForHtml(JsEngine& js,
                                        const std::string& urlString) {
     js.host.currentUrl = urlString;
     js.host.baseUrl = baseUrl;
+    js.host.domDirty = false;
 
     jsResetContext(js);
 
-    js.host.domHtml = stripNoscriptBlocks(html);
-    indexDomIdsFromHtml(js.host, js.host.domHtml);
+    // Build the real DOM tree (the source of truth for this page); the renderer
+    // consumes a serialized snapshot of it.
+    js.host.dom = domParse(stripNoscriptBlocks(html));
+    js.host.domHtml = domSerialize(js.host.dom);
 
     std::string initialTitle = extractTitleFromHtmlSimple(html);
     jsSetupPageGlobals(js.ctx, urlString, initialTitle);
@@ -2054,6 +2018,8 @@ static std::string runJavaScriptForHtml(JsEngine& js,
         if (exc) jsDumpException(js.ctx, exc);
     }
 
+    // Reflect any DOM mutations the scripts made back into the render snapshot.
+    js.host.domHtml = domSerialize(js.host.dom);
     return jsReadDocumentTitle(js.ctx);
 }
 
@@ -2095,356 +2061,6 @@ static void jsPumpTimers(JsEngine& js) {
 #else
 // -------------------- JavaScript (QuickJS) --------------------
 
-// -------------------- Minimal DOM tree --------------------
-// A real (if small) DOM: a pool of nodes addressed by stable integer ids.
-// JS bindings hold node ids and mutate this tree directly; for rendering the
-// tree is serialized back to HTML and fed through the existing layout pipeline.
-
-enum class DomNodeType { Element, Text };
-
-struct DomNode {
-    DomNodeType type = DomNodeType::Element;
-    std::string tag;                                          // lowercased (Element)
-    std::vector<std::pair<std::string, std::string>> attrs;   // ordered (Element)
-    std::string text;                                         // (Text)
-    std::string styleDisplay;                                 // style.display, if set
-    int parent = -1;
-    std::vector<int> children;
-    bool alive = true;
-};
-
-struct DomTree {
-    std::vector<DomNode> nodes;
-    int root = -1; // synthetic root; its children are the top-level nodes
-
-    int alloc(DomNodeType t) {
-        DomNode n;
-        n.type = t;
-        nodes.push_back(std::move(n));
-        return (int)nodes.size() - 1;
-    }
-    DomNode* get(int id) {
-        if (id < 0 || id >= (int)nodes.size()) return nullptr;
-        return &nodes[id];
-    }
-    const DomNode* get(int id) const {
-        if (id < 0 || id >= (int)nodes.size()) return nullptr;
-        return &nodes[id];
-    }
-};
-
-static const std::string* domGetAttrPtr(const DomNode& n, const std::string& key) {
-    for (auto& kv : n.attrs) if (kv.first == key) return &kv.second;
-    return nullptr;
-}
-static std::string domGetAttr(const DomNode& n, const std::string& key) {
-    const std::string* p = domGetAttrPtr(n, key);
-    return p ? *p : std::string();
-}
-static void domSetAttr(DomNode& n, const std::string& key, const std::string& val) {
-    for (auto& kv : n.attrs) if (kv.first == key) { kv.second = val; return; }
-    n.attrs.push_back({ key, val });
-}
-
-static void domAppendChild(DomTree& dom, int parentId, int childId) {
-    DomNode* child = dom.get(childId);
-    if (!child) return;
-    if (child->parent >= 0) {
-        if (DomNode* old = dom.get(child->parent)) {
-            auto& cs = old->children;
-            cs.erase(std::remove(cs.begin(), cs.end(), childId), cs.end());
-        }
-    }
-    DomNode* parent = dom.get(parentId);
-    if (!parent) { child->parent = -1; return; }
-    parent->children.push_back(childId);
-    child->parent = parentId;
-}
-
-static void domRemoveChild(DomTree& dom, int parentId, int childId) {
-    DomNode* parent = dom.get(parentId);
-    DomNode* child = dom.get(childId);
-    if (!parent || !child) return;
-    auto& cs = parent->children;
-    cs.erase(std::remove(cs.begin(), cs.end(), childId), cs.end());
-    child->parent = -1;
-}
-
-static int domFindById(const DomTree& dom, int start, const std::string& id) {
-    const DomNode* n = dom.get(start);
-    if (!n) return -1;
-    if (n->type == DomNodeType::Element) {
-        const std::string* a = domGetAttrPtr(*n, "id");
-        if (a && *a == id) return start;
-    }
-    for (int c : n->children) {
-        int r = domFindById(dom, c, id);
-        if (r >= 0) return r;
-    }
-    return -1;
-}
-
-static int domFindByTag(const DomTree& dom, int start, const std::string& tag) {
-    const DomNode* n = dom.get(start);
-    if (!n) return -1;
-    if (n->type == DomNodeType::Element && n->tag == tag) return start;
-    for (int c : n->children) {
-        int r = domFindByTag(dom, c, tag);
-        if (r >= 0) return r;
-    }
-    return -1;
-}
-
-static int domFindByClass(const DomTree& dom, int start, const std::string& cls) {
-    const DomNode* n = dom.get(start);
-    if (!n) return -1;
-    if (n->type == DomNodeType::Element) {
-        for (auto& c : parseClassList(domGetAttr(*n, "class"))) {
-            if (c == cls) return start;
-        }
-    }
-    for (int c : n->children) {
-        int r = domFindByClass(dom, c, cls);
-        if (r >= 0) return r;
-    }
-    return -1;
-}
-
-static int domFindOrCreateTag(DomTree& dom, const std::string& tag) {
-    int id = domFindByTag(dom, dom.root, tag);
-    if (id >= 0) return id;
-    int el = dom.alloc(DomNodeType::Element);
-    dom.nodes[el].tag = tag;
-    domAppendChild(dom, dom.root, el);
-    return el;
-}
-
-static void domCollectText(const DomTree& dom, int id, std::string& out) {
-    const DomNode* n = dom.get(id);
-    if (!n) return;
-    if (n->type == DomNodeType::Text) { out += n->text; return; }
-    for (int c : n->children) domCollectText(dom, c, out);
-}
-static std::string domTextContent(const DomTree& dom, int id) {
-    std::string out;
-    domCollectText(dom, id, out);
-    return out;
-}
-
-static const std::unordered_set<std::string>& domVoidTags() {
-    static const std::unordered_set<std::string> v = {
-        "area", "base", "br", "col", "embed", "hr", "img", "input",
-        "link", "meta", "param", "source", "track", "wbr"
-    };
-    return v;
-}
-
-// Serialize a node subtree to HTML. Elements with style.display == "none" are
-// skipped so the renderer never lays them out.
-static void domSerializeNode(const DomTree& dom, int id, std::string& out) {
-    const DomNode* n = dom.get(id);
-    if (!n || !n->alive) return;
-
-    if (n->type == DomNodeType::Text) {
-        out += escapeHtmlEntities(n->text);
-        return;
-    }
-
-    if (toLowerCopy(trimCopy(n->styleDisplay)) == "none") return;
-
-    std::string tag = n->tag.empty() ? std::string("div") : n->tag;
-    out += "<" + tag;
-    for (auto& kv : n->attrs) {
-        out += " " + kv.first + "=\"" + escapeHtmlEntities(kv.second) + "\"";
-    }
-    out += ">";
-
-    if (domVoidTags().count(tag)) return;
-
-    for (int c : n->children) domSerializeNode(dom, c, out);
-    out += "</" + tag + ">";
-}
-
-static std::string domSerialize(const DomTree& dom) {
-    std::string out;
-    const DomNode* r = dom.get(dom.root);
-    if (!r) return out;
-    for (int c : r->children) domSerializeNode(dom, c, out);
-    return out;
-}
-
-static std::string domSerializeChildren(const DomTree& dom, int id) {
-    std::string out;
-    const DomNode* n = dom.get(id);
-    if (!n) return out;
-    for (int c : n->children) domSerializeNode(dom, c, out);
-    return out;
-}
-
-static void domCaptureStyleDisplay(DomNode& n, const std::string& styleAttr) {
-    std::string sv = toLowerCopy(styleAttr);
-    size_t dp = sv.find("display");
-    if (dp == std::string::npos) return;
-    size_t colon = sv.find(':', dp);
-    if (colon == std::string::npos) return;
-    size_t e = sv.find(';', colon);
-    n.styleDisplay = trimCopy(sv.substr(colon + 1, (e == std::string::npos ? sv.size() : e) - colon - 1));
-}
-
-static DomTree domParse(const std::string& html) {
-    DomTree dom;
-    dom.root = dom.alloc(DomNodeType::Element);
-    dom.nodes[dom.root].tag = "#root";
-
-    std::vector<int> stack;
-    stack.push_back(dom.root);
-    auto top = [&]() -> int { return stack.empty() ? dom.root : stack.back(); };
-
-    std::string textBuf;
-    auto flushText = [&]() {
-        if (textBuf.empty()) return;
-        std::string decoded = decodeEntities(textBuf);
-        textBuf.clear();
-        if (trimCopy(decoded).empty()) return; // drop whitespace-only nodes
-        int t = dom.alloc(DomNodeType::Text);
-        dom.nodes[t].text = decoded;
-        domAppendChild(dom, top(), t);
-    };
-
-    size_t i = 0;
-    const size_t N = html.size();
-    while (i < N) {
-        char c = html[i];
-        if (c != '<') { textBuf.push_back(c); i++; continue; }
-
-        if (html.compare(i, 4, "<!--") == 0) {
-            flushText();
-            size_t end = html.find("-->", i + 4);
-            i = (end == std::string::npos) ? N : end + 3;
-            continue;
-        }
-
-        size_t gt = html.find('>', i);
-        if (gt == std::string::npos) { textBuf.append(html, i, std::string::npos); break; }
-
-        std::string inner = html.substr(i + 1, gt - (i + 1));
-        i = gt + 1;
-
-        std::string t = trimCopy(inner);
-        if (t.empty()) continue;
-        if (t[0] == '!' || t[0] == '?') { flushText(); continue; }
-
-        flushText();
-
-        bool isEnd = (t[0] == '/');
-        size_t p = isEnd ? 1 : 0;
-        std::string name;
-        while (p < t.size() && (std::isalnum((unsigned char)t[p]) || t[p] == '-')) {
-            name.push_back((char)std::tolower((unsigned char)t[p]));
-            p++;
-        }
-        if (name.empty()) continue;
-
-        if (isEnd) {
-            for (int s = (int)stack.size() - 1; s >= 1; --s) {
-                if (dom.nodes[stack[s]].tag == name) { stack.resize(s); break; }
-            }
-            continue;
-        }
-
-        bool selfClose = (!t.empty() && t.back() == '/');
-
-        int el = dom.alloc(DomNodeType::Element);
-        dom.nodes[el].tag = name;
-
-        std::string attrsPart = t.substr(p);
-        size_t q = 0;
-        while (q < attrsPart.size()) {
-            while (q < attrsPart.size() && (std::isspace((unsigned char)attrsPart[q]) || attrsPart[q] == '/')) q++;
-            if (q >= attrsPart.size()) break;
-            std::string key;
-            while (q < attrsPart.size() && attrsPart[q] != '=' &&
-                   !std::isspace((unsigned char)attrsPart[q]) && attrsPart[q] != '/') {
-                key.push_back((char)std::tolower((unsigned char)attrsPart[q]));
-                q++;
-            }
-            while (q < attrsPart.size() && std::isspace((unsigned char)attrsPart[q])) q++;
-            std::string val;
-            if (q < attrsPart.size() && attrsPart[q] == '=') {
-                q++;
-                while (q < attrsPart.size() && std::isspace((unsigned char)attrsPart[q])) q++;
-                if (q < attrsPart.size() && (attrsPart[q] == '"' || attrsPart[q] == '\'')) {
-                    char quote = attrsPart[q++];
-                    while (q < attrsPart.size() && attrsPart[q] != quote) { val.push_back(attrsPart[q]); q++; }
-                    if (q < attrsPart.size()) q++;
-                } else {
-                    while (q < attrsPart.size() && !std::isspace((unsigned char)attrsPart[q]) && attrsPart[q] != '/') {
-                        val.push_back(attrsPart[q]); q++;
-                    }
-                }
-            }
-            if (!key.empty()) {
-                std::string dval = decodeEntities(val);
-                domSetAttr(dom.nodes[el], key, dval);
-                if (key == "style") domCaptureStyleDisplay(dom.nodes[el], dval);
-            }
-        }
-
-        domAppendChild(dom, top(), el);
-
-        if (!domVoidTags().count(name) && !selfClose) stack.push_back(el);
-    }
-    flushText();
-
-    return dom;
-}
-
-// Deep-copy a node (and its subtree) from src into dom; returns the new id.
-static int domImportNode(DomTree& dom, const DomTree& src, int srcId) {
-    const DomNode* sn = src.get(srcId);
-    if (!sn) return -1;
-    int nid = dom.alloc(sn->type);
-    dom.nodes[nid].type = sn->type;
-    dom.nodes[nid].tag = sn->tag;
-    dom.nodes[nid].attrs = sn->attrs;
-    dom.nodes[nid].text = sn->text;
-    dom.nodes[nid].styleDisplay = sn->styleDisplay;
-    // Copy children list first (recursion may reallocate the vector).
-    std::vector<int> kids = sn->children;
-    for (int c : kids) {
-        int cid = domImportNode(dom, src, c);
-        if (cid >= 0) domAppendChild(dom, nid, cid);
-    }
-    return nid;
-}
-
-static void domClearChildren(DomTree& dom, int nodeId) {
-    DomNode* n = dom.get(nodeId);
-    if (!n) return;
-    for (int c : n->children) { if (DomNode* cc = dom.get(c)) cc->parent = -1; }
-    dom.get(nodeId)->children.clear();
-}
-
-static void domSetTextContent(DomTree& dom, int nodeId, const std::string& text) {
-    if (!dom.get(nodeId)) return;
-    domClearChildren(dom, nodeId);
-    int t = dom.alloc(DomNodeType::Text);
-    dom.nodes[t].text = text;
-    domAppendChild(dom, nodeId, t);
-}
-
-static void domSetInnerHtml(DomTree& dom, int nodeId, const std::string& html) {
-    if (!dom.get(nodeId)) return;
-    domClearChildren(dom, nodeId);
-    DomTree frag = domParse(html);
-    const DomNode* fr = frag.get(frag.root);
-    if (!fr) return;
-    std::vector<int> topKids = fr->children;
-    for (int fc : topKids) {
-        int nid = domImportNode(dom, frag, fc);
-        if (nid >= 0) domAppendChild(dom, nodeId, nid);
-    }
-}
 
 struct JsHost {
     SDL_Window* window = nullptr;
@@ -4229,13 +3845,9 @@ int main(int argc, char** argv) {
             std::string jsTitle = runJavaScriptForHtml(js, t.page.body, t.page.baseUrl, t.page.urlString);
             if (!jsTitle.empty()) pageTitle = jsTitle;
 
-            // If JS mutated the HTML backing store, re-render from that.
+            // The DOM tree was serialized into domHtml by runJavaScriptForHtml.
             if (!js.host.domHtml.empty()) {
-#if defined(__APPLE__)
                 t.page.body = js.host.domHtml;
-#else
-                t.page.body = js.host.domHtml;
-#endif
             }
             js.host.domDirty = false;
             activeJsTab = idx;
@@ -4396,7 +4008,7 @@ int main(int argc, char** argv) {
 
                     
 #ifdef NOCHROME_ENABLE_JS
-#if defined(__APPLE__)
+#if defined(NOCHROME_USE_JSC)
                     // Dispatch click event (best-effort).
                     {
                         g_jsHost = &js.host;
@@ -4496,7 +4108,7 @@ int main(int argc, char** argv) {
                                 }
                             }
                             if (!hitId.empty()) {
-#if defined(__APPLE__)
+#if defined(NOCHROME_USE_JSC)
                                 g_jsHost = &js.host;
                                 JSObjectRef evt = JSObjectMake(js.ctx, nullptr, nullptr);
                                 JSStringRef tn = JSStringCreateWithUTF8CString("type");
@@ -4553,7 +4165,7 @@ int main(int argc, char** argv) {
                     bool shift = (e.key.keysym.mod & KMOD_SHIFT);
 
 #ifdef NOCHROME_ENABLE_JS
-#if defined(__APPLE__)
+#if defined(NOCHROME_USE_JSC)
                     // Dispatch window/document keydown (best-effort, no target mapping).
                     {
                         g_jsHost = &js.host;
@@ -4665,13 +4277,10 @@ int main(int argc, char** argv) {
         jsPumpTimers(js);
         if (js.host.domDirty) {
             js.host.domDirty = false;
-            if (activeJsTab == activeTab && !tabs.empty() && !js.host.domHtml.empty()) {
-#if defined(__APPLE__)
-                tabs[activeTab].page.body = js.host.domHtml;
-#else
+            if (activeJsTab == activeTab && !tabs.empty()) {
+                // Re-serialize the (mutated) DOM tree and re-render the page.
                 js.host.domHtml = domSerialize(js.host.dom);
                 tabs[activeTab].page.body = js.host.domHtml;
-#endif
                 rebuildTabLayout(activeTab);
                 clampScroll();
 

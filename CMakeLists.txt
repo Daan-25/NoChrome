@@ -19,6 +19,7 @@ pkg_check_modules(SDL2_IMAGE REQUIRED SDL2_image)
 find_package(OpenSSL REQUIRED)
 
 option(NOCHROME_ENABLE_JS "Enable JavaScript support" ON)
+option(NOCHROME_FORCE_JSC "Use JavaScriptCore (WebKitGTK) instead of QuickJS on non-Apple platforms" OFF)
 
 add_executable(NoChrome main.cpp)
 
@@ -55,6 +56,14 @@ if(NOCHROME_ENABLE_JS)
     # Use Apple's built-in JavaScript engine (JavaScriptCore framework)
     find_library(JAVASCRIPTCORE_FRAMEWORK JavaScriptCore REQUIRED)
     target_link_libraries(NoChrome PRIVATE ${JAVASCRIPTCORE_FRAMEWORK})
+  elseif(NOCHROME_FORCE_JSC)
+    # Use WebKitGTK's JavaScriptCore (same C API as Apple's) so the
+    # JavaScriptCore backend can be built and tested on Linux.
+    pkg_check_modules(JSCGTK REQUIRED javascriptcoregtk-4.1)
+    target_compile_definitions(NoChrome PRIVATE NOCHROME_FORCE_JSC=1)
+    target_include_directories(NoChrome PRIVATE ${JSCGTK_INCLUDE_DIRS})
+    target_link_directories(NoChrome PRIVATE ${JSCGTK_LIBRARY_DIRS})
+    target_link_libraries(NoChrome PRIVATE ${JSCGTK_LIBRARIES})
   else()
     # Non-macOS: embed QuickJS (requires headers + libquickjs).
     # If your distro doesn't ship libquickjs, build QuickJS from source and point CMake to it:
