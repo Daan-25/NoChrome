@@ -1171,8 +1171,7 @@ struct JsHost {
     SDL_Window* window = nullptr;
     std::string currentUrl;
 
-    // Real DOM tree (source of truth). domHtml below is a serialized snapshot
-    // used by the renderer; it is refreshed from the tree after JS runs.
+    // Real DOM tree (source of truth); the renderer walks it directly.
     DomTree dom;
     bool domDirty = false;
 
@@ -1191,9 +1190,7 @@ struct JsHost {
     // Event listeners keyed by scope+type, e.g. "window:keydown", "document:DOMContentLoaded", "el:myid:click"
     std::unordered_map<std::string, std::vector<JSObjectRef>> listeners; // protected
 
-    // Best-effort "DOM" backing store: we mutate this HTML string and re-render when domDirty flips.
     Url baseUrl;
-    std::string domHtml;
 
     std::chrono::steady_clock::time_point perfStart = std::chrono::steady_clock::now();
 };
@@ -2155,10 +2152,9 @@ static std::string runJavaScriptForHtml(JsEngine& js,
 
     jsResetContext(js);
 
-    // Build the real DOM tree (the source of truth for this page); the renderer
-    // consumes a serialized snapshot of it.
+    // Build the real DOM tree (the source of truth for this page; the renderer
+    // walks it directly).
     js.host.dom = domParse(stripNoscriptBlocks(html));
-    js.host.domHtml = domSerialize(js.host.dom);
 
     std::string initialTitle = extractTitleFromHtmlSimple(html);
     jsSetupPageGlobals(js.ctx, urlString, initialTitle);
@@ -2197,8 +2193,6 @@ static std::string runJavaScriptForHtml(JsEngine& js,
         if (exc) jsDumpException(js.ctx, exc);
     }
 
-    // Reflect any DOM mutations the scripts made back into the render snapshot.
-    js.host.domHtml = domSerialize(js.host.dom);
     return jsReadDocumentTitle(js.ctx);
 }
 
@@ -2262,11 +2256,9 @@ struct JsHost {
     // Event listeners keyed by scope+type, e.g. "window:click", "document:keydown", "el:myid:click".
     std::unordered_map<std::string, std::vector<JSValue>> listeners; // duplicated
 
-    // Real DOM tree (source of truth). domHtml is a serialized snapshot used by
-    // the renderer; it is refreshed from the tree after scripts / mutations run.
+    // Real DOM tree (source of truth); the renderer walks it directly.
     Url baseUrl;
     DomTree dom;
-    std::string domHtml;
 
     std::chrono::steady_clock::time_point perfStart = std::chrono::steady_clock::now();
 };
@@ -3086,10 +3078,9 @@ static std::string runJavaScriptForHtml(JsEngine& js,
 
     jsResetContext(js);
 
-    // Build the real DOM tree (the source of truth for this page); the renderer
-    // consumes a serialized snapshot of it.
+    // Build the real DOM tree (the source of truth for this page; the renderer
+    // walks it directly).
     js.host.dom = domParse(stripNoscriptBlocks(html));
-    js.host.domHtml = domSerialize(js.host.dom);
 
     std::string initialTitle = extractTitleFromHtmlSimple(html);
     jsSetupPageGlobals(js.ctx, urlString, initialTitle);
@@ -3125,8 +3116,6 @@ static std::string runJavaScriptForHtml(JsEngine& js,
         jsDrainJobs(js);
     }
 
-    // Reflect any DOM mutations the scripts made back into the render snapshot.
-    js.host.domHtml = domSerialize(js.host.dom);
     return jsReadDocumentTitle(js.ctx);
 }
 #endif
@@ -3135,103 +3124,52 @@ static std::string runJavaScriptForHtml(JsEngine& js,
 
 // -------------------- HTML -> Styled tokens --------------------
 
-static std::vector<StyledToken> parseHtmlToStyledTokens(const std::string& html,
-                                                        const Url& baseUrl,
-                                                        SDL_Color* outPageBg) {
-    // 1) Inline CSS from <style>
-    std::string cssAll;
-    for (auto& block : extractTagContents(html, "style")) {
-        cssAll += block;
-        cssAll.push_back('\n');
-    }
-
-    // 2) External CSS from <link rel="stylesheet" href="...">
-    int externalCount = 0;
-    auto linkTags = extractStartTagContents(html, "link");
-    for (const auto& tagContent : linkTags) {
-        if (externalCount >= 8) break;
-
-        std::string rel = toLowerCopy(getAttrValue(tagContent, "rel"));
-        if (rel.find("stylesheet") == std::string::npos) continue;
-
-        std::string href = trimCopy(getAttrValue(tagContent, "href"));
-        if (href.empty()) continue;
-
-        std::string abs = resolveHref(baseUrl, href);
-        if (abs.empty()) continue;
-
-        std::string css = fetchSubresourceText(abs);
-        if (!css.empty()) {
-            cssAll += "\n";
-            cssAll += css;
-            cssAll += "\n";
-            externalCount++;
+static void domCollectCssVisit(const DomTree& dom, int id, const Url& baseUrl,
+                               std::string& cssAll, int& externalCount) {
+    const DomNode* n = dom.get(id);
+    if (!n) return;
+    if (n->type == DomNodeType::Element) {
+        if (n->tag == "style") {
+            cssAll += domTextContent(dom, id);
+            cssAll.push_back('\n');
+        } else if (n->tag == "link") {
+            std::string rel = toLowerCopy(domGetAttr(*n, "rel"));
+            if (rel.find("stylesheet") != std::string::npos && externalCount < 8) {
+                std::string href = trimCopy(domGetAttr(*n, "href"));
+                if (!href.empty()) {
+                    std::string abs = resolveHref(baseUrl, href);
+                    std::string css = abs.empty() ? std::string() : fetchSubresourceText(abs);
+                    if (!css.empty()) {
+                        cssAll += "\n" + css + "\n";
+                        externalCount++;
+                    }
+                }
+            }
         }
     }
+    for (int c : n->children) domCollectCssVisit(dom, c, baseUrl, cssAll, externalCount);
+}
 
-    auto rules = parseCssRules(cssAll);
-
-    if (outPageBg) {
-        *outPageBg = extractPageBackgroundFromRules(rules);
-    }
-
-    // Remove non-rendered blocks
-    std::string cleaned = removeTagBlocks(html, "script");
-    cleaned = removeTagBlocks(cleaned, "style");
-    cleaned = removeTagBlocks(cleaned, "head");
-
-
-#ifdef NOCHROME_ENABLE_JS
-    // If JS is enabled, do not render <noscript> fallbacks.
-    cleaned = removeTagBlocks(cleaned, "noscript");
-#endif
+namespace {
+// Walks the DOM tree producing the StyledToken stream the layout consumes.
+struct DomTokenize {
+    const DomTree& dom;
+    const std::vector<StyleRule>& rules;
+    const Url& baseUrl;
     std::vector<StyledToken> tokens;
 
-    bool inTag = false;
-    std::string tagBuf;
-    std::string textBuf;
-
-    std::vector<TextStyle> styleStack;
-    std::vector<std::string> hrefStack;
-    std::vector<std::string> idStack;
-
-    TextStyle base;
-    styleStack.push_back(base);
-    hrefStack.push_back("");
-    idStack.push_back("");
-
-    auto currentStyle = [&]()->TextStyle {
-        return styleStack.empty() ? base : styleStack.back();
-    };
-    auto currentHref = [&]()->std::string {
-        return hrefStack.empty() ? "" : hrefStack.back();
-    };
-    auto currentId = [&]()->std::string {
-        return idStack.empty() ? "" : idStack.back();
-    };
-
-    auto pushBreakN = [&](int n){
+    void emitBreak(int n) {
         if (n <= 0) return;
         StyledToken bt;
         bt.kind = TokenKind::Break;
-        bt.style = base;
         bt.breakCount = n;
         tokens.push_back(bt);
-    };
+    }
 
-    auto flushText = [&](){
-        std::string t = decodeEntities(textBuf);
-        textBuf.clear();
-
-        t = trimCopy(t);
-        if (t.empty()) return;
-
-        std::istringstream iss(t);
+    void emitText(const std::string& text, const TextStyle& st,
+                  const std::string& href, const std::string& eid) {
+        std::istringstream iss(text);
         std::string w;
-        TextStyle st = currentStyle();
-        std::string href = currentHref();
-        std::string eid = currentId();
-
         while (iss >> w) {
             StyledToken tok;
             tok.kind = TokenKind::Word;
@@ -3241,133 +3179,100 @@ static std::vector<StyledToken> parseHtmlToStyledTokens(const std::string& html,
             tok.elementId = eid;
             tokens.push_back(std::move(tok));
         }
-    };
+    }
 
-    auto popOne = [&](){
-        if (styleStack.size() > 1) styleStack.pop_back();
-        if (hrefStack.size() > 1) hrefStack.pop_back();
-        if (idStack.size() > 1) idStack.pop_back();
-    };
-
-    auto parseIntAttr = [&](const std::string& s)->int{
+    static int intAttr(const std::string& s) {
         std::string v = trimCopy(s);
         if (v.empty()) return 0;
-        try {
-            return std::max(0, std::stoi(v));
-        } catch (...) {
-            return 0;
-        }
-    };
+        try { return std::max(0, std::stoi(v)); } catch (...) { return 0; }
+    }
 
-    auto processTag = [&](const std::string& raw){
-        std::string t = trimCopy(raw);
-        if (t.empty()) return;
+    void walk(int nodeId, TextStyle style, std::string href, std::string eid) {
+        const DomNode* n = dom.get(nodeId);
+        if (!n) return;
 
-        if (!t.empty() && (t[0] == '!' || t[0] == '?')) return;
-
-        std::string lower = toLowerCopy(t);
-        bool isEnd = (!lower.empty() && lower[0] == '/');
-
-        size_t i = isEnd ? 1 : 0;
-        std::string name;
-        while (i < lower.size() && std::isalpha((unsigned char)lower[i])) {
-            name.push_back(lower[i]);
-            i++;
-        }
-        if (name.empty()) return;
-
-        bool selfClosing = (lower.find("/>") != std::string::npos);
-
-        if (name == "br") {
-            pushBreakN(1);
+        if (n->type == DomNodeType::Text) {
+            emitText(n->text, style, href, eid);
             return;
         }
 
-        if (!isEnd && name == "img") {
-            // Flush text before inserting an image token
-            flushText();
+        const std::string& tag = n->tag;
 
-            std::string src = trimCopy(getAttrValue(t, "src"));
+        if (tag == "#root") {
+            for (int c : n->children) walk(c, style, href, eid);
+            return;
+        }
+        if (tag == "noscript") {
+#ifndef NOCHROME_ENABLE_JS
+            for (int c : n->children) walk(c, style, href, eid); // render fallback when JS is off
+#endif
+            return;
+        }
+        // Never-rendered subtrees (CSS is collected separately).
+        if (tag == "script" || tag == "style" || tag == "head" ||
+            tag == "title" || tag == "meta" || tag == "link") {
+            return;
+        }
+        if (tag == "br") { emitBreak(1); return; }
+
+        if (tag == "img") {
+            std::string src = trimCopy(domGetAttr(*n, "src"));
             if (!src.empty()) {
                 StyledToken it;
                 it.kind = TokenKind::Image;
                 it.imgSrcAbs = resolveHref(baseUrl, src);
-                it.imgAlt = decodeEntities(getAttrValue(t, "alt"));
-                it.imgAttrW = parseIntAttr(getAttrValue(t, "width"));
-                it.imgAttrH = parseIntAttr(getAttrValue(t, "height"));
+                it.imgAlt = domGetAttr(*n, "alt");
+                it.imgAttrW = intAttr(domGetAttr(*n, "width"));
+                it.imgAttrH = intAttr(domGetAttr(*n, "height"));
                 tokens.push_back(std::move(it));
-
-                // Minimal separation
-                pushBreakN(1);
+                emitBreak(1);
             }
             return;
         }
 
-        if (isEnd) {
-            std::string fullName = "/" + name;
-            if (isBlockTagName(fullName)) {
-                pushBreakN(defaultBreakCountForTag(fullName));
-            }
-            popOne();
-            return;
-        }
-
-        TextStyle st = currentStyle();
-
-        std::string id = trimCopy(getAttrValue(t, "id"));
-        std::string classAttr = getAttrValue(t, "class");
-        auto classes = parseClassList(classAttr);
-
-        applyTagDefaults(name, st);
-        applyRulesForElement(rules, name, toLowerCopy(id), classes, st);
-
-        std::string inlineCss = getAttrValue(t, "style");
+        // Compute this element's text style from defaults + CSS rules + inline.
+        TextStyle st = style;
+        std::string id = trimCopy(domGetAttr(*n, "id"));
+        auto classes = parseClassList(domGetAttr(*n, "class"));
+        applyTagDefaults(tag, st);
+        applyRulesForElement(rules, tag, toLowerCopy(id), classes, st);
+        std::string inlineCss = domGetAttr(*n, "style");
         if (!inlineCss.empty()) applyInlineStyle(inlineCss, st);
 
-        styleStack.push_back(st);
+        std::string childHref = (tag == "a") ? trimCopy(domGetAttr(*n, "href")) : href;
+        std::string childEid = id.empty() ? eid : id;
 
-        std::string href = currentHref();
-        if (name == "a") {
-            href = trimCopy(getAttrValue(t, "href"));
-        }
-        hrefStack.push_back(href);
-        idStack.push_back(id.empty() ? currentId() : id);
+        bool block = isBlockTagName(tag);
+        if (block) emitBreak(defaultBreakCountForTag(tag));
 
-        if (isBlockTagName(name)) {
-            pushBreakN(defaultBreakCountForTag(name));
-        }
+        for (int c : n->children) walk(c, st, childHref, childEid);
 
-        if (selfClosing) {
-            popOne();
-        }
-    };
-
-    for (size_t idx = 0; idx < cleaned.size(); ++idx) {
-        char c = cleaned[idx];
-
-        if (!inTag) {
-            if (c == '<') {
-                flushText();
-                inTag = true;
-                tagBuf.clear();
-            } else {
-                textBuf.push_back(c);
-            }
-        } else {
-            if (c == '>') {
-                inTag = false;
-                processTag(tagBuf);
-            } else {
-                tagBuf.push_back(c);
-            }
-        }
+        if (block) emitBreak(defaultBreakCountForTag("/" + tag));
     }
-    flushText();
+};
+} // namespace
 
-    while (!tokens.empty() && tokens.back().kind == TokenKind::Break)
-        tokens.pop_back();
+// Build the StyledToken stream by walking the DOM tree directly (no HTML
+// re-parsing). This is the single HTML interpretation path; the JS bindings
+// and the renderer share the same tree.
+static std::vector<StyledToken> domTreeToStyledTokens(const DomTree& dom,
+                                                      const Url& baseUrl,
+                                                      SDL_Color* outPageBg) {
+    std::string cssAll;
+    int externalCount = 0;
+    domCollectCssVisit(dom, dom.root, baseUrl, cssAll, externalCount);
 
-    return tokens;
+    auto rules = parseCssRules(cssAll);
+    if (outPageBg) *outPageBg = extractPageBackgroundFromRules(rules);
+
+    DomTokenize tk{ dom, rules, baseUrl, {} };
+    TextStyle base;
+    tk.walk(dom.root, base, "", "");
+
+    while (!tk.tokens.empty() && tk.tokens.back().kind == TokenKind::Break)
+        tk.tokens.pop_back();
+
+    return std::move(tk.tokens);
 }
 
 // -------------------- Fonts --------------------
@@ -3790,6 +3695,7 @@ struct Page {
     Url baseUrl;
     std::string urlString;
     std::string body;
+    DomTree dom;   // parsed / post-JS DOM tree; the renderer walks this
 
     SDL_Color background {245, 245, 245, 255};
 
@@ -3822,7 +3728,7 @@ static void rebuildLayout(Page& page,
     destroyBlocks(renderer, page.blocks);
 
     SDL_Color bg = page.background;
-    auto tokens = parseHtmlToStyledTokens(page.body, page.baseUrl, &bg);
+    auto tokens = domTreeToStyledTokens(page.dom, page.baseUrl, &bg);
     page.background = bg;
 
     page.blocks = buildBlocksFromTokens(renderer, fonts, tokens, contentWidth, padding, baseLineHeight, page.linkHits, page.elementHits);
@@ -4023,13 +3929,13 @@ int main(int argc, char** argv) {
             std::string jsTitle = runJavaScriptForHtml(js, t.page.body, t.page.baseUrl, t.page.urlString);
             if (!jsTitle.empty()) pageTitle = jsTitle;
 
-            // The DOM tree was serialized into domHtml by runJavaScriptForHtml.
-            if (!js.host.domHtml.empty()) {
-                t.page.body = js.host.domHtml;
-            }
+            // The renderer walks the DOM tree; take the post-JS tree from the host.
+            t.page.dom = js.host.dom;
             js.host.domDirty = false;
             activeJsTab = idx;
         }
+#else
+        t.page.dom = domParse(t.page.body);
 #endif
 
         t.title = pageTitle;
@@ -4456,9 +4362,8 @@ int main(int argc, char** argv) {
         if (js.host.domDirty) {
             js.host.domDirty = false;
             if (activeJsTab == activeTab && !tabs.empty()) {
-                // Re-serialize the (mutated) DOM tree and re-render the page.
-                js.host.domHtml = domSerialize(js.host.dom);
-                tabs[activeTab].page.body = js.host.domHtml;
+                // The handler mutated the DOM tree; copy it over and re-render.
+                tabs[activeTab].page.dom = js.host.dom;
                 rebuildTabLayout(activeTab);
                 clampScroll();
 
