@@ -2095,13 +2095,362 @@ static void jsPumpTimers(JsEngine& js) {
 #else
 // -------------------- JavaScript (QuickJS) --------------------
 
+// -------------------- Minimal DOM tree --------------------
+// A real (if small) DOM: a pool of nodes addressed by stable integer ids.
+// JS bindings hold node ids and mutate this tree directly; for rendering the
+// tree is serialized back to HTML and fed through the existing layout pipeline.
+
+enum class DomNodeType { Element, Text };
+
+struct DomNode {
+    DomNodeType type = DomNodeType::Element;
+    std::string tag;                                          // lowercased (Element)
+    std::vector<std::pair<std::string, std::string>> attrs;   // ordered (Element)
+    std::string text;                                         // (Text)
+    std::string styleDisplay;                                 // style.display, if set
+    int parent = -1;
+    std::vector<int> children;
+    bool alive = true;
+};
+
+struct DomTree {
+    std::vector<DomNode> nodes;
+    int root = -1; // synthetic root; its children are the top-level nodes
+
+    int alloc(DomNodeType t) {
+        DomNode n;
+        n.type = t;
+        nodes.push_back(std::move(n));
+        return (int)nodes.size() - 1;
+    }
+    DomNode* get(int id) {
+        if (id < 0 || id >= (int)nodes.size()) return nullptr;
+        return &nodes[id];
+    }
+    const DomNode* get(int id) const {
+        if (id < 0 || id >= (int)nodes.size()) return nullptr;
+        return &nodes[id];
+    }
+};
+
+static const std::string* domGetAttrPtr(const DomNode& n, const std::string& key) {
+    for (auto& kv : n.attrs) if (kv.first == key) return &kv.second;
+    return nullptr;
+}
+static std::string domGetAttr(const DomNode& n, const std::string& key) {
+    const std::string* p = domGetAttrPtr(n, key);
+    return p ? *p : std::string();
+}
+static void domSetAttr(DomNode& n, const std::string& key, const std::string& val) {
+    for (auto& kv : n.attrs) if (kv.first == key) { kv.second = val; return; }
+    n.attrs.push_back({ key, val });
+}
+
+static void domAppendChild(DomTree& dom, int parentId, int childId) {
+    DomNode* child = dom.get(childId);
+    if (!child) return;
+    if (child->parent >= 0) {
+        if (DomNode* old = dom.get(child->parent)) {
+            auto& cs = old->children;
+            cs.erase(std::remove(cs.begin(), cs.end(), childId), cs.end());
+        }
+    }
+    DomNode* parent = dom.get(parentId);
+    if (!parent) { child->parent = -1; return; }
+    parent->children.push_back(childId);
+    child->parent = parentId;
+}
+
+static void domRemoveChild(DomTree& dom, int parentId, int childId) {
+    DomNode* parent = dom.get(parentId);
+    DomNode* child = dom.get(childId);
+    if (!parent || !child) return;
+    auto& cs = parent->children;
+    cs.erase(std::remove(cs.begin(), cs.end(), childId), cs.end());
+    child->parent = -1;
+}
+
+static int domFindById(const DomTree& dom, int start, const std::string& id) {
+    const DomNode* n = dom.get(start);
+    if (!n) return -1;
+    if (n->type == DomNodeType::Element) {
+        const std::string* a = domGetAttrPtr(*n, "id");
+        if (a && *a == id) return start;
+    }
+    for (int c : n->children) {
+        int r = domFindById(dom, c, id);
+        if (r >= 0) return r;
+    }
+    return -1;
+}
+
+static int domFindByTag(const DomTree& dom, int start, const std::string& tag) {
+    const DomNode* n = dom.get(start);
+    if (!n) return -1;
+    if (n->type == DomNodeType::Element && n->tag == tag) return start;
+    for (int c : n->children) {
+        int r = domFindByTag(dom, c, tag);
+        if (r >= 0) return r;
+    }
+    return -1;
+}
+
+static int domFindByClass(const DomTree& dom, int start, const std::string& cls) {
+    const DomNode* n = dom.get(start);
+    if (!n) return -1;
+    if (n->type == DomNodeType::Element) {
+        for (auto& c : parseClassList(domGetAttr(*n, "class"))) {
+            if (c == cls) return start;
+        }
+    }
+    for (int c : n->children) {
+        int r = domFindByClass(dom, c, cls);
+        if (r >= 0) return r;
+    }
+    return -1;
+}
+
+static int domFindOrCreateTag(DomTree& dom, const std::string& tag) {
+    int id = domFindByTag(dom, dom.root, tag);
+    if (id >= 0) return id;
+    int el = dom.alloc(DomNodeType::Element);
+    dom.nodes[el].tag = tag;
+    domAppendChild(dom, dom.root, el);
+    return el;
+}
+
+static void domCollectText(const DomTree& dom, int id, std::string& out) {
+    const DomNode* n = dom.get(id);
+    if (!n) return;
+    if (n->type == DomNodeType::Text) { out += n->text; return; }
+    for (int c : n->children) domCollectText(dom, c, out);
+}
+static std::string domTextContent(const DomTree& dom, int id) {
+    std::string out;
+    domCollectText(dom, id, out);
+    return out;
+}
+
+static const std::unordered_set<std::string>& domVoidTags() {
+    static const std::unordered_set<std::string> v = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr"
+    };
+    return v;
+}
+
+// Serialize a node subtree to HTML. Elements with style.display == "none" are
+// skipped so the renderer never lays them out.
+static void domSerializeNode(const DomTree& dom, int id, std::string& out) {
+    const DomNode* n = dom.get(id);
+    if (!n || !n->alive) return;
+
+    if (n->type == DomNodeType::Text) {
+        out += escapeHtmlEntities(n->text);
+        return;
+    }
+
+    if (toLowerCopy(trimCopy(n->styleDisplay)) == "none") return;
+
+    std::string tag = n->tag.empty() ? std::string("div") : n->tag;
+    out += "<" + tag;
+    for (auto& kv : n->attrs) {
+        out += " " + kv.first + "=\"" + escapeHtmlEntities(kv.second) + "\"";
+    }
+    out += ">";
+
+    if (domVoidTags().count(tag)) return;
+
+    for (int c : n->children) domSerializeNode(dom, c, out);
+    out += "</" + tag + ">";
+}
+
+static std::string domSerialize(const DomTree& dom) {
+    std::string out;
+    const DomNode* r = dom.get(dom.root);
+    if (!r) return out;
+    for (int c : r->children) domSerializeNode(dom, c, out);
+    return out;
+}
+
+static std::string domSerializeChildren(const DomTree& dom, int id) {
+    std::string out;
+    const DomNode* n = dom.get(id);
+    if (!n) return out;
+    for (int c : n->children) domSerializeNode(dom, c, out);
+    return out;
+}
+
+static void domCaptureStyleDisplay(DomNode& n, const std::string& styleAttr) {
+    std::string sv = toLowerCopy(styleAttr);
+    size_t dp = sv.find("display");
+    if (dp == std::string::npos) return;
+    size_t colon = sv.find(':', dp);
+    if (colon == std::string::npos) return;
+    size_t e = sv.find(';', colon);
+    n.styleDisplay = trimCopy(sv.substr(colon + 1, (e == std::string::npos ? sv.size() : e) - colon - 1));
+}
+
+static DomTree domParse(const std::string& html) {
+    DomTree dom;
+    dom.root = dom.alloc(DomNodeType::Element);
+    dom.nodes[dom.root].tag = "#root";
+
+    std::vector<int> stack;
+    stack.push_back(dom.root);
+    auto top = [&]() -> int { return stack.empty() ? dom.root : stack.back(); };
+
+    std::string textBuf;
+    auto flushText = [&]() {
+        if (textBuf.empty()) return;
+        std::string decoded = decodeEntities(textBuf);
+        textBuf.clear();
+        if (trimCopy(decoded).empty()) return; // drop whitespace-only nodes
+        int t = dom.alloc(DomNodeType::Text);
+        dom.nodes[t].text = decoded;
+        domAppendChild(dom, top(), t);
+    };
+
+    size_t i = 0;
+    const size_t N = html.size();
+    while (i < N) {
+        char c = html[i];
+        if (c != '<') { textBuf.push_back(c); i++; continue; }
+
+        if (html.compare(i, 4, "<!--") == 0) {
+            flushText();
+            size_t end = html.find("-->", i + 4);
+            i = (end == std::string::npos) ? N : end + 3;
+            continue;
+        }
+
+        size_t gt = html.find('>', i);
+        if (gt == std::string::npos) { textBuf.append(html, i, std::string::npos); break; }
+
+        std::string inner = html.substr(i + 1, gt - (i + 1));
+        i = gt + 1;
+
+        std::string t = trimCopy(inner);
+        if (t.empty()) continue;
+        if (t[0] == '!' || t[0] == '?') { flushText(); continue; }
+
+        flushText();
+
+        bool isEnd = (t[0] == '/');
+        size_t p = isEnd ? 1 : 0;
+        std::string name;
+        while (p < t.size() && (std::isalnum((unsigned char)t[p]) || t[p] == '-')) {
+            name.push_back((char)std::tolower((unsigned char)t[p]));
+            p++;
+        }
+        if (name.empty()) continue;
+
+        if (isEnd) {
+            for (int s = (int)stack.size() - 1; s >= 1; --s) {
+                if (dom.nodes[stack[s]].tag == name) { stack.resize(s); break; }
+            }
+            continue;
+        }
+
+        bool selfClose = (!t.empty() && t.back() == '/');
+
+        int el = dom.alloc(DomNodeType::Element);
+        dom.nodes[el].tag = name;
+
+        std::string attrsPart = t.substr(p);
+        size_t q = 0;
+        while (q < attrsPart.size()) {
+            while (q < attrsPart.size() && (std::isspace((unsigned char)attrsPart[q]) || attrsPart[q] == '/')) q++;
+            if (q >= attrsPart.size()) break;
+            std::string key;
+            while (q < attrsPart.size() && attrsPart[q] != '=' &&
+                   !std::isspace((unsigned char)attrsPart[q]) && attrsPart[q] != '/') {
+                key.push_back((char)std::tolower((unsigned char)attrsPart[q]));
+                q++;
+            }
+            while (q < attrsPart.size() && std::isspace((unsigned char)attrsPart[q])) q++;
+            std::string val;
+            if (q < attrsPart.size() && attrsPart[q] == '=') {
+                q++;
+                while (q < attrsPart.size() && std::isspace((unsigned char)attrsPart[q])) q++;
+                if (q < attrsPart.size() && (attrsPart[q] == '"' || attrsPart[q] == '\'')) {
+                    char quote = attrsPart[q++];
+                    while (q < attrsPart.size() && attrsPart[q] != quote) { val.push_back(attrsPart[q]); q++; }
+                    if (q < attrsPart.size()) q++;
+                } else {
+                    while (q < attrsPart.size() && !std::isspace((unsigned char)attrsPart[q]) && attrsPart[q] != '/') {
+                        val.push_back(attrsPart[q]); q++;
+                    }
+                }
+            }
+            if (!key.empty()) {
+                std::string dval = decodeEntities(val);
+                domSetAttr(dom.nodes[el], key, dval);
+                if (key == "style") domCaptureStyleDisplay(dom.nodes[el], dval);
+            }
+        }
+
+        domAppendChild(dom, top(), el);
+
+        if (!domVoidTags().count(name) && !selfClose) stack.push_back(el);
+    }
+    flushText();
+
+    return dom;
+}
+
+// Deep-copy a node (and its subtree) from src into dom; returns the new id.
+static int domImportNode(DomTree& dom, const DomTree& src, int srcId) {
+    const DomNode* sn = src.get(srcId);
+    if (!sn) return -1;
+    int nid = dom.alloc(sn->type);
+    dom.nodes[nid].type = sn->type;
+    dom.nodes[nid].tag = sn->tag;
+    dom.nodes[nid].attrs = sn->attrs;
+    dom.nodes[nid].text = sn->text;
+    dom.nodes[nid].styleDisplay = sn->styleDisplay;
+    // Copy children list first (recursion may reallocate the vector).
+    std::vector<int> kids = sn->children;
+    for (int c : kids) {
+        int cid = domImportNode(dom, src, c);
+        if (cid >= 0) domAppendChild(dom, nid, cid);
+    }
+    return nid;
+}
+
+static void domClearChildren(DomTree& dom, int nodeId) {
+    DomNode* n = dom.get(nodeId);
+    if (!n) return;
+    for (int c : n->children) { if (DomNode* cc = dom.get(c)) cc->parent = -1; }
+    dom.get(nodeId)->children.clear();
+}
+
+static void domSetTextContent(DomTree& dom, int nodeId, const std::string& text) {
+    if (!dom.get(nodeId)) return;
+    domClearChildren(dom, nodeId);
+    int t = dom.alloc(DomNodeType::Text);
+    dom.nodes[t].text = text;
+    domAppendChild(dom, nodeId, t);
+}
+
+static void domSetInnerHtml(DomTree& dom, int nodeId, const std::string& html) {
+    if (!dom.get(nodeId)) return;
+    domClearChildren(dom, nodeId);
+    DomTree frag = domParse(html);
+    const DomNode* fr = frag.get(frag.root);
+    if (!fr) return;
+    std::vector<int> topKids = fr->children;
+    for (int fc : topKids) {
+        int nid = domImportNode(dom, frag, fc);
+        if (nid >= 0) domAppendChild(dom, nodeId, nid);
+    }
+}
+
 struct JsHost {
     SDL_Window* window = nullptr;
     std::string currentUrl;
 
-    // Minimal DOM state used by the JS bindings.
-    std::unordered_set<std::string> domIds;
-    std::unordered_map<std::string, std::string> styleDisplayById; // id -> display value (e.g. "none")
+    // Set whenever JS mutates the DOM tree; triggers a re-render of the page.
     bool domDirty = false;
 
     // setTimeout/clearTimeout queue (no threads; pumped from the UI loop).
@@ -2118,8 +2467,10 @@ struct JsHost {
     // Event listeners keyed by scope+type, e.g. "window:click", "document:keydown", "el:myid:click".
     std::unordered_map<std::string, std::vector<JSValue>> listeners; // duplicated
 
-    // Best-effort "DOM": we mutate this HTML string and re-render when domDirty flips.
+    // Real DOM tree (source of truth). domHtml is a serialized snapshot used by
+    // the renderer; it is refreshed from the tree after scripts / mutations run.
     Url baseUrl;
+    DomTree dom;
     std::string domHtml;
 
     std::chrono::steady_clock::time_point perfStart = std::chrono::steady_clock::now();
@@ -2136,14 +2487,11 @@ static JSClassID g_qjsElementClassId = 0;
 static JSClassID g_qjsStyleClassId = 0;
 
 struct QjsElementPriv {
-    std::string id;
-    std::string tagName;
-    std::unordered_map<std::string, std::string> attrs;
-    std::string text;
+    int nodeId = -1; // index into JsHost::dom
 };
 
 struct QjsStylePriv {
-    std::string id;
+    int nodeId = -1; // element this style belongs to
 };
 
 static JsHost* qjsHost(JSContext* ctx) {
@@ -2183,143 +2531,6 @@ static std::string stripNoscriptBlocks(const std::string& html) {
         pos = end + std::string("</noscript>").size();
     }
 
-    return out;
-}
-
-// Replace the inner content of the first element carrying id="id". When escape
-// is true the content is treated as text (entities escaped); otherwise it is
-// inserted as raw HTML (used by innerHTML).
-static bool replaceElementInnerById(std::string& html, const std::string& id,
-                                    const std::string& inner, bool escape) {
-    if (id.empty()) return false;
-    std::string lower = toLowerCopy(html);
-
-    std::string needle1 = toLowerCopy("id=\"" + id + "\"");
-    std::string needle2 = toLowerCopy("id='" + id + "'");
-    size_t p = lower.find(needle1);
-    if (p == std::string::npos) p = lower.find(needle2);
-    if (p == std::string::npos) return false;
-
-    size_t tagStart = lower.rfind('<', p);
-    if (tagStart == std::string::npos) return false;
-
-    size_t nameStart = tagStart + 1;
-    while (nameStart < lower.size() && std::isspace((unsigned char)lower[nameStart])) nameStart++;
-    size_t nameEnd = nameStart;
-    while (nameEnd < lower.size() && std::isalnum((unsigned char)lower[nameEnd])) nameEnd++;
-    if (nameEnd <= nameStart) return false;
-    std::string tag = lower.substr(nameStart, nameEnd - nameStart);
-
-    size_t openEnd = lower.find('>', p);
-    if (openEnd == std::string::npos) return false;
-    if (openEnd > 0 && lower[openEnd - 1] == '/') return false; // self-closing
-
-    std::string closeNeedle = "</" + tag;
-    size_t closeStart = lower.find(closeNeedle, openEnd);
-    if (closeStart == std::string::npos) return false;
-
-    std::string content = escape ? escapeHtmlEntities(inner) : inner;
-    html = html.substr(0, openEnd + 1) + content + html.substr(closeStart);
-    return true;
-}
-
-static bool replaceElementTextById(std::string& html, const std::string& id, const std::string& newText) {
-    return replaceElementInnerById(html, id, newText, true);
-}
-
-static void insertBeforeClosingTag(std::string& html, const std::string& tag, const std::string& snippet) {
-    std::string lower = toLowerCopy(html);
-    std::string closeNeedle = "</" + toLowerCopy(tag) + ">";
-    size_t pos = lower.rfind(closeNeedle);
-    if (pos != std::string::npos) {
-        html.insert(pos, snippet);
-        return;
-    }
-    html += snippet;
-}
-
-static std::string stripFirstElementById(const std::string& html, const std::string& id) {
-    std::string needle1 = "id=\"" + id + "\"";
-    std::string needle2 = "id='" + id + "'";
-    size_t pos = html.find(needle1);
-    if (pos == std::string::npos) pos = html.find(needle2);
-    if (pos == std::string::npos) return html;
-
-    size_t tagStart = html.rfind('<', pos);
-    if (tagStart == std::string::npos) return html;
-
-    size_t tagEnd = html.find('>', pos);
-    if (tagEnd == std::string::npos) return html;
-
-    size_t nameStart = tagStart + 1;
-    while (nameStart < html.size() && std::isspace((unsigned char)html[nameStart])) nameStart++;
-    if (nameStart < html.size() && html[nameStart] == '/') return html;
-
-    size_t nameEnd = nameStart;
-    while (nameEnd < html.size() && std::isalpha((unsigned char)html[nameEnd])) nameEnd++;
-    std::string tag = toLowerCopy(html.substr(nameStart, nameEnd - nameStart));
-    if (tag.empty()) return html;
-
-    bool selfClose = false;
-    {
-        size_t check = tagEnd;
-        while (check > tagStart && std::isspace((unsigned char)html[check - 1])) check--;
-        if (check > tagStart && html[check - 1] == '/') selfClose = true;
-    }
-
-    if (selfClose || tag == "img" || tag == "br" || tag == "meta" || tag == "link" || tag == "input") {
-        return html.substr(0, tagStart) + html.substr(tagEnd + 1);
-    }
-
-    std::string closeTag = "</" + tag + ">";
-    size_t closePos = html.find(closeTag, tagEnd + 1);
-    if (closePos == std::string::npos) {
-        return html.substr(0, tagStart) + html.substr(tagEnd + 1);
-    }
-
-    size_t closeEnd = closePos + closeTag.size();
-    return html.substr(0, tagStart) + html.substr(closeEnd);
-}
-
-static void indexDomIdsFromHtml(JsHost& host, const std::string& html) {
-    host.domIds.clear();
-    static const std::regex reId(R"(id\s*=\s*(['"])([^'"]+)\1)", std::regex_constants::icase);
-    auto begin = std::sregex_iterator(html.begin(), html.end(), reId);
-    auto end = std::sregex_iterator();
-    for (auto it = begin; it != end; ++it) {
-        host.domIds.insert((*it)[2].str());
-    }
-}
-
-static bool isDisplayNone(const JsHost& host, const std::string& id) {
-    auto it = host.styleDisplayById.find(id);
-    if (it == host.styleDisplayById.end()) return false;
-    std::string v = toLowerCopy(trimCopy(it->second));
-    return (v == "none");
-}
-
-static std::string applyDisplayNonePatches(const std::string& html, const JsHost& host) {
-    std::string out = html;
-    for (const auto& kv : host.styleDisplayById) {
-        if (isDisplayNone(host, kv.first)) {
-            out = stripFirstElementById(out, kv.first);
-        }
-    }
-    return out;
-}
-
-static std::string qjsElementOuterHtml(const QjsElementPriv& el) {
-    std::string tag = el.tagName.empty() ? "div" : el.tagName;
-    std::string out = "<" + tag;
-    if (!el.id.empty() && el.id.rfind("__", 0) != 0) {
-        out += " id=\"" + el.id + "\"";
-    }
-    for (const auto& kv : el.attrs) {
-        out += " " + kv.first + "=\"" + escapeHtmlEntities(kv.second) + "\"";
-    }
-    out += ">";
-    out += escapeHtmlEntities(el.text);
-    out += "</" + tag + ">";
     return out;
 }
 
@@ -2490,115 +2701,138 @@ static void qjsStyleFinalizer(JSRuntime* /*rt*/, JSValue val) {
     delete p;
 }
 
-static JSValue qjsMakeElement(JSContext* ctx, const std::string& id, const std::string& tag) {
+static DomNode* qjsElNode(JSContext* ctx, JSValueConst this_val) {
+    JsHost* host = qjsHost(ctx);
+    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
+    if (!host || !p) return nullptr;
+    return host->dom.get(p->nodeId);
+}
+
+static int qjsElNodeId(JSValueConst this_val) {
+    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
+    return p ? p->nodeId : -1;
+}
+
+static JSValue qjsMakeElement(JSContext* ctx, int nodeId) {
     JSValue obj = JS_NewObjectClass(ctx, g_qjsElementClassId);
     if (JS_IsException(obj)) return obj;
     auto* p = new QjsElementPriv();
-    p->id = id;
-    p->tagName = tag;
+    p->nodeId = nodeId;
     JS_SetOpaque(obj, p);
     return obj;
 }
 
 static JSValue qjsElGetId(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
-    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
-    return p ? JS_NewString(ctx, p->id.c_str()) : JS_UNDEFINED;
+    DomNode* n = qjsElNode(ctx, this_val);
+    return n ? JS_NewString(ctx, domGetAttr(*n, "id").c_str()) : JS_UNDEFINED;
 }
 
 static JSValue qjsElSetId(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
-    if (p && argc > 0) {
-        std::string newId = jsToUtf8(ctx, argv[0]);
-        if (!newId.empty()) {
-            p->id = newId;
-            if (JsHost* host = qjsHost(ctx)) host->domIds.insert(newId);
-        }
+    JsHost* host = qjsHost(ctx);
+    DomNode* n = qjsElNode(ctx, this_val);
+    if (n && argc > 0) {
+        domSetAttr(*n, "id", jsToUtf8(ctx, argv[0]));
+        if (host) host->domDirty = true;
     }
     return JS_UNDEFINED;
 }
 
 static JSValue qjsElGetTagName(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
-    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
-    std::string tn = (p && !p->tagName.empty()) ? toUpperCopy(p->tagName) : "DIV";
+    DomNode* n = qjsElNode(ctx, this_val);
+    std::string tn = (n && !n->tag.empty()) ? toUpperCopy(n->tag) : "DIV";
     return JS_NewString(ctx, tn.c_str());
 }
 
 static JSValue qjsElGetText(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
-    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
-    return p ? JS_NewString(ctx, p->text.c_str()) : JS_UNDEFINED;
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0) return JS_UNDEFINED;
+    return JS_NewString(ctx, domTextContent(host->dom, nid).c_str());
 }
 
 static JSValue qjsElSetText(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
-    if (!p) return JS_UNDEFINED;
-    std::string t = (argc > 0) ? jsToUtf8(ctx, argv[0]) : "";
-    p->text = t;
-    if (JsHost* host = qjsHost(ctx)) {
-        if (!host->domHtml.empty()) replaceElementTextById(host->domHtml, p->id, t);
-        host->domDirty = true;
-    }
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0) return JS_UNDEFINED;
+    domSetTextContent(host->dom, nid, (argc > 0) ? jsToUtf8(ctx, argv[0]) : "");
+    host->domDirty = true;
     return JS_UNDEFINED;
+}
+
+static JSValue qjsElGetInnerHtml(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0) return JS_UNDEFINED;
+    return JS_NewString(ctx, domSerializeChildren(host->dom, nid).c_str());
 }
 
 static JSValue qjsElSetInnerHtml(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
-    if (!p) return JS_UNDEFINED;
-    std::string raw = (argc > 0) ? jsToUtf8(ctx, argv[0]) : "";
-    p->text = raw;
-    if (JsHost* host = qjsHost(ctx)) {
-        if (!host->domHtml.empty()) replaceElementInnerById(host->domHtml, p->id, raw, false);
-        host->domDirty = true;
-    }
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0) return JS_UNDEFINED;
+    domSetInnerHtml(host->dom, nid, (argc > 0) ? jsToUtf8(ctx, argv[0]) : "");
+    host->domDirty = true;
     return JS_UNDEFINED;
 }
 
+static JSValue qjsElGetParent(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host) return JS_NULL;
+    DomNode* n = host->dom.get(nid);
+    if (!n || n->parent < 0 || n->parent == host->dom.root) return JS_NULL;
+    return qjsMakeElement(ctx, n->parent);
+}
+
 static JSValue qjsElGetStyle(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
-    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
-    if (!p) return JS_UNDEFINED;
+    int nid = qjsElNodeId(this_val);
+    if (nid < 0) return JS_UNDEFINED;
     JSValue s = JS_NewObjectClass(ctx, g_qjsStyleClassId);
     if (JS_IsException(s)) return s;
     auto* sp = new QjsStylePriv();
-    sp->id = p->id;
+    sp->nodeId = nid;
     JS_SetOpaque(s, sp);
     return s;
 }
 
 static JSValue qjsElAttrGet(JSContext* ctx, JSValueConst this_val, int, JSValueConst*, int, JSValue* data) {
-    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
-    if (!p) return JS_UNDEFINED;
-    std::string name = jsToUtf8(ctx, data[0]);
-    auto it = p->attrs.find(name);
-    return JS_NewString(ctx, it == p->attrs.end() ? "" : it->second.c_str());
+    DomNode* n = qjsElNode(ctx, this_val);
+    if (!n) return JS_UNDEFINED;
+    return JS_NewString(ctx, domGetAttr(*n, jsToUtf8(ctx, data[0])).c_str());
 }
 
 static JSValue qjsElAttrSet(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv, int, JSValue* data) {
-    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
-    if (!p) return JS_UNDEFINED;
-    std::string name = jsToUtf8(ctx, data[0]);
-    p->attrs[name] = (argc > 0) ? jsToUtf8(ctx, argv[0]) : "";
+    JsHost* host = qjsHost(ctx);
+    DomNode* n = qjsElNode(ctx, this_val);
+    if (!n) return JS_UNDEFINED;
+    domSetAttr(*n, jsToUtf8(ctx, data[0]), (argc > 0) ? jsToUtf8(ctx, argv[0]) : "");
+    if (host) host->domDirty = true;
     return JS_UNDEFINED;
 }
 
 // Forward declarations for element methods used while building the prototype.
 static JSValue qjsElAddEventListener(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
 static JSValue qjsElAppendChild(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
+static JSValue qjsElRemoveChild(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
 static JSValue qjsElSetAttribute(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
 static JSValue qjsElGetAttribute(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
 
 static JSValue qjsStyleGetDisplay(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
-    auto* p = (QjsStylePriv*)JS_GetOpaque(this_val, g_qjsStyleClassId);
     JsHost* host = qjsHost(ctx);
-    if (!p || !host) return JS_UNDEFINED;
-    auto it = host->styleDisplayById.find(p->id);
-    return JS_NewString(ctx, it == host->styleDisplayById.end() ? "" : it->second.c_str());
+    auto* p = (QjsStylePriv*)JS_GetOpaque(this_val, g_qjsStyleClassId);
+    if (!host || !p) return JS_UNDEFINED;
+    DomNode* n = host->dom.get(p->nodeId);
+    return JS_NewString(ctx, n ? n->styleDisplay.c_str() : "");
 }
 
 static JSValue qjsStyleSetDisplay(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    auto* p = (QjsStylePriv*)JS_GetOpaque(this_val, g_qjsStyleClassId);
     JsHost* host = qjsHost(ctx);
-    if (!p || !host) return JS_UNDEFINED;
-    host->styleDisplayById[p->id] = (argc > 0) ? jsToUtf8(ctx, argv[0]) : "";
-    host->domDirty = true;
+    auto* p = (QjsStylePriv*)JS_GetOpaque(this_val, g_qjsStyleClassId);
+    if (!host || !p) return JS_UNDEFINED;
+    if (DomNode* n = host->dom.get(p->nodeId)) {
+        n->styleDisplay = (argc > 0) ? jsToUtf8(ctx, argv[0]) : "";
+        host->domDirty = true;
+    }
     return JS_UNDEFINED;
 }
 
@@ -2647,12 +2881,14 @@ static void qjsSetupDomProtos(JSContext* ctx) {
     JS_SetPropertyStr(ctx, elProto, "appendChild", JS_NewCFunction(ctx, qjsElAppendChild, "appendChild", 1));
     JS_SetPropertyStr(ctx, elProto, "setAttribute", JS_NewCFunction(ctx, qjsElSetAttribute, "setAttribute", 2));
     JS_SetPropertyStr(ctx, elProto, "getAttribute", JS_NewCFunction(ctx, qjsElGetAttribute, "getAttribute", 1));
+    JS_SetPropertyStr(ctx, elProto, "removeChild", JS_NewCFunction(ctx, qjsElRemoveChild, "removeChild", 1));
     qjsDefineAccessor(ctx, elProto, "id", qjsElGetId, qjsElSetId);
     qjsDefineAccessor(ctx, elProto, "tagName", qjsElGetTagName, nullptr);
     qjsDefineAccessor(ctx, elProto, "style", qjsElGetStyle, nullptr);
+    qjsDefineAccessor(ctx, elProto, "parentNode", qjsElGetParent, nullptr);
     qjsDefineAccessor(ctx, elProto, "textContent", qjsElGetText, qjsElSetText);
     qjsDefineAccessor(ctx, elProto, "innerText", qjsElGetText, qjsElSetText);
-    qjsDefineAccessor(ctx, elProto, "innerHTML", qjsElGetText, qjsElSetInnerHtml);
+    qjsDefineAccessor(ctx, elProto, "innerHTML", qjsElGetInnerHtml, qjsElSetInnerHtml);
     qjsDefineAttrAccessor(ctx, elProto, "src");
     qjsDefineAttrAccessor(ctx, elProto, "href");
     qjsDefineAttrAccessor(ctx, elProto, "type");
@@ -2672,36 +2908,36 @@ static void qjsAddListener(JSContext* ctx, const std::string& key, JSValueConst 
 }
 
 static JSValue qjsElAddEventListener(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
-    if (!p || argc < 2 || !JS_IsFunction(ctx, argv[1])) return JS_UNDEFINED;
+    DomNode* n = qjsElNode(ctx, this_val);
+    if (!n || argc < 2 || !JS_IsFunction(ctx, argv[1])) return JS_UNDEFINED;
     std::string type = jsToUtf8(ctx, argv[0]);
-    qjsAddListener(ctx, "el:" + p->id + ":" + type, argv[1]);
+    qjsAddListener(ctx, "el:" + domGetAttr(*n, "id") + ":" + type, argv[1]);
     return JS_UNDEFINED;
 }
 
 static JSValue qjsElAppendChild(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     JsHost* host = qjsHost(ctx);
-    auto* parent = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
-    if (!host || !parent || argc < 1) return JS_UNDEFINED;
+    if (!host || argc < 1) return JS_UNDEFINED;
 
-    auto* child = (QjsElementPriv*)JS_GetOpaque(argv[0], g_qjsElementClassId);
-    if (!child) return JS_DupValue(ctx, argv[0]);
+    int parentId = qjsElNodeId(this_val);
+    auto* childP = (QjsElementPriv*)JS_GetOpaque(argv[0], g_qjsElementClassId);
+    if (parentId < 0 || !childP) return JS_DupValue(ctx, argv[0]);
+    int childId = childP->nodeId;
 
-    std::string parentTag = toLowerCopy(parent->tagName);
-    if (parentTag == "head" || parentTag == "body") {
-        std::string snippet = qjsElementOuterHtml(*child);
-        if (!host->domHtml.empty()) insertBeforeClosingTag(host->domHtml, parent->tagName, snippet);
-        host->domDirty = true;
+    domAppendChild(host->dom, parentId, childId);
+    host->domDirty = true;
 
-        if (toLowerCopy(child->tagName) == "script") {
+    // Appending a <script> element executes it (matches browser behavior).
+    if (DomNode* child = host->dom.get(childId)) {
+        if (child->tag == "script") {
+            std::string src = domGetAttr(*child, "src");
             std::string code;
-            auto it = child->attrs.find("src");
-            if (it != child->attrs.end() && !it->second.empty()) {
-                std::string abs = resolveHref(host->baseUrl, it->second);
-                if (abs.empty()) abs = it->second;
+            if (!src.empty()) {
+                std::string abs = resolveHref(host->baseUrl, src);
+                if (abs.empty()) abs = src;
                 code = fetchSubresourceText(abs);
             } else {
-                code = child->text;
+                code = domTextContent(host->dom, childId);
             }
             if (!trimCopy(code).empty()) {
                 JSValue r = JS_Eval(ctx, code.c_str(), code.size(), "<appended>", JS_EVAL_TYPE_GLOBAL);
@@ -2714,45 +2950,37 @@ static JSValue qjsElAppendChild(JSContext* ctx, JSValueConst this_val, int argc,
     return JS_DupValue(ctx, argv[0]);
 }
 
+static JSValue qjsElRemoveChild(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (!host || argc < 1) return JS_UNDEFINED;
+    int parentId = qjsElNodeId(this_val);
+    auto* childP = (QjsElementPriv*)JS_GetOpaque(argv[0], g_qjsElementClassId);
+    if (parentId < 0 || !childP) return JS_DupValue(ctx, argv[0]);
+    domRemoveChild(host->dom, parentId, childP->nodeId);
+    host->domDirty = true;
+    return JS_DupValue(ctx, argv[0]);
+}
+
 static JSValue qjsElSetAttribute(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
-    if (!p || argc < 2) return JS_UNDEFINED;
+    JsHost* host = qjsHost(ctx);
+    DomNode* n = qjsElNode(ctx, this_val);
+    if (!n || argc < 2) return JS_UNDEFINED;
     std::string k = toLowerCopy(jsToUtf8(ctx, argv[0]));
     std::string v = jsToUtf8(ctx, argv[1]);
     if (!k.empty()) {
-        p->attrs[k] = v;
-        if (k == "id" && !v.empty()) {
-            p->id = v;
-            if (JsHost* host = qjsHost(ctx)) host->domIds.insert(v);
-        }
+        domSetAttr(*n, k, v);
+        if (k == "style") domCaptureStyleDisplay(*n, v);
+        if (host) host->domDirty = true;
     }
     return JS_UNDEFINED;
 }
 
 static JSValue qjsElGetAttribute(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
-    if (!p || argc < 1) return JS_NULL;
+    DomNode* n = qjsElNode(ctx, this_val);
+    if (!n || argc < 1) return JS_NULL;
     std::string k = toLowerCopy(jsToUtf8(ctx, argv[0]));
-    if (k == "id") return JS_NewString(ctx, p->id.c_str());
-    auto it = p->attrs.find(k);
-    return it == p->attrs.end() ? JS_NULL : JS_NewString(ctx, it->second.c_str());
-}
-
-// Best-effort lookup of an element's tag name from the backing HTML by id.
-static std::string qjsTagNameForId(const std::string& html, const std::string& id) {
-    if (html.empty() || id.empty()) return "div";
-    std::string lower = toLowerCopy(html);
-    size_t p = lower.find(toLowerCopy("id=\"" + id + "\""));
-    if (p == std::string::npos) p = lower.find(toLowerCopy("id='" + id + "'"));
-    if (p == std::string::npos) return "div";
-    size_t tagStart = lower.rfind('<', p);
-    if (tagStart == std::string::npos) return "div";
-    size_t nameStart = tagStart + 1;
-    while (nameStart < lower.size() && std::isspace((unsigned char)lower[nameStart])) nameStart++;
-    size_t nameEnd = nameStart;
-    while (nameEnd < lower.size() && std::isalnum((unsigned char)lower[nameEnd])) nameEnd++;
-    if (nameEnd <= nameStart) return "div";
-    return lower.substr(nameStart, nameEnd - nameStart);
+    const std::string* p = domGetAttrPtr(*n, k);
+    return p ? JS_NewString(ctx, p->c_str()) : JS_NULL;
 }
 
 static JSValue jsGetElementById(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
@@ -2760,10 +2988,16 @@ static JSValue jsGetElementById(JSContext* ctx, JSValueConst /*this_val*/, int a
     if (!host || argc < 1) return JS_NULL;
     std::string id = jsToUtf8(ctx, argv[0]);
     if (id.empty()) return JS_NULL;
-    // Return a virtual element even when the id is unknown, so that scripts doing
-    // getElementById(...).something don't crash on a hard null.
-    host->domIds.insert(id);
-    return qjsMakeElement(ctx, id, qjsTagNameForId(host->domHtml, id));
+
+    int nid = domFindById(host->dom, host->dom.root, id);
+    if (nid < 0) {
+        // Unknown id: hand back a detached element so getElementById(...).x
+        // does not throw. It is not part of the rendered tree.
+        nid = host->dom.alloc(DomNodeType::Element);
+        host->dom.nodes[nid].tag = "div";
+        domSetAttr(host->dom.nodes[nid], "id", id);
+    }
+    return qjsMakeElement(ctx, nid);
 }
 
 static JSValue jsCreateElement(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
@@ -2771,21 +3005,24 @@ static JSValue jsCreateElement(JSContext* ctx, JSValueConst /*this_val*/, int ar
     if (!host || argc < 1) return JS_NULL;
     std::string tag = toLowerCopy(jsToUtf8(ctx, argv[0]));
     if (tag.empty()) tag = "div";
-    std::string vid = "__el" + std::to_string(host->nextTimerId++);
-    return qjsMakeElement(ctx, vid, tag);
+    int nid = host->dom.alloc(DomNodeType::Element);
+    host->dom.nodes[nid].tag = tag;
+    return qjsMakeElement(ctx, nid);
 }
 
 static JSValue jsQuerySelector(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
     JsHost* host = qjsHost(ctx);
     if (!host || argc < 1) return JS_NULL;
     std::string sel = trimCopy(jsToUtf8(ctx, argv[0]));
-    // Minimal support: "#id" selectors map to getElementById.
-    if (sel.size() > 1 && sel[0] == '#' && sel.find(' ') == std::string::npos) {
-        std::string id = sel.substr(1);
-        host->domIds.insert(id);
-        return qjsMakeElement(ctx, id, qjsTagNameForId(host->domHtml, id));
-    }
-    return JS_NULL;
+    if (sel.empty() || sel.find(' ') != std::string::npos) return JS_NULL; // no combinators
+
+    int nid = -1;
+    if (sel[0] == '#') nid = domFindById(host->dom, host->dom.root, sel.substr(1));
+    else if (sel[0] == '.') nid = domFindByClass(host->dom, host->dom.root, sel.substr(1));
+    else nid = domFindByTag(host->dom, host->dom.root, toLowerCopy(sel));
+
+    if (nid < 0) return JS_NULL;
+    return qjsMakeElement(ctx, nid);
 }
 
 static JSValue jsDocAddEventListener(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
@@ -2999,9 +3236,12 @@ static void jsSetupPageGlobals(JSContext* ctx, const std::string& url, const std
     JS_SetPropertyStr(ctx, document, "createElement", JS_NewCFunction(ctx, jsCreateElement, "createElement", 1));
     JS_SetPropertyStr(ctx, document, "querySelector", JS_NewCFunction(ctx, jsQuerySelector, "querySelector", 1));
 
-    // document.body / document.head as virtual elements so appendChild() works.
-    JS_SetPropertyStr(ctx, document, "body", qjsMakeElement(ctx, "__body", "body"));
-    JS_SetPropertyStr(ctx, document, "head", qjsMakeElement(ctx, "__head", "head"));
+    // document.body / document.head map to the real <body>/<head> nodes
+    // (created if the page omitted them) so appendChild() actually renders.
+    if (JsHost* host = qjsHost(ctx)) {
+        JS_SetPropertyStr(ctx, document, "body", qjsMakeElement(ctx, domFindOrCreateTag(host->dom, "body")));
+        JS_SetPropertyStr(ctx, document, "head", qjsMakeElement(ctx, domFindOrCreateTag(host->dom, "head")));
+    }
 
     JS_SetPropertyStr(ctx, global, "document", document);
 
@@ -3047,13 +3287,14 @@ static std::string runJavaScriptForHtml(JsEngine& js,
                                        const std::string& urlString) {
     js.host.currentUrl = urlString;
     js.host.baseUrl = baseUrl;
-    js.host.styleDisplayById.clear();
     js.host.domDirty = false;
 
     jsResetContext(js);
 
-    js.host.domHtml = stripNoscriptBlocks(html);
-    indexDomIdsFromHtml(js.host, js.host.domHtml);
+    // Build the real DOM tree (the source of truth for this page); the renderer
+    // consumes a serialized snapshot of it.
+    js.host.dom = domParse(stripNoscriptBlocks(html));
+    js.host.domHtml = domSerialize(js.host.dom);
 
     std::string initialTitle = extractTitleFromHtmlSimple(html);
     jsSetupPageGlobals(js.ctx, urlString, initialTitle);
@@ -3089,6 +3330,8 @@ static std::string runJavaScriptForHtml(JsEngine& js,
         jsDrainJobs(js);
     }
 
+    // Reflect any DOM mutations the scripts made back into the render snapshot.
+    js.host.domHtml = domSerialize(js.host.dom);
     return jsReadDocumentTitle(js.ctx);
 }
 #endif
@@ -3991,7 +4234,7 @@ int main(int argc, char** argv) {
 #if defined(__APPLE__)
                 t.page.body = js.host.domHtml;
 #else
-                t.page.body = applyDisplayNonePatches(js.host.domHtml, js.host);
+                t.page.body = js.host.domHtml;
 #endif
             }
             js.host.domDirty = false;
@@ -4426,7 +4669,8 @@ int main(int argc, char** argv) {
 #if defined(__APPLE__)
                 tabs[activeTab].page.body = js.host.domHtml;
 #else
-                tabs[activeTab].page.body = applyDisplayNonePatches(js.host.domHtml, js.host);
+                js.host.domHtml = domSerialize(js.host.dom);
+                tabs[activeTab].page.body = js.host.domHtml;
 #endif
                 rebuildTabLayout(activeTab);
                 clampScroll();
