@@ -836,6 +836,17 @@ struct StyleRule {
     std::optional<bool> bold;
 
     std::optional<SDL_Color> backgroundColor;
+
+    // Box-model properties (block-level).
+    std::optional<int> marginTop, marginRight, marginBottom, marginLeft;
+    std::optional<bool> marginAuto;          // margin-left/right: auto -> centering
+    std::optional<int> padTop, padRight, padBottom, padLeft;
+    std::optional<int> borderW;
+    std::optional<SDL_Color> borderColor;
+    std::optional<int> width;                // content width, px
+    std::optional<int> widthPct;             // width as a percentage
+    std::optional<int> textAlign;            // 0 left, 1 center, 2 right
+    std::optional<bool> displayNone;
 };
 
 static std::optional<SDL_Color> parseColor(const std::string& raw) {
@@ -903,6 +914,38 @@ static std::optional<int> parseFontSizePx(const std::string& raw) {
     }
 }
 
+// Parse a CSS length to integer pixels. nullopt for auto / percent / unknown.
+static std::optional<int> cssLenPx(const std::string& raw) {
+    std::string v = trimCopy(toLowerCopy(raw));
+    if (v.empty() || v == "auto") return std::nullopt;
+    if (!v.empty() && v.back() == '%') return std::nullopt;
+    if (endsWith(v, "px")) v = trimCopy(v.substr(0, v.size() - 2));
+    try {
+        size_t used = 0;
+        double d = std::stod(v, &used);
+        return std::max(0, (int)std::lround(d));
+    } catch (...) { return std::nullopt; }
+}
+
+// Expand a 1-4 value box shorthand into top/right/bottom/left.
+static void cssExpandBox(const std::string& val,
+                         std::optional<int>& top, std::optional<int>& right,
+                         std::optional<int>& bottom, std::optional<int>& left,
+                         bool* anyAuto) {
+    std::istringstream iss(toLowerCopy(trimCopy(val)));
+    std::vector<std::string> toks; std::string t;
+    while (iss >> t) toks.push_back(t);
+    if (toks.empty()) return;
+    auto px = [&](const std::string& s) -> std::optional<int> {
+        if (s == "auto") { if (anyAuto) *anyAuto = true; return std::nullopt; }
+        return cssLenPx(s);
+    };
+    if (toks.size() == 1)      { auto a = px(toks[0]); top = right = bottom = left = a; }
+    else if (toks.size() == 2) { auto v = px(toks[0]); auto h = px(toks[1]); top = bottom = v; right = left = h; }
+    else if (toks.size() == 3) { top = px(toks[0]); right = left = px(toks[1]); bottom = px(toks[2]); }
+    else                       { top = px(toks[0]); right = px(toks[1]); bottom = px(toks[2]); left = px(toks[3]); }
+}
+
 static void applyDeclarationsToRule(StyleRule& rule, const std::string& declsRaw) {
     auto parts = splitBy(declsRaw, ';');
     for (auto& p : parts) {
@@ -925,6 +968,46 @@ static void applyDeclarationsToRule(StyleRule& rule, const std::string& declsRaw
         } else if (key == "background-color" || key == "background") {
             auto c = parseColor(val);
             if (c) rule.backgroundColor = *c;
+        } else if (key == "margin") {
+            bool a = false;
+            cssExpandBox(val, rule.marginTop, rule.marginRight, rule.marginBottom, rule.marginLeft, &a);
+            if (a) rule.marginAuto = true;
+        } else if (key == "margin-top")    rule.marginTop = cssLenPx(val);
+        else if (key == "margin-right")    rule.marginRight = cssLenPx(val);
+        else if (key == "margin-bottom")   rule.marginBottom = cssLenPx(val);
+        else if (key == "margin-left")     rule.marginLeft = cssLenPx(val);
+        else if (key == "padding") {
+            cssExpandBox(val, rule.padTop, rule.padRight, rule.padBottom, rule.padLeft, nullptr);
+        }
+        else if (key == "padding-top")     rule.padTop = cssLenPx(val);
+        else if (key == "padding-right")   rule.padRight = cssLenPx(val);
+        else if (key == "padding-bottom")  rule.padBottom = cssLenPx(val);
+        else if (key == "padding-left")    rule.padLeft = cssLenPx(val);
+        else if (key == "border" || key == "border-width") {
+            std::istringstream iss(toLowerCopy(val)); std::string tk;
+            while (iss >> tk) {
+                auto w = cssLenPx(tk);
+                if (w) rule.borderW = *w;
+                else { auto c = parseColor(tk); if (c) rule.borderColor = *c; }
+            }
+            if (key == "border" && !rule.borderW) rule.borderW = 1;
+        }
+        else if (key == "border-color") { auto c = parseColor(val); if (c) rule.borderColor = *c; }
+        else if (key == "width") {
+            std::string v = trimCopy(toLowerCopy(val));
+            if (!v.empty() && v.back() == '%') {
+                try { rule.widthPct = std::clamp((int)std::lround(std::stod(v.substr(0, v.size() - 1))), 0, 100); }
+                catch (...) {}
+            } else { auto w = cssLenPx(val); if (w) rule.width = *w; }
+        }
+        else if (key == "text-align") {
+            std::string v = trimCopy(toLowerCopy(val));
+            if (v == "center") rule.textAlign = 1;
+            else if (v == "right") rule.textAlign = 2;
+            else if (v == "left") rule.textAlign = 0;
+        }
+        else if (key == "display") {
+            rule.displayNone = (trimCopy(toLowerCopy(val)) == "none");
         }
     }
 }
@@ -1083,6 +1166,62 @@ static void applyRulesForElement(const std::vector<StyleRule>& rules,
             if (r.bold) st.bold = *r.bold;
         }
     }
+}
+
+// -------------------- CSS box model --------------------
+
+struct BoxStyle {
+    int mTop = 0, mRight = 0, mBottom = 0, mLeft = 0;
+    bool marginAuto = false;
+    int pTop = 0, pRight = 0, pBottom = 0, pLeft = 0;
+    int borderW = 0;
+    SDL_Color borderColor {120, 120, 120, 255};
+    bool hasBg = false;
+    SDL_Color bg {0, 0, 0, 0};
+    int width = -1;      // content width in px, -1 = auto
+    int widthPct = -1;   // width as %, -1 = none
+    int textAlign = -1;  // -1 inherit, 0 left, 1 center, 2 right
+    bool displayNone = false;
+};
+
+// Approximate browser default block margins/padding (px).
+static void applyBoxDefaults(const std::string& tag, BoxStyle& b) {
+    if (tag == "h1") { b.mTop = b.mBottom = 22; }
+    else if (tag == "h2") { b.mTop = b.mBottom = 18; }
+    else if (tag == "h3" || tag == "h4") { b.mTop = b.mBottom = 16; }
+    else if (tag == "p") { b.mTop = b.mBottom = 14; }
+    else if (tag == "ul" || tag == "ol") { b.mTop = b.mBottom = 14; b.pLeft = 32; }
+    else if (tag == "blockquote" || tag == "figure") { b.mTop = b.mBottom = 14; b.mLeft = b.mRight = 32; }
+    else if (tag == "pre") { b.mTop = b.mBottom = 12; }
+    else if (tag == "hr") { b.mTop = b.mBottom = 10; b.borderW = 1; b.borderColor = SDL_Color{180,180,180,255}; }
+}
+
+static void applyBoxRuleProps(const StyleRule& r, BoxStyle& b) {
+    if (r.marginTop) b.mTop = *r.marginTop;
+    if (r.marginRight) b.mRight = *r.marginRight;
+    if (r.marginBottom) b.mBottom = *r.marginBottom;
+    if (r.marginLeft) b.mLeft = *r.marginLeft;
+    if (r.marginAuto) b.marginAuto = *r.marginAuto;
+    if (r.padTop) b.pTop = *r.padTop;
+    if (r.padRight) b.pRight = *r.padRight;
+    if (r.padBottom) b.pBottom = *r.padBottom;
+    if (r.padLeft) b.pLeft = *r.padLeft;
+    if (r.borderW) b.borderW = *r.borderW;
+    if (r.borderColor) b.borderColor = *r.borderColor;
+    if (r.backgroundColor) { b.hasBg = true; b.bg = *r.backgroundColor; }
+    if (r.width) { b.width = *r.width; b.widthPct = -1; }
+    if (r.widthPct) { b.widthPct = *r.widthPct; b.width = -1; }
+    if (r.textAlign) b.textAlign = *r.textAlign;
+    if (r.displayNone) b.displayNone = *r.displayNone;
+}
+
+static void applyBoxRulesForElement(const std::vector<StyleRule>& rules,
+                                    const std::string& tag, const std::string& id,
+                                    const std::vector<std::string>& classes, BoxStyle& b) {
+    for (const auto& r : rules) if (r.type == SelectorType::Tag && r.tag == tag) applyBoxRuleProps(r, b);
+    for (const auto& r : rules) if (r.type == SelectorType::Class && hasClass(classes, r.cls)) applyBoxRuleProps(r, b);
+    for (const auto& r : rules) if (r.type == SelectorType::TagClass && r.tag == tag && hasClass(classes, r.cls)) applyBoxRuleProps(r, b);
+    for (const auto& r : rules) if (r.type == SelectorType::Id && !id.empty() && r.id == id) applyBoxRuleProps(r, b);
 }
 
 // -------------------- Tokens --------------------
@@ -3150,131 +3289,6 @@ static void domCollectCssVisit(const DomTree& dom, int id, const Url& baseUrl,
     for (int c : n->children) domCollectCssVisit(dom, c, baseUrl, cssAll, externalCount);
 }
 
-namespace {
-// Walks the DOM tree producing the StyledToken stream the layout consumes.
-struct DomTokenize {
-    const DomTree& dom;
-    const std::vector<StyleRule>& rules;
-    const Url& baseUrl;
-    std::vector<StyledToken> tokens;
-
-    void emitBreak(int n) {
-        if (n <= 0) return;
-        StyledToken bt;
-        bt.kind = TokenKind::Break;
-        bt.breakCount = n;
-        tokens.push_back(bt);
-    }
-
-    void emitText(const std::string& text, const TextStyle& st,
-                  const std::string& href, const std::string& eid) {
-        std::istringstream iss(text);
-        std::string w;
-        while (iss >> w) {
-            StyledToken tok;
-            tok.kind = TokenKind::Word;
-            tok.text = w;
-            tok.href = href;
-            tok.style = st;
-            tok.elementId = eid;
-            tokens.push_back(std::move(tok));
-        }
-    }
-
-    static int intAttr(const std::string& s) {
-        std::string v = trimCopy(s);
-        if (v.empty()) return 0;
-        try { return std::max(0, std::stoi(v)); } catch (...) { return 0; }
-    }
-
-    void walk(int nodeId, TextStyle style, std::string href, std::string eid) {
-        const DomNode* n = dom.get(nodeId);
-        if (!n) return;
-
-        if (n->type == DomNodeType::Text) {
-            emitText(n->text, style, href, eid);
-            return;
-        }
-
-        const std::string& tag = n->tag;
-
-        if (tag == "#root") {
-            for (int c : n->children) walk(c, style, href, eid);
-            return;
-        }
-        if (tag == "noscript") {
-#ifndef NOCHROME_ENABLE_JS
-            for (int c : n->children) walk(c, style, href, eid); // render fallback when JS is off
-#endif
-            return;
-        }
-        // Never-rendered subtrees (CSS is collected separately).
-        if (tag == "script" || tag == "style" || tag == "head" ||
-            tag == "title" || tag == "meta" || tag == "link") {
-            return;
-        }
-        if (tag == "br") { emitBreak(1); return; }
-
-        if (tag == "img") {
-            std::string src = trimCopy(domGetAttr(*n, "src"));
-            if (!src.empty()) {
-                StyledToken it;
-                it.kind = TokenKind::Image;
-                it.imgSrcAbs = resolveHref(baseUrl, src);
-                it.imgAlt = domGetAttr(*n, "alt");
-                it.imgAttrW = intAttr(domGetAttr(*n, "width"));
-                it.imgAttrH = intAttr(domGetAttr(*n, "height"));
-                tokens.push_back(std::move(it));
-                emitBreak(1);
-            }
-            return;
-        }
-
-        // Compute this element's text style from defaults + CSS rules + inline.
-        TextStyle st = style;
-        std::string id = trimCopy(domGetAttr(*n, "id"));
-        auto classes = parseClassList(domGetAttr(*n, "class"));
-        applyTagDefaults(tag, st);
-        applyRulesForElement(rules, tag, toLowerCopy(id), classes, st);
-        std::string inlineCss = domGetAttr(*n, "style");
-        if (!inlineCss.empty()) applyInlineStyle(inlineCss, st);
-
-        std::string childHref = (tag == "a") ? trimCopy(domGetAttr(*n, "href")) : href;
-        std::string childEid = id.empty() ? eid : id;
-
-        bool block = isBlockTagName(tag);
-        if (block) emitBreak(defaultBreakCountForTag(tag));
-
-        for (int c : n->children) walk(c, st, childHref, childEid);
-
-        if (block) emitBreak(defaultBreakCountForTag("/" + tag));
-    }
-};
-} // namespace
-
-// Build the StyledToken stream by walking the DOM tree directly (no HTML
-// re-parsing). This is the single HTML interpretation path; the JS bindings
-// and the renderer share the same tree.
-static std::vector<StyledToken> domTreeToStyledTokens(const DomTree& dom,
-                                                      const Url& baseUrl,
-                                                      SDL_Color* outPageBg) {
-    std::string cssAll;
-    int externalCount = 0;
-    domCollectCssVisit(dom, dom.root, baseUrl, cssAll, externalCount);
-
-    auto rules = parseCssRules(cssAll);
-    if (outPageBg) *outPageBg = extractPageBackgroundFromRules(rules);
-
-    DomTokenize tk{ dom, rules, baseUrl, {} };
-    TextStyle base;
-    tk.walk(dom.root, base, "", "");
-
-    while (!tk.tokens.empty() && tk.tokens.back().kind == TokenKind::Break)
-        tk.tokens.pop_back();
-
-    return std::move(tk.tokens);
-}
-
 // -------------------- Fonts --------------------
 
 struct FontSet {
@@ -3393,27 +3407,21 @@ struct RenderSpan {
     int h = 0;
 };
 
-struct RenderTextLine {
-    std::vector<RenderSpan> spans;
-    int height = 0;
-};
+enum class ItemKind { Box, Text, Image };
 
-struct RenderImage {
-    SDL_Texture* texture = nullptr;
-    int w = 0;
-    int h = 0;
-    std::string srcAbs;
-};
-
-enum class BlockKind { Text, Spacer, Image };
-
-struct RenderBlock {
-    BlockKind kind = BlockKind::Text;
-    int y = 0;
-    int h = 0;
-
-    RenderTextLine text;
-    RenderImage image;
+// A positioned paint primitive in content coordinates (absolute, pre-scroll).
+struct RenderItem {
+    ItemKind kind = ItemKind::Text;
+    SDL_Rect rect {0, 0, 0, 0};
+    // Box:
+    bool hasBg = false;
+    SDL_Color bg {0, 0, 0, 0};
+    int borderW = 0;
+    SDL_Color borderColor {120, 120, 120, 255};
+    // Text / Image:
+    SDL_Texture* tex = nullptr;
+    bool underline = false;
+    SDL_Color underlineColor {0, 0, 0, 255};
 };
 
 struct LinkHit {
@@ -3422,24 +3430,15 @@ struct LinkHit {
 };
 
 struct ElementHit {
-    SDL_Rect rect; // Content coordinates (bounding box of an element's rendered text)
+    SDL_Rect rect; // Content coordinates (bounding box of an element)
     std::string id;
 };
 
-static void destroyBlocks(SDL_Renderer* renderer, std::vector<RenderBlock>& blocks) {
-    (void)renderer;
-    for (auto& b : blocks) {
-        if (b.kind == BlockKind::Text) {
-            for (auto& sp : b.text.spans) {
-                if (sp.texture) SDL_DestroyTexture(sp.texture);
-                sp.texture = nullptr;
-            }
-        } else if (b.kind == BlockKind::Image) {
-            if (b.image.texture) SDL_DestroyTexture(b.image.texture);
-            b.image.texture = nullptr;
-        }
+static void destroyItems(std::vector<RenderItem>& items) {
+    for (auto& it : items) {
+        if (it.tex) { SDL_DestroyTexture(it.tex); it.tex = nullptr; }
     }
-    blocks.clear();
+    items.clear();
 }
 
 static std::vector<RenderSpan> groupWordsToSpans(const std::vector<StyledWord>& words) {
@@ -3496,197 +3495,324 @@ static SDL_Texture* loadImageTexture(SDL_Renderer* renderer,
     return tex;
 }
 
-static std::vector<RenderBlock> buildBlocksFromTokens(SDL_Renderer* renderer,
-                                                      const FontSet& fonts,
-                                                      const std::vector<StyledToken>& tokens,
-                                                      int contentWidth,
-                                                      int padding,
-                                                      int baseLineHeight,
-                                                      std::vector<LinkHit>& outLinks,
-                                                      std::vector<ElementHit>& outElements) {
-    std::vector<RenderBlock> blocks;
-    outLinks.clear();
-    outElements.clear();
+static int domIntAttr(const std::string& s) {
+    std::string v = trimCopy(s);
+    if (v.empty()) return 0;
+    try { return std::max(0, std::stoi(v)); } catch (...) { return 0; }
+}
 
-    const int maxLineW = std::max(10, contentWidth - padding * 2);
+static bool isLayoutBlock(const std::string& tag) {
+    static const std::unordered_set<std::string> blocks = {
+        "#root","html","body","head","div","p","h1","h2","h3","h4","h5","h6",
+        "ul","ol","li","section","article","header","footer","nav","main","aside",
+        "blockquote","pre","figure","figcaption","table","thead","tbody","tfoot",
+        "tr","td","th","form","fieldset","legend","hr","dl","dt","dd","address",
+        "details","summary","script","style","title","meta","link","noscript"
+    };
+    return blocks.count(tag) > 0;
+}
 
-    std::vector<StyledWord> currentLine;
-    int lineW = 0;
+// -------------------- Block box layout --------------------
+// Walks the DOM tree producing positioned RenderItems (block boxes + inline
+// text/images). Block elements get margins/padding/border/background/width/
+// text-align; inline descendants flow into wrapped lines within each block.
+struct BoxLayout {
+    SDL_Renderer* renderer;
+    const FontSet& fonts;
+    const std::vector<StyleRule>& rules;
+    const DomTree& dom;
+    Url baseUrl;
+    int baseLineHeight;
+    std::vector<RenderItem>& items;
+    std::vector<LinkHit>& links;
+    std::unordered_map<std::string, SDL_Rect>& idRects;
 
-    auto flushLine = [&](){
-        if (currentLine.empty()) return;
+    void recordHit(const std::string& id, const SDL_Rect& r) {
+        auto it = idRects.find(id);
+        if (it == idRects.end()) { idRects[id] = r; return; }
+        SDL_Rect& u = it->second;
+        int x0 = std::min(u.x, r.x), y0 = std::min(u.y, r.y);
+        int x1 = std::max(u.x + u.w, r.x + r.w), y1 = std::max(u.y + u.h, r.y + r.h);
+        u = SDL_Rect{ x0, y0, x1 - x0, y1 - y0 };
+    }
 
-        RenderBlock b;
-        b.kind = BlockKind::Text;
+    // Gather inline tokens (words / <br> / <img>) from an inline subtree.
+    void collectInline(int nodeId, TextStyle style, std::string href,
+                       std::string eid, std::vector<StyledToken>& toks) {
+        const DomNode* n = dom.get(nodeId);
+        if (!n) return;
 
-        auto spans = groupWordsToSpans(currentLine);
-        int maxH = 0;
-
-        for (auto& sp : spans) {
-            TTF_Font* f = pickFont(fonts, sp.style.fontSize);
-
-            SDL_Surface* surf = renderTextWithStyle(f, sp.text, sp.style);
-            if (!surf) {
-                b.text.spans.push_back(std::move(sp));
-                continue;
+        if (n->type == DomNodeType::Text) {
+            std::istringstream iss(n->text);
+            std::string w;
+            while (iss >> w) {
+                StyledToken t; t.kind = TokenKind::Word; t.text = w;
+                t.href = href; t.style = style; t.elementId = eid;
+                toks.push_back(std::move(t));
             }
-
-            sp.w = surf->w;
-            sp.h = surf->h;
-            maxH = std::max(maxH, sp.h);
-            sp.texture = SDL_CreateTextureFromSurface(renderer, surf);
-            SDL_FreeSurface(surf);
-
-            b.text.spans.push_back(std::move(sp));
+            return;
         }
 
-        b.text.height = std::max(baseLineHeight, maxH + 6);
-        b.h = b.text.height;
+        const std::string& tag = n->tag;
+        if (tag == "br") { StyledToken t; t.kind = TokenKind::Break; t.breakCount = 1; toks.push_back(t); return; }
+        if (tag == "img") {
+            std::string src = trimCopy(domGetAttr(*n, "src"));
+            if (!src.empty()) {
+                StyledToken it; it.kind = TokenKind::Image;
+                it.imgSrcAbs = resolveHref(baseUrl, src);
+                it.imgAlt = domGetAttr(*n, "alt");
+                it.imgAttrW = domIntAttr(domGetAttr(*n, "width"));
+                it.imgAttrH = domIntAttr(domGetAttr(*n, "height"));
+                toks.push_back(std::move(it));
+            }
+            return;
+        }
+        if (tag == "script" || tag == "style" || tag == "head" || tag == "title" || tag == "noscript") return;
 
-        blocks.push_back(std::move(b));
-        currentLine.clear();
-        lineW = 0;
-    };
+        TextStyle st = style;
+        std::string id = trimCopy(domGetAttr(*n, "id"));
+        auto classes = parseClassList(domGetAttr(*n, "class"));
+        applyTagDefaults(tag, st);
+        applyRulesForElement(rules, tag, toLowerCopy(id), classes, st);
+        std::string inlineCss = domGetAttr(*n, "style");
+        if (!inlineCss.empty()) applyInlineStyle(inlineCss, st);
 
-    auto addSpacer = [&](int h){
-        if (h <= 0) return;
-        RenderBlock b;
-        b.kind = BlockKind::Spacer;
-        b.h = h;
-        blocks.push_back(std::move(b));
-    };
+        std::string childHref = (tag == "a") ? trimCopy(domGetAttr(*n, "href")) : href;
+        std::string childEid = id.empty() ? eid : id;
+        for (int c : n->children) collectInline(c, st, childHref, childEid, toks);
+    }
 
-    auto addImageBlock = [&](const StyledToken& it){
-        if (it.imgSrcAbs.empty()) return;
-
-        std::string bytes = fetchSubresourceBytes(it.imgSrcAbs);
+    int layoutImageToken(const StyledToken& t, int contentX, int y, int contentW) {
+        if (t.imgSrcAbs.empty()) return y;
+        std::string bytes = fetchSubresourceBytes(t.imgSrcAbs);
         int iw = 0, ih = 0;
         SDL_Texture* tex = loadImageTexture(renderer, bytes, &iw, &ih);
 
         if (!tex || iw <= 0 || ih <= 0) {
-            // Fallback: render alt text when image fails
-            std::string alt = it.imgAlt.empty() ? "[image]" : ("[image: " + it.imgAlt + "]");
-            StyledToken t;
-            t.kind = TokenKind::Word;
-            t.text = alt;
-            t.style = TextStyle{};
-            // Push as a simple text block via currentLine
-            currentLine.push_back({t.text, "", t.style, ""});
-            flushLine();
-            addSpacer(baseLineHeight / 2);
-            return;
+            std::string alt = t.imgAlt.empty() ? "[image]" : ("[image: " + t.imgAlt + "]");
+            TextStyle st;
+            TTF_Font* f = pickFont(fonts, st.fontSize);
+            SDL_Surface* surf = renderTextWithStyle(f, alt, st);
+            if (surf) {
+                RenderItem it; it.kind = ItemKind::Text;
+                it.rect = { contentX, y, surf->w, surf->h };
+                it.tex = SDL_CreateTextureFromSurface(renderer, surf);
+                int h = surf->h;
+                SDL_FreeSurface(surf);
+                items.push_back(it);
+                y += std::max(baseLineHeight, h + 6);
+            }
+            return y;
         }
 
-        int targetW = iw;
-        int targetH = ih;
+        int tw = iw, th = ih;
+        if (t.imgAttrW > 0 && t.imgAttrH > 0) { tw = t.imgAttrW; th = t.imgAttrH; }
+        else if (t.imgAttrW > 0) { float s = (float)t.imgAttrW / iw; tw = t.imgAttrW; th = std::max(1, (int)std::lround(ih * s)); }
+        else if (t.imgAttrH > 0) { float s = (float)t.imgAttrH / ih; th = t.imgAttrH; tw = std::max(1, (int)std::lround(iw * s)); }
+        if (tw > contentW && tw > 0) { float s = (float)contentW / tw; tw = contentW; th = std::max(1, (int)std::lround(th * s)); }
 
-        // Respect width/height attributes lightly (optional)
-        if (it.imgAttrW > 0 && it.imgAttrH > 0) {
-            targetW = it.imgAttrW;
-            targetH = it.imgAttrH;
-        } else if (it.imgAttrW > 0 && it.imgAttrH == 0) {
-            float s = (float)it.imgAttrW / (float)iw;
-            targetW = it.imgAttrW;
-            targetH = std::max(1, (int)std::lround(ih * s));
-        } else if (it.imgAttrH > 0 && it.imgAttrW == 0) {
-            float s = (float)it.imgAttrH / (float)ih;
-            targetH = it.imgAttrH;
-            targetW = std::max(1, (int)std::lround(iw * s));
-        }
-
-        // Fit into content width
-        if (targetW > maxLineW) {
-            float s = (float)maxLineW / (float)targetW;
-            targetW = maxLineW;
-            targetH = std::max(1, (int)std::lround(targetH * s));
-        }
-
-        RenderBlock b;
-        b.kind = BlockKind::Image;
-        b.image.texture = tex;
-        b.image.w = targetW;
-        b.image.h = targetH;
-        b.image.srcAbs = it.imgSrcAbs;
-        b.h = targetH + 8; // small bottom padding
-        blocks.push_back(std::move(b));
-    };
-
-    for (const auto& t : tokens) {
-        if (t.kind == TokenKind::Break) {
-            flushLine();
-            addSpacer(baseLineHeight * std::max(1, t.breakCount));
-            continue;
-        }
-
-        if (t.kind == TokenKind::Image) {
-            flushLine();
-            addImageBlock(t);
-            continue;
-        }
-
-        // Word
-        StyledWord w { t.text, t.href, t.style, t.elementId };
-        TTF_Font* f = pickFont(fonts, w.style.fontSize);
-
-        int wW = textWidth(f, w.text);
-        int spaceW = textWidth(f, " ");
-        int add = currentLine.empty() ? wW : (spaceW + wW);
-
-        if (!currentLine.empty() && lineW + add > maxLineW) {
-            flushLine();
-        }
-
-        if (currentLine.empty()) {
-            lineW = wW;
-            currentLine.push_back(std::move(w));
-        } else {
-            lineW += add;
-            currentLine.push_back(std::move(w));
-        }
+        RenderItem it; it.kind = ItemKind::Image; it.rect = { contentX, y, tw, th }; it.tex = tex;
+        items.push_back(it);
+        return y + th + 8;
     }
 
-    flushLine();
+    // Lay out a stream of inline tokens into wrapped lines within [contentX, contentX+contentW).
+    int layoutInline(const std::vector<StyledToken>& toks, int contentX, int startY, int contentW, int textAlign) {
+        int y = startY;
+        int maxLineW = std::max(10, contentW);
 
-    // Assign y positions + build link / element hitboxes
-    int y = padding;
-    std::unordered_map<std::string, SDL_Rect> idRects;
-    for (auto& b : blocks) {
-        b.y = y;
-        y += b.h;
+        std::vector<StyledWord> line;
+        int lineW = 0;
 
-        if (b.kind != BlockKind::Text) continue;
-
-        int x = padding;
-        int lineTop = b.y;
-
-        for (const auto& sp : b.text.spans) {
-            SDL_Rect r { x, lineTop, sp.w, sp.h };
-            if (!sp.href.empty() && sp.w > 0 && sp.h > 0) {
-                outLinks.push_back({ r, sp.href });
+        auto flush = [&]() {
+            if (line.empty()) return;
+            auto spans = groupWordsToSpans(line);
+            int maxH = 0;
+            for (auto& sp : spans) {
+                TTF_Font* f = pickFont(fonts, sp.style.fontSize);
+                SDL_Surface* surf = renderTextWithStyle(f, sp.text, sp.style);
+                if (surf) {
+                    sp.w = surf->w; sp.h = surf->h;
+                    sp.texture = SDL_CreateTextureFromSurface(renderer, surf);
+                    SDL_FreeSurface(surf);
+                }
+                maxH = std::max(maxH, sp.h);
             }
-            if (!sp.elementId.empty() && sp.w > 0 && sp.h > 0) {
-                auto it = idRects.find(sp.elementId);
-                if (it == idRects.end()) {
-                    idRects[sp.elementId] = r;
-                } else {
-                    SDL_Rect& u = it->second;
-                    int x0 = std::min(u.x, r.x);
-                    int y0 = std::min(u.y, r.y);
-                    int x1 = std::max(u.x + u.w, r.x + r.w);
-                    int y1 = std::max(u.y + u.h, r.y + r.h);
-                    u = SDL_Rect{ x0, y0, x1 - x0, y1 - y0 };
+            int total = 0;
+            for (size_t i = 0; i < spans.size(); ++i) {
+                total += spans[i].w;
+                if (i + 1 < spans.size()) {
+                    TTF_Font* f = pickFont(fonts, spans[i].style.fontSize);
+                    total += textWidth(f, " ");
                 }
             }
-            TTF_Font* f = pickFont(fonts, sp.style.fontSize);
-            x += sp.w + textWidth(f, " ");
+            int lineH = std::max(baseLineHeight, maxH + 6);
+            int xoff = 0;
+            if (textAlign == 1) xoff = std::max(0, (contentW - total) / 2);
+            else if (textAlign == 2) xoff = std::max(0, contentW - total);
+            int x = contentX + xoff;
+            for (auto& sp : spans) {
+                SDL_Rect r { x, y, sp.w, sp.h };
+                if (sp.texture) {
+                    RenderItem it; it.kind = ItemKind::Text; it.rect = r; it.tex = sp.texture;
+                    if (!sp.href.empty()) { it.underline = true; it.underlineColor = sp.style.color; }
+                    items.push_back(it);
+                }
+                if (!sp.href.empty() && sp.w > 0) links.push_back({ r, sp.href });
+                if (!sp.elementId.empty() && sp.w > 0) recordHit(sp.elementId, r);
+                TTF_Font* f = pickFont(fonts, sp.style.fontSize);
+                x += sp.w + textWidth(f, " ");
+            }
+            y += lineH;
+            line.clear();
+            lineW = 0;
+        };
+
+        for (const auto& t : toks) {
+            if (t.kind == TokenKind::Break) {
+                if (line.empty()) y += baseLineHeight; else flush();
+                continue;
+            }
+            if (t.kind == TokenKind::Image) { flush(); y = layoutImageToken(t, contentX, y, contentW); continue; }
+
+            TTF_Font* f = pickFont(fonts, t.style.fontSize);
+            int wW = textWidth(f, t.text);
+            int spaceW = textWidth(f, " ");
+            int add = line.empty() ? wW : (spaceW + wW);
+            if (!line.empty() && lineW + add > maxLineW) flush();
+            if (line.empty()) lineW = wW; else lineW += add;
+            line.push_back(StyledWord{ t.text, t.href, t.style, t.elementId });
         }
+        flush();
+        return y;
     }
 
-    for (auto& kv : idRects) {
-        outElements.push_back(ElementHit{ kv.second, kv.first });
-    }
+    // Lay out a block element; returns the y just below it (incl. bottom margin).
+    int layoutBlock(int nodeId, int x, int y, int availWidth,
+                    TextStyle inheritStyle, int inheritAlign, std::string inheritEid) {
+        const DomNode* node = dom.get(nodeId);
+        if (!node || node->type != DomNodeType::Element) return y;
+        const std::string& tag = node->tag;
 
-    return blocks;
+        if (tag == "head" || tag == "script" || tag == "style" ||
+            tag == "title" || tag == "meta" || tag == "link") return y;
+#ifdef NOCHROME_ENABLE_JS
+        if (tag == "noscript") return y;
+#endif
+
+        std::string id = trimCopy(domGetAttr(*node, "id"));
+        auto classes = parseClassList(domGetAttr(*node, "class"));
+        std::string styleAttr = domGetAttr(*node, "style");
+
+        BoxStyle box;
+        applyBoxDefaults(tag, box);
+        applyBoxRulesForElement(rules, tag, toLowerCopy(id), classes, box);
+        if (!styleAttr.empty()) { StyleRule tmp; applyDeclarationsToRule(tmp, styleAttr); applyBoxRuleProps(tmp, box); }
+        if (box.displayNone) return y;
+
+        TextStyle st = inheritStyle;
+        applyTagDefaults(tag, st);
+        applyRulesForElement(rules, tag, toLowerCopy(id), classes, st);
+        if (!styleAttr.empty()) applyInlineStyle(styleAttr, st);
+
+        int effAlign = (box.textAlign >= 0) ? box.textAlign : inheritAlign;
+        std::string elemId = id.empty() ? inheritEid : id;
+
+        if (tag == "hr") {
+            int top = y + box.mTop;
+            int w = std::max(0, availWidth - box.mLeft - box.mRight);
+            int h = std::max(1, box.borderW);
+            RenderItem it; it.kind = ItemKind::Box;
+            it.rect = { x + box.mLeft, top, w, h };
+            it.hasBg = true; it.bg = box.borderColor;
+            items.push_back(it);
+            return top + h + box.mBottom;
+        }
+
+        int avail = std::max(0, availWidth - box.mLeft - box.mRight);
+        int borderBoxW;
+        if (box.width >= 0) borderBoxW = box.width + box.pLeft + box.pRight + 2 * box.borderW;
+        else if (box.widthPct >= 0) borderBoxW = avail * box.widthPct / 100;
+        else borderBoxW = avail;
+        borderBoxW = std::clamp(borderBoxW, 0, avail);
+
+        int boxLeft = x + box.mLeft;
+        if (box.marginAuto && (box.width >= 0 || box.widthPct >= 0))
+            boxLeft = x + box.mLeft + std::max(0, (avail - borderBoxW) / 2);
+
+        int contentW = std::max(0, borderBoxW - 2 * box.borderW - box.pLeft - box.pRight);
+        int boxTop = y + box.mTop;
+        int contentLeft = boxLeft + box.borderW + box.pLeft;
+        int contentTop = boxTop + box.borderW + box.pTop;
+
+        bool drawBox = box.hasBg || box.borderW > 0;
+        size_t boxIdx = (size_t)-1;
+        if (drawBox) { boxIdx = items.size(); items.push_back(RenderItem{}); }
+
+        int curY = contentTop;
+        std::vector<StyledToken> inlineToks;
+        auto flushInline = [&]() {
+            if (inlineToks.empty()) return;
+            curY = layoutInline(inlineToks, contentLeft, curY, contentW, effAlign);
+            inlineToks.clear();
+        };
+
+        if (tag == "li") {
+            StyledToken b; b.kind = TokenKind::Word; b.text = "\xE2\x80\xA2"; b.style = st; b.elementId = elemId;
+            inlineToks.push_back(b);
+        }
+
+        for (int c : node->children) {
+            const DomNode* cn = dom.get(c);
+            if (!cn) continue;
+            bool childBlock = (cn->type == DomNodeType::Element) && isLayoutBlock(cn->tag);
+            if (childBlock) {
+                flushInline();
+                curY = layoutBlock(c, contentLeft, curY, contentW, st, effAlign, elemId);
+            } else {
+                collectInline(c, st, "", elemId, inlineToks);
+            }
+        }
+        flushInline();
+
+        int contentBottom = curY;
+        int boxBottom = contentBottom + box.pBottom + box.borderW;
+
+        if (drawBox) {
+            RenderItem it; it.kind = ItemKind::Box;
+            it.rect = { boxLeft, boxTop, borderBoxW, std::max(0, boxBottom - boxTop) };
+            it.hasBg = box.hasBg; it.bg = box.bg;
+            it.borderW = box.borderW; it.borderColor = box.borderColor;
+            items[boxIdx] = it;
+        }
+
+        if (!id.empty())
+            recordHit(id, SDL_Rect{ boxLeft, boxTop, borderBoxW, std::max(0, boxBottom - boxTop) });
+
+        return boxBottom + box.mBottom;
+    }
+};
+
+static int layoutDocument(SDL_Renderer* renderer, const FontSet& fonts, const DomTree& dom,
+                          const Url& baseUrl, int contentWidth, int padding, int baseLineHeight,
+                          std::vector<RenderItem>& items, std::vector<LinkHit>& links,
+                          std::vector<ElementHit>& elements, SDL_Color* outPageBg) {
+    items.clear(); links.clear(); elements.clear();
+
+    std::string cssAll; int ext = 0;
+    domCollectCssVisit(dom, dom.root, baseUrl, cssAll, ext);
+    auto rules = parseCssRules(cssAll);
+    if (outPageBg) *outPageBg = extractPageBackgroundFromRules(rules);
+
+    std::unordered_map<std::string, SDL_Rect> idRects;
+    BoxLayout bl{ renderer, fonts, rules, dom, baseUrl, baseLineHeight, items, links, idRects };
+
+    int availWidth = std::max(10, contentWidth - 2 * padding);
+    TextStyle base;
+    int bottom = bl.layoutBlock(dom.root, padding, padding, availWidth, base, -1, "");
+
+    for (auto& kv : idRects) elements.push_back(ElementHit{ kv.second, kv.first });
+    return bottom + padding;
 }
 
 // -------------------- Page state --------------------
@@ -3699,7 +3825,7 @@ struct Page {
 
     SDL_Color background {245, 245, 245, 255};
 
-    std::vector<RenderBlock> blocks;
+    std::vector<RenderItem> items;
     std::vector<LinkHit> linkHits;
     std::vector<ElementHit> elementHits;
     int contentHeight = 0;
@@ -3725,19 +3851,13 @@ static void rebuildLayout(Page& page,
                           int contentWidth,
                           int padding,
                           int baseLineHeight) {
-    destroyBlocks(renderer, page.blocks);
+    destroyItems(page.items);
 
     SDL_Color bg = page.background;
-    auto tokens = domTreeToStyledTokens(page.dom, page.baseUrl, &bg);
+    page.contentHeight = layoutDocument(renderer, fonts, page.dom, page.baseUrl,
+                                        contentWidth, padding, baseLineHeight,
+                                        page.items, page.linkHits, page.elementHits, &bg);
     page.background = bg;
-
-    page.blocks = buildBlocksFromTokens(renderer, fonts, tokens, contentWidth, padding, baseLineHeight, page.linkHits, page.elementHits);
-
-    int last = padding;
-    for (const auto& b : page.blocks) {
-        last = std::max(last, b.y + b.h);
-    }
-    page.contentHeight = last + padding;
 }
 
 // -------------------- UI helpers --------------------
@@ -3967,7 +4087,7 @@ int main(int argc, char** argv) {
     auto closeTab = [&](int idx){
         if (idx < 0 || idx >= (int)tabs.size()) return;
 
-        destroyBlocks(renderer, tabs[idx].page.blocks);
+        destroyItems(tabs[idx].page.items);
         tabs.erase(tabs.begin() + idx);
 
         if (tabs.empty()) {
@@ -4477,36 +4597,35 @@ int main(int argc, char** argv) {
 
         int scrollY = (int)tabs[activeTab].scrollYf;
 
-        for (const auto& b : page.blocks) {
-            int yScreen = chromeH + b.y - scrollY;
+        for (const auto& it : page.items) {
+            int yScreen = chromeH + it.rect.y - scrollY;
 
-            if (yScreen + b.h < chromeH - 50) continue;
+            if (yScreen + it.rect.h < chromeH - 50) continue;
             if (yScreen > winH + 50) break;
 
-            if (b.kind == BlockKind::Text) {
-                int x = padding;
-                for (const auto& sp : b.text.spans) {
-                    if (sp.texture) {
-                        SDL_Rect dst { x, yScreen, sp.w, sp.h };
-                        SDL_RenderCopy(renderer, sp.texture, nullptr, &dst);
+            SDL_Rect dst { it.rect.x, yScreen, it.rect.w, it.rect.h };
 
-                        if (!sp.href.empty()) {
-                            SDL_SetRenderDrawColor(renderer,
-                                                   sp.style.color.r,
-                                                   sp.style.color.g,
-                                                   sp.style.color.b, 255);
-                            SDL_Rect ul { x, yScreen + sp.h + 2, sp.w, 1 };
-                            SDL_RenderFillRect(renderer, &ul);
-                        }
-                    }
-
-                    TTF_Font* f = pickFont(fonts, sp.style.fontSize);
-                    x += sp.w + textWidth(f, " ");
+            if (it.kind == ItemKind::Box) {
+                if (it.hasBg) {
+                    drawFilledRect(renderer, dst, it.bg.r, it.bg.g, it.bg.b, it.bg.a ? it.bg.a : 255);
                 }
-            } else if (b.kind == BlockKind::Image) {
-                if (b.image.texture) {
-                    SDL_Rect dst { padding, yScreen, b.image.w, b.image.h };
-                    SDL_RenderCopy(renderer, b.image.texture, nullptr, &dst);
+                if (it.borderW > 0) {
+                    int bw = it.borderW;
+                    SDL_SetRenderDrawColor(renderer, it.borderColor.r, it.borderColor.g, it.borderColor.b, 255);
+                    SDL_Rect sides[4] = {
+                        { dst.x, dst.y, dst.w, bw },
+                        { dst.x, dst.y + dst.h - bw, dst.w, bw },
+                        { dst.x, dst.y, bw, dst.h },
+                        { dst.x + dst.w - bw, dst.y, bw, dst.h }
+                    };
+                    for (auto& s : sides) SDL_RenderFillRect(renderer, &s);
+                }
+            } else if (it.tex) {
+                SDL_RenderCopy(renderer, it.tex, nullptr, &dst);
+                if (it.underline) {
+                    SDL_SetRenderDrawColor(renderer, it.underlineColor.r, it.underlineColor.g, it.underlineColor.b, 255);
+                    SDL_Rect ul { dst.x, dst.y + dst.h + 2, dst.w, 1 };
+                    SDL_RenderFillRect(renderer, &ul);
                 }
             }
         }
@@ -4515,7 +4634,7 @@ int main(int argc, char** argv) {
     }
 
     for (auto& t : tabs) {
-        destroyBlocks(renderer, t.page.blocks);
+        destroyItems(t.page.items);
     }
 
     freeFontSet(fonts);
