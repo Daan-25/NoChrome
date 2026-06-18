@@ -63,6 +63,15 @@ cmake -S . -B build
 cmake --build build
 ```
 
+The JavaScript engine is QuickJS on non-Apple platforms and JavaScriptCore on
+macOS; both share the same DOM tree. To build the JavaScriptCore backend on
+Linux (via WebKitGTK — handy for parity testing):
+```bash
+sudo apt-get install libjavascriptcoregtk-4.1-dev
+cmake -S . -B build-jsc -DNOCHROME_FORCE_JSC=ON
+cmake --build build-jsc
+```
+
 ## Run
 ```bash
 ./build/NoChrome http://example.com/
