@@ -45,6 +45,8 @@ extern "C" {
 #include <regex>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
+#include <zlib.h>
 
 // --------- Networking (POSIX + basic Windows support) ----------
 #ifdef _WIN32
@@ -277,6 +279,7 @@ static std::string httpGetRaw(const Url& u) {
         << "Host: " << hostHeaderValue(u) << "\r\n"
         << "User-Agent: NoChrome/0.8\r\n"
         << "Accept: */*\r\n"
+        << "Accept-Encoding: gzip, deflate\r\n"
         << "Connection: close\r\n\r\n";
 
     std::string request = req.str();
@@ -368,6 +371,7 @@ static std::string httpsGetRaw(const Url& u) {
             << "Host: " << hostHeaderValue(u) << "\r\n"
             << "User-Agent: NoChrome/0.8\r\n"
             << "Accept: */*\r\n"
+            << "Accept-Encoding: gzip, deflate\r\n"
             << "Connection: close\r\n\r\n";
 
         std::string request = req.str();
@@ -486,6 +490,184 @@ static std::string extractBodyBytes(const std::string& rawResponse) {
         return decodeChunkedBody(parts.body);
     }
     return parts.body;
+}
+
+// -------------------- HTTP headers / compression / charset / redirects --------------------
+
+// Case-insensitive lookup of a single header value in a raw header block.
+static std::string headerValueCI(const std::string& headers, const std::string& nameLower) {
+    std::istringstream iss(headers);
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        if (toLowerCopy(trimCopy(line.substr(0, colon))) == nameLower) {
+            return trimCopy(line.substr(colon + 1));
+        }
+    }
+    return "";
+}
+
+// Numeric status code from the HTTP status line ("HTTP/1.1 301 ...").
+static int parseStatusCode(const std::string& headers) {
+    size_t eol = headers.find("\r\n");
+    std::string status = (eol == std::string::npos) ? headers : headers.substr(0, eol);
+    size_t sp = status.find(' ');
+    if (sp == std::string::npos) return 0;
+    size_t p = sp + 1;
+    while (p < status.size() && status[p] == ' ') p++;
+    int code = 0;
+    while (p < status.size() && std::isdigit((unsigned char)status[p])) {
+        code = code * 10 + (status[p] - '0');
+        p++;
+    }
+    return code;
+}
+
+// Inflate gzip/zlib/raw-deflate. windowBits: 47 = auto-detect gzip|zlib header,
+// -MAX_WBITS = raw deflate (no header).
+static bool zinflateInto(const std::string& in, std::string& out, int windowBits) {
+    if (in.empty()) return false;
+    z_stream zs = {};
+    if (inflateInit2(&zs, windowBits) != Z_OK) return false;
+
+    zs.next_in = (Bytef*)in.data();
+    zs.avail_in = (uInt)in.size();
+
+    char buf[16384];
+    int ret = Z_OK;
+    do {
+        zs.next_out = (Bytef*)buf;
+        zs.avail_out = sizeof(buf);
+        ret = inflate(&zs, Z_NO_FLUSH);
+        if (ret != Z_OK && ret != Z_STREAM_END) { inflateEnd(&zs); return false; }
+        out.append(buf, sizeof(buf) - zs.avail_out);
+    } while (ret != Z_STREAM_END);
+
+    inflateEnd(&zs);
+    return true;
+}
+
+static std::string maybeDecompress(const std::string& headers, const std::string& body) {
+    std::string enc = toLowerCopy(headerValueCI(headers, "content-encoding"));
+    if (enc.empty() || enc == "identity") return body;
+    if (enc.find("gzip") == std::string::npos && enc.find("deflate") == std::string::npos)
+        return body;
+
+    std::string out;
+    if (zinflateInto(body, out, 47)) return out;          // gzip or zlib (auto-detect)
+    out.clear();
+    if (zinflateInto(body, out, -MAX_WBITS)) return out;  // raw deflate fallback
+    return body;                                          // could not inflate
+}
+
+static void appendUtf8(std::string& out, unsigned cp) {
+    if (cp < 0x80) {
+        out.push_back((char)cp);
+    } else if (cp < 0x800) {
+        out.push_back((char)(0xC0 | (cp >> 6)));
+        out.push_back((char)(0x80 | (cp & 0x3F)));
+    } else {
+        out.push_back((char)(0xE0 | (cp >> 12)));
+        out.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back((char)(0x80 | (cp & 0x3F)));
+    }
+}
+
+// Windows-1252 (also used for iso-8859-1 / latin1, per the HTML standard) -> UTF-8.
+static std::string win1252ToUtf8(const std::string& in) {
+    static const unsigned hi[32] = {
+        0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+        0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+        0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+        0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178
+    };
+    std::string out;
+    out.reserve(in.size());
+    for (unsigned char c : in) {
+        if (c < 0x80) out.push_back((char)c);
+        else if (c < 0xA0) appendUtf8(out, hi[c - 0x80]);
+        else appendUtf8(out, c); // 0xA0-0xFF map 1:1 to U+00A0-U+00FF
+    }
+    return out;
+}
+
+static std::string charsetFromContentType(const std::string& headers) {
+    std::string ct = toLowerCopy(headerValueCI(headers, "content-type"));
+    size_t cs = ct.find("charset=");
+    if (cs == std::string::npos) return "";
+    std::string v = ct.substr(cs + 8);
+    size_t e = v.find_first_of("; \t\"'");
+    if (e != std::string::npos) v = v.substr(0, e);
+    return trimCopy(v);
+}
+
+static std::string charsetFromMeta(const std::string& html) {
+    std::string head = toLowerCopy(html.substr(0, std::min<size_t>(html.size(), 2048)));
+    size_t cs = head.find("charset=");
+    if (cs == std::string::npos) return "";
+    std::string v = head.substr(cs + 8);
+    if (!v.empty() && (v[0] == '"' || v[0] == '\'')) v = v.substr(1);
+    size_t e = v.find_first_of("; \t\"'>/");
+    if (e != std::string::npos) v = v.substr(0, e);
+    return trimCopy(v);
+}
+
+// Best-effort: convert an HTML document to UTF-8 if it declares a legacy charset.
+static std::string decodeHtmlToUtf8(const std::string& headers, const std::string& html) {
+    std::string cs = charsetFromContentType(headers);
+    if (cs.empty()) cs = charsetFromMeta(html);
+    cs = toLowerCopy(cs);
+    if (cs.empty() || cs.find("utf-8") != std::string::npos || cs == "utf8") return html;
+    if (cs.find("8859-1") != std::string::npos || cs == "latin1" ||
+        cs.find("1252") != std::string::npos || cs.find("ascii") != std::string::npos) {
+        return win1252ToUtf8(html);
+    }
+    return html; // unknown encoding: leave as-is
+}
+
+// Fetch a URL, following redirects (301/302/303/307/308) and decoding the body
+// (chunked + gzip/deflate). outFinal receives the final URL so relative links
+// and subresources resolve against it. If outHeaders is non-null it gets the
+// final response's header block.
+static std::string httpFetchProcessed(Url u, Url& outFinal, std::string* outHeaders) {
+    netInit();
+    std::string lastHeaders;
+    try {
+        std::string body;
+        for (int hop = 0; hop < 10; ++hop) {
+            std::string raw = (u.scheme == "https") ? httpsGetRaw(u) : httpGetRaw(u);
+            HttpParts parts = splitHeadersBody(raw);
+            lastHeaders = parts.headers;
+
+            int status = parseStatusCode(parts.headers);
+            if (status >= 300 && status < 400) {
+                std::string loc = headerValueCI(parts.headers, "location");
+                if (!loc.empty()) {
+                    std::string abs = resolveHref(u, loc);
+                    if (abs.empty()) abs = loc;
+                    u = parseUrl(normalizeUserUrl(abs));
+                    continue;
+                }
+            }
+
+            body = parts.body;
+            if (headerContainsCI(parts.headers, "transfer-encoding: chunked"))
+                body = decodeChunkedBody(body);
+            body = maybeDecompress(parts.headers, body);
+            break;
+        }
+        netCleanup();
+        outFinal = u;
+        if (outHeaders) *outHeaders = lastHeaders;
+        return body;
+    } catch (...) {
+        netCleanup();
+        outFinal = u;
+        if (outHeaders) *outHeaders = lastHeaders;
+        throw;
+    }
 }
 
 // -------------------- HTML helpers --------------------
@@ -961,12 +1143,9 @@ static int defaultBreakCountForTag(const std::string& tagNameLower) {
 static std::string fetchSubresourceBytes(const std::string& absUrl) {
     try {
         Url u = parseUrl(absUrl);
-        netInit();
-        std::string raw = (u.scheme == "https") ? httpsGetRaw(u) : httpGetRaw(u);
-        netCleanup();
-        return extractBodyBytes(raw);
+        Url finalU;
+        return httpFetchProcessed(u, finalU, nullptr); // follows redirects + decompresses
     } catch (...) {
-        netCleanup();
         return "";
     }
 }
@@ -3622,15 +3801,14 @@ struct Page {
 
 static std::string loadPageBodyText(const std::string& urlString, Url& outUrl) {
     std::string normalized = normalizeUserUrl(urlString);
-    outUrl = parseUrl(normalized);
+    Url u = parseUrl(normalized);
+    outUrl = u;
 
     try {
-        netInit();
-        std::string raw = (outUrl.scheme == "https") ? httpsGetRaw(outUrl) : httpGetRaw(outUrl);
-        netCleanup();
-        return extractBodyBytes(raw);
+        std::string headers;
+        std::string body = httpFetchProcessed(u, outUrl, &headers); // redirects + gzip
+        return decodeHtmlToUtf8(headers, body);
     } catch (const std::exception& ex) {
-        netCleanup();
         return std::string("<h2>Network error</h2><p>") + ex.what() + "</p>";
     }
 }

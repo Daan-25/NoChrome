@@ -7,7 +7,7 @@ The current implementation is an early prototype of the rendering and UI pipelin
 
 ## Current Features
 - Windowed GUI with tabs (Ctrl+T new tab, Ctrl+W close tab, Ctrl+L focus address bar)
-- HTTP and HTTPS page loading (OpenSSL) with chunked transfer decoding
+- HTTP and HTTPS page loading (OpenSSL): redirects (301/302/303/307/308), chunked transfer, gzip/deflate decompression, and legacy-charset (iso-8859-1/windows-1252) → UTF-8
 - HTML-to-text rendering with inline images (PNG/JPEG via SDL2_image)
 - Clickable links and trackpad-friendly scrolling
 - CSS support (early v0.x)

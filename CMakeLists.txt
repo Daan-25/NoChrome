@@ -17,6 +17,7 @@ pkg_check_modules(SDL2_TTF REQUIRED SDL2_ttf)
 pkg_check_modules(SDL2_IMAGE REQUIRED SDL2_image)
 
 find_package(OpenSSL REQUIRED)
+find_package(ZLIB REQUIRED)
 
 option(NOCHROME_ENABLE_JS "Enable JavaScript support" ON)
 option(NOCHROME_FORCE_JSC "Use JavaScriptCore (WebKitGTK) instead of QuickJS on non-Apple platforms" OFF)
@@ -47,6 +48,7 @@ target_link_libraries(NoChrome PRIVATE
   ${SDL2_IMAGE_LIBRARIES}
   OpenSSL::SSL
   OpenSSL::Crypto
+  ZLIB::ZLIB
 )
 
 if(NOCHROME_ENABLE_JS)
