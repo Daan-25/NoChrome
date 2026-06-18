@@ -8,24 +8,24 @@ The current implementation is an early prototype of the rendering and UI pipelin
 ## Current Features
 - Windowed GUI with tabs (Ctrl+T new tab, Ctrl+W close tab, Ctrl+L focus address bar)
 - HTTP and HTTPS page loading (OpenSSL): redirects (301/302/303/307/308), chunked transfer, gzip/deflate decompression, and legacy-charset (iso-8859-1/windows-1252) → UTF-8
-- HTML-to-text rendering with inline images (PNG/JPEG via SDL2_image)
+- HTML rendering with a block box model (margins, padding, borders, backgrounds, width, text-align) and inline images (PNG/JPEG via SDL2_image)
 - Clickable links and trackpad-friendly scrolling
 - CSS support (early v0.x)
-  - tag, class, id and `tag.class` selectors, comma groups, inline styles
-  - external stylesheets (`<link rel="stylesheet">`)
-  - properties: `color`, `font-size`, `font-weight`, page `background`
+  - tag, class, id and `tag.class` selectors, comma groups, inline styles, external stylesheets
+  - text: `color`, `font-size`, `font-weight`
+  - box: `margin`, `padding`, `border`, `background-color`, `width` (px/%, `margin: auto`), `text-align`, `display: none`
 - JavaScript support (JavaScriptCore on macOS, QuickJS elsewhere)
   - `console`, `alert`, `performance.now`, `setTimeout`/`clearTimeout`, `fetch` (Promise + `.then`)
-  - DOM: `getElementById`, `querySelector("#id")`, `createElement`, `document.body`/`head`,
-    `textContent`/`innerHTML`, `style.display`, `setAttribute`/`getAttribute`, `appendChild`
+  - DOM: `getElementById`, `querySelector` (`#id`/`.class`/tag), `createElement`, `document.body`/`head`,
+    `textContent`/`innerHTML`, `style.display`, `setAttribute`/`getAttribute`, `appendChild`/`removeChild`, `parentNode`
   - events: `window`/`document`/element `addEventListener` with `click` and `keydown` dispatch
 
 ## Limitations (Current Stage)
-- No full DOM tree or box model layout (line-based rendering; HTML parsed best-effort)
-- DOM mutations are applied to a backing HTML string, not a live tree
+- Block-level box model only (no inline boxes, floats, flexbox/grid; tables stack as blocks)
+- Single-pass layout (no margin collapsing); CSS is a small subset
 - JavaScript is a useful subset, not a complete engine integration:
   - no ES module loading, event bubbling, or `removeEventListener`
-  - `querySelector` supports only `#id`
+  - `querySelector` takes a single simple selector (no combinators)
   - a single shared JS context (multi-tab JS is not isolated)
 - No form controls / input widgets yet
 
@@ -42,6 +42,7 @@ The current implementation is an early prototype of the rendering and UI pipelin
 .
 ├── CMakeLists.txt
 ├── main.cpp
+├── dom.h
 ├── fonts/
 │   └── DejaVuSans.ttf
 └── README.md
