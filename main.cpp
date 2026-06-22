@@ -1730,10 +1730,12 @@ static void jsInstallBaseGlobals(JsEngine& js) {
     JSObjectSetProperty(js.ctx, global, windowName, global, kJSPropertyAttributeNone, nullptr);
     JSStringRelease(windowName);
 
-    // self = global (common in browsers and workers)
-    JSStringRef selfName = JSStringCreateWithUTF8CString("self");
-    JSObjectSetProperty(js.ctx, global, selfName, global, kJSPropertyAttributeNone, nullptr);
-    JSStringRelease(selfName);
+    // self / top / parent / frames all refer to the window (no frames).
+    for (const char* nm : { "self", "top", "parent", "frames" }) {
+        JSStringRef n = JSStringCreateWithUTF8CString(nm);
+        JSObjectSetProperty(js.ctx, global, n, global, kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(n);
+    }
 
     // performance.now()
     JSObjectRef perfObj = JSObjectMake(js.ctx, nullptr, nullptr);
@@ -3185,9 +3187,10 @@ static void jsResetContext(JsEngine& js) {
 
     JSValue global = JS_GetGlobalObject(js.ctx);
 
-    // window === self === global
-    JS_SetPropertyStr(js.ctx, global, "window", JS_DupValue(js.ctx, global));
-    JS_SetPropertyStr(js.ctx, global, "self", JS_DupValue(js.ctx, global));
+    // window / self / top / parent / frames all refer to the global (no frames).
+    for (const char* nm : { "window", "self", "top", "parent", "frames" }) {
+        JS_SetPropertyStr(js.ctx, global, nm, JS_DupValue(js.ctx, global));
+    }
 
     // console.log / error / warn / info
     JSValue consoleObj = JS_NewObject(js.ctx);
