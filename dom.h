@@ -119,6 +119,26 @@ static int domFindByClass(const DomTree& dom, int start, const std::string& cls)
     return -1;
 }
 
+// Collect all element ids whose tag matches (or "*" for every element).
+static void domCollectByTag(const DomTree& dom, int start, const std::string& tag, std::vector<int>& out) {
+    const DomNode* n = dom.get(start);
+    if (!n) return;
+    if (n->type == DomNodeType::Element && n->tag != "#root" && (tag == "*" || n->tag == tag))
+        out.push_back(start);
+    for (int c : n->children) domCollectByTag(dom, c, tag, out);
+}
+
+static void domCollectByClass(const DomTree& dom, int start, const std::string& cls, std::vector<int>& out) {
+    const DomNode* n = dom.get(start);
+    if (!n) return;
+    if (n->type == DomNodeType::Element) {
+        for (auto& c : parseClassList(domGetAttr(*n, "class"))) {
+            if (c == cls) { out.push_back(start); break; }
+        }
+    }
+    for (int c : n->children) domCollectByClass(dom, c, cls, out);
+}
+
 static int domFindOrCreateTag(DomTree& dom, const std::string& tag) {
     int id = domFindByTag(dom, dom.root, tag);
     if (id >= 0) return id;
