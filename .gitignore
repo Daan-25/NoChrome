@@ -1,5 +1,6 @@
 # ===== CMake build folders =====
 build/
+build-jsc/
 cmake-build-*/
 out/
 dist/

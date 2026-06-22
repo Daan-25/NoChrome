@@ -6,8 +6,19 @@
 #include <openssl/err.h>
 
 #ifdef NOCHROME_ENABLE_JS
+
+// Choose the JavaScript engine: JavaScriptCore on macOS (or when explicitly
+// forced, e.g. WebKitGTK's JSC for testing on Linux); QuickJS otherwise.
+#if defined(__APPLE__) || defined(NOCHROME_FORCE_JSC)
+#define NOCHROME_USE_JSC 1
+#endif
+
+#if defined(NOCHROME_USE_JSC)
 #if defined(__APPLE__)
 #include <JavaScriptCore/JavaScriptCore.h>
+#else
+#include <JavaScriptCore/JavaScript.h>
+#endif
 #else
 extern "C" {
 #if __has_include(<quickjs.h>)
@@ -34,6 +45,8 @@ extern "C" {
 #include <regex>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
+#include <zlib.h>
 
 // --------- Networking (POSIX + basic Windows support) ----------
 #ifdef _WIN32
@@ -266,6 +279,7 @@ static std::string httpGetRaw(const Url& u) {
         << "Host: " << hostHeaderValue(u) << "\r\n"
         << "User-Agent: NoChrome/0.8\r\n"
         << "Accept: */*\r\n"
+        << "Accept-Encoding: gzip, deflate\r\n"
         << "Connection: close\r\n\r\n";
 
     std::string request = req.str();
@@ -357,6 +371,7 @@ static std::string httpsGetRaw(const Url& u) {
             << "Host: " << hostHeaderValue(u) << "\r\n"
             << "User-Agent: NoChrome/0.8\r\n"
             << "Accept: */*\r\n"
+            << "Accept-Encoding: gzip, deflate\r\n"
             << "Connection: close\r\n\r\n";
 
         std::string request = req.str();
@@ -475,6 +490,184 @@ static std::string extractBodyBytes(const std::string& rawResponse) {
         return decodeChunkedBody(parts.body);
     }
     return parts.body;
+}
+
+// -------------------- HTTP headers / compression / charset / redirects --------------------
+
+// Case-insensitive lookup of a single header value in a raw header block.
+static std::string headerValueCI(const std::string& headers, const std::string& nameLower) {
+    std::istringstream iss(headers);
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        if (toLowerCopy(trimCopy(line.substr(0, colon))) == nameLower) {
+            return trimCopy(line.substr(colon + 1));
+        }
+    }
+    return "";
+}
+
+// Numeric status code from the HTTP status line ("HTTP/1.1 301 ...").
+static int parseStatusCode(const std::string& headers) {
+    size_t eol = headers.find("\r\n");
+    std::string status = (eol == std::string::npos) ? headers : headers.substr(0, eol);
+    size_t sp = status.find(' ');
+    if (sp == std::string::npos) return 0;
+    size_t p = sp + 1;
+    while (p < status.size() && status[p] == ' ') p++;
+    int code = 0;
+    while (p < status.size() && std::isdigit((unsigned char)status[p])) {
+        code = code * 10 + (status[p] - '0');
+        p++;
+    }
+    return code;
+}
+
+// Inflate gzip/zlib/raw-deflate. windowBits: 47 = auto-detect gzip|zlib header,
+// -MAX_WBITS = raw deflate (no header).
+static bool zinflateInto(const std::string& in, std::string& out, int windowBits) {
+    if (in.empty()) return false;
+    z_stream zs = {};
+    if (inflateInit2(&zs, windowBits) != Z_OK) return false;
+
+    zs.next_in = (Bytef*)in.data();
+    zs.avail_in = (uInt)in.size();
+
+    char buf[16384];
+    int ret = Z_OK;
+    do {
+        zs.next_out = (Bytef*)buf;
+        zs.avail_out = sizeof(buf);
+        ret = inflate(&zs, Z_NO_FLUSH);
+        if (ret != Z_OK && ret != Z_STREAM_END) { inflateEnd(&zs); return false; }
+        out.append(buf, sizeof(buf) - zs.avail_out);
+    } while (ret != Z_STREAM_END);
+
+    inflateEnd(&zs);
+    return true;
+}
+
+static std::string maybeDecompress(const std::string& headers, const std::string& body) {
+    std::string enc = toLowerCopy(headerValueCI(headers, "content-encoding"));
+    if (enc.empty() || enc == "identity") return body;
+    if (enc.find("gzip") == std::string::npos && enc.find("deflate") == std::string::npos)
+        return body;
+
+    std::string out;
+    if (zinflateInto(body, out, 47)) return out;          // gzip or zlib (auto-detect)
+    out.clear();
+    if (zinflateInto(body, out, -MAX_WBITS)) return out;  // raw deflate fallback
+    return body;                                          // could not inflate
+}
+
+static void appendUtf8(std::string& out, unsigned cp) {
+    if (cp < 0x80) {
+        out.push_back((char)cp);
+    } else if (cp < 0x800) {
+        out.push_back((char)(0xC0 | (cp >> 6)));
+        out.push_back((char)(0x80 | (cp & 0x3F)));
+    } else {
+        out.push_back((char)(0xE0 | (cp >> 12)));
+        out.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back((char)(0x80 | (cp & 0x3F)));
+    }
+}
+
+// Windows-1252 (also used for iso-8859-1 / latin1, per the HTML standard) -> UTF-8.
+static std::string win1252ToUtf8(const std::string& in) {
+    static const unsigned hi[32] = {
+        0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+        0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+        0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+        0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178
+    };
+    std::string out;
+    out.reserve(in.size());
+    for (unsigned char c : in) {
+        if (c < 0x80) out.push_back((char)c);
+        else if (c < 0xA0) appendUtf8(out, hi[c - 0x80]);
+        else appendUtf8(out, c); // 0xA0-0xFF map 1:1 to U+00A0-U+00FF
+    }
+    return out;
+}
+
+static std::string charsetFromContentType(const std::string& headers) {
+    std::string ct = toLowerCopy(headerValueCI(headers, "content-type"));
+    size_t cs = ct.find("charset=");
+    if (cs == std::string::npos) return "";
+    std::string v = ct.substr(cs + 8);
+    size_t e = v.find_first_of("; \t\"'");
+    if (e != std::string::npos) v = v.substr(0, e);
+    return trimCopy(v);
+}
+
+static std::string charsetFromMeta(const std::string& html) {
+    std::string head = toLowerCopy(html.substr(0, std::min<size_t>(html.size(), 2048)));
+    size_t cs = head.find("charset=");
+    if (cs == std::string::npos) return "";
+    std::string v = head.substr(cs + 8);
+    if (!v.empty() && (v[0] == '"' || v[0] == '\'')) v = v.substr(1);
+    size_t e = v.find_first_of("; \t\"'>/");
+    if (e != std::string::npos) v = v.substr(0, e);
+    return trimCopy(v);
+}
+
+// Best-effort: convert an HTML document to UTF-8 if it declares a legacy charset.
+static std::string decodeHtmlToUtf8(const std::string& headers, const std::string& html) {
+    std::string cs = charsetFromContentType(headers);
+    if (cs.empty()) cs = charsetFromMeta(html);
+    cs = toLowerCopy(cs);
+    if (cs.empty() || cs.find("utf-8") != std::string::npos || cs == "utf8") return html;
+    if (cs.find("8859-1") != std::string::npos || cs == "latin1" ||
+        cs.find("1252") != std::string::npos || cs.find("ascii") != std::string::npos) {
+        return win1252ToUtf8(html);
+    }
+    return html; // unknown encoding: leave as-is
+}
+
+// Fetch a URL, following redirects (301/302/303/307/308) and decoding the body
+// (chunked + gzip/deflate). outFinal receives the final URL so relative links
+// and subresources resolve against it. If outHeaders is non-null it gets the
+// final response's header block.
+static std::string httpFetchProcessed(Url u, Url& outFinal, std::string* outHeaders) {
+    netInit();
+    std::string lastHeaders;
+    try {
+        std::string body;
+        for (int hop = 0; hop < 10; ++hop) {
+            std::string raw = (u.scheme == "https") ? httpsGetRaw(u) : httpGetRaw(u);
+            HttpParts parts = splitHeadersBody(raw);
+            lastHeaders = parts.headers;
+
+            int status = parseStatusCode(parts.headers);
+            if (status >= 300 && status < 400) {
+                std::string loc = headerValueCI(parts.headers, "location");
+                if (!loc.empty()) {
+                    std::string abs = resolveHref(u, loc);
+                    if (abs.empty()) abs = loc;
+                    u = parseUrl(normalizeUserUrl(abs));
+                    continue;
+                }
+            }
+
+            body = parts.body;
+            if (headerContainsCI(parts.headers, "transfer-encoding: chunked"))
+                body = decodeChunkedBody(body);
+            body = maybeDecompress(parts.headers, body);
+            break;
+        }
+        netCleanup();
+        outFinal = u;
+        if (outHeaders) *outHeaders = lastHeaders;
+        return body;
+    } catch (...) {
+        netCleanup();
+        outFinal = u;
+        if (outHeaders) *outHeaders = lastHeaders;
+        throw;
+    }
 }
 
 // -------------------- HTML helpers --------------------
@@ -643,6 +836,17 @@ struct StyleRule {
     std::optional<bool> bold;
 
     std::optional<SDL_Color> backgroundColor;
+
+    // Box-model properties (block-level).
+    std::optional<int> marginTop, marginRight, marginBottom, marginLeft;
+    std::optional<bool> marginAuto;          // margin-left/right: auto -> centering
+    std::optional<int> padTop, padRight, padBottom, padLeft;
+    std::optional<int> borderW;
+    std::optional<SDL_Color> borderColor;
+    std::optional<int> width;                // content width, px
+    std::optional<int> widthPct;             // width as a percentage
+    std::optional<int> textAlign;            // 0 left, 1 center, 2 right
+    std::optional<bool> displayNone;
 };
 
 static std::optional<SDL_Color> parseColor(const std::string& raw) {
@@ -710,6 +914,38 @@ static std::optional<int> parseFontSizePx(const std::string& raw) {
     }
 }
 
+// Parse a CSS length to integer pixels. nullopt for auto / percent / unknown.
+static std::optional<int> cssLenPx(const std::string& raw) {
+    std::string v = trimCopy(toLowerCopy(raw));
+    if (v.empty() || v == "auto") return std::nullopt;
+    if (!v.empty() && v.back() == '%') return std::nullopt;
+    if (endsWith(v, "px")) v = trimCopy(v.substr(0, v.size() - 2));
+    try {
+        size_t used = 0;
+        double d = std::stod(v, &used);
+        return std::max(0, (int)std::lround(d));
+    } catch (...) { return std::nullopt; }
+}
+
+// Expand a 1-4 value box shorthand into top/right/bottom/left.
+static void cssExpandBox(const std::string& val,
+                         std::optional<int>& top, std::optional<int>& right,
+                         std::optional<int>& bottom, std::optional<int>& left,
+                         bool* anyAuto) {
+    std::istringstream iss(toLowerCopy(trimCopy(val)));
+    std::vector<std::string> toks; std::string t;
+    while (iss >> t) toks.push_back(t);
+    if (toks.empty()) return;
+    auto px = [&](const std::string& s) -> std::optional<int> {
+        if (s == "auto") { if (anyAuto) *anyAuto = true; return std::nullopt; }
+        return cssLenPx(s);
+    };
+    if (toks.size() == 1)      { auto a = px(toks[0]); top = right = bottom = left = a; }
+    else if (toks.size() == 2) { auto v = px(toks[0]); auto h = px(toks[1]); top = bottom = v; right = left = h; }
+    else if (toks.size() == 3) { top = px(toks[0]); right = left = px(toks[1]); bottom = px(toks[2]); }
+    else                       { top = px(toks[0]); right = px(toks[1]); bottom = px(toks[2]); left = px(toks[3]); }
+}
+
 static void applyDeclarationsToRule(StyleRule& rule, const std::string& declsRaw) {
     auto parts = splitBy(declsRaw, ';');
     for (auto& p : parts) {
@@ -732,6 +968,46 @@ static void applyDeclarationsToRule(StyleRule& rule, const std::string& declsRaw
         } else if (key == "background-color" || key == "background") {
             auto c = parseColor(val);
             if (c) rule.backgroundColor = *c;
+        } else if (key == "margin") {
+            bool a = false;
+            cssExpandBox(val, rule.marginTop, rule.marginRight, rule.marginBottom, rule.marginLeft, &a);
+            if (a) rule.marginAuto = true;
+        } else if (key == "margin-top")    rule.marginTop = cssLenPx(val);
+        else if (key == "margin-right")    rule.marginRight = cssLenPx(val);
+        else if (key == "margin-bottom")   rule.marginBottom = cssLenPx(val);
+        else if (key == "margin-left")     rule.marginLeft = cssLenPx(val);
+        else if (key == "padding") {
+            cssExpandBox(val, rule.padTop, rule.padRight, rule.padBottom, rule.padLeft, nullptr);
+        }
+        else if (key == "padding-top")     rule.padTop = cssLenPx(val);
+        else if (key == "padding-right")   rule.padRight = cssLenPx(val);
+        else if (key == "padding-bottom")  rule.padBottom = cssLenPx(val);
+        else if (key == "padding-left")    rule.padLeft = cssLenPx(val);
+        else if (key == "border" || key == "border-width") {
+            std::istringstream iss(toLowerCopy(val)); std::string tk;
+            while (iss >> tk) {
+                auto w = cssLenPx(tk);
+                if (w) rule.borderW = *w;
+                else { auto c = parseColor(tk); if (c) rule.borderColor = *c; }
+            }
+            if (key == "border" && !rule.borderW) rule.borderW = 1;
+        }
+        else if (key == "border-color") { auto c = parseColor(val); if (c) rule.borderColor = *c; }
+        else if (key == "width") {
+            std::string v = trimCopy(toLowerCopy(val));
+            if (!v.empty() && v.back() == '%') {
+                try { rule.widthPct = std::clamp((int)std::lround(std::stod(v.substr(0, v.size() - 1))), 0, 100); }
+                catch (...) {}
+            } else { auto w = cssLenPx(val); if (w) rule.width = *w; }
+        }
+        else if (key == "text-align") {
+            std::string v = trimCopy(toLowerCopy(val));
+            if (v == "center") rule.textAlign = 1;
+            else if (v == "right") rule.textAlign = 2;
+            else if (v == "left") rule.textAlign = 0;
+        }
+        else if (key == "display") {
+            rule.displayNone = (trimCopy(toLowerCopy(val)) == "none");
         }
     }
 }
@@ -892,6 +1168,62 @@ static void applyRulesForElement(const std::vector<StyleRule>& rules,
     }
 }
 
+// -------------------- CSS box model --------------------
+
+struct BoxStyle {
+    int mTop = 0, mRight = 0, mBottom = 0, mLeft = 0;
+    bool marginAuto = false;
+    int pTop = 0, pRight = 0, pBottom = 0, pLeft = 0;
+    int borderW = 0;
+    SDL_Color borderColor {120, 120, 120, 255};
+    bool hasBg = false;
+    SDL_Color bg {0, 0, 0, 0};
+    int width = -1;      // content width in px, -1 = auto
+    int widthPct = -1;   // width as %, -1 = none
+    int textAlign = -1;  // -1 inherit, 0 left, 1 center, 2 right
+    bool displayNone = false;
+};
+
+// Approximate browser default block margins/padding (px).
+static void applyBoxDefaults(const std::string& tag, BoxStyle& b) {
+    if (tag == "h1") { b.mTop = b.mBottom = 22; }
+    else if (tag == "h2") { b.mTop = b.mBottom = 18; }
+    else if (tag == "h3" || tag == "h4") { b.mTop = b.mBottom = 16; }
+    else if (tag == "p") { b.mTop = b.mBottom = 14; }
+    else if (tag == "ul" || tag == "ol") { b.mTop = b.mBottom = 14; b.pLeft = 32; }
+    else if (tag == "blockquote" || tag == "figure") { b.mTop = b.mBottom = 14; b.mLeft = b.mRight = 32; }
+    else if (tag == "pre") { b.mTop = b.mBottom = 12; }
+    else if (tag == "hr") { b.mTop = b.mBottom = 10; b.borderW = 1; b.borderColor = SDL_Color{180,180,180,255}; }
+}
+
+static void applyBoxRuleProps(const StyleRule& r, BoxStyle& b) {
+    if (r.marginTop) b.mTop = *r.marginTop;
+    if (r.marginRight) b.mRight = *r.marginRight;
+    if (r.marginBottom) b.mBottom = *r.marginBottom;
+    if (r.marginLeft) b.mLeft = *r.marginLeft;
+    if (r.marginAuto) b.marginAuto = *r.marginAuto;
+    if (r.padTop) b.pTop = *r.padTop;
+    if (r.padRight) b.pRight = *r.padRight;
+    if (r.padBottom) b.pBottom = *r.padBottom;
+    if (r.padLeft) b.pLeft = *r.padLeft;
+    if (r.borderW) b.borderW = *r.borderW;
+    if (r.borderColor) b.borderColor = *r.borderColor;
+    if (r.backgroundColor) { b.hasBg = true; b.bg = *r.backgroundColor; }
+    if (r.width) { b.width = *r.width; b.widthPct = -1; }
+    if (r.widthPct) { b.widthPct = *r.widthPct; b.width = -1; }
+    if (r.textAlign) b.textAlign = *r.textAlign;
+    if (r.displayNone) b.displayNone = *r.displayNone;
+}
+
+static void applyBoxRulesForElement(const std::vector<StyleRule>& rules,
+                                    const std::string& tag, const std::string& id,
+                                    const std::vector<std::string>& classes, BoxStyle& b) {
+    for (const auto& r : rules) if (r.type == SelectorType::Tag && r.tag == tag) applyBoxRuleProps(r, b);
+    for (const auto& r : rules) if (r.type == SelectorType::Class && hasClass(classes, r.cls)) applyBoxRuleProps(r, b);
+    for (const auto& r : rules) if (r.type == SelectorType::TagClass && r.tag == tag && hasClass(classes, r.cls)) applyBoxRuleProps(r, b);
+    for (const auto& r : rules) if (r.type == SelectorType::Id && !id.empty() && r.id == id) applyBoxRuleProps(r, b);
+}
+
 // -------------------- Tokens --------------------
 
 enum class TokenKind { Word, Break, Image };
@@ -902,6 +1234,8 @@ struct StyledToken {
     std::string href;
     TextStyle style;
     int breakCount = 1;
+
+    std::string elementId; // nearest ancestor element id (for click routing)
 
     // Image
     std::string imgSrcAbs;
@@ -948,12 +1282,9 @@ static int defaultBreakCountForTag(const std::string& tagNameLower) {
 static std::string fetchSubresourceBytes(const std::string& absUrl) {
     try {
         Url u = parseUrl(absUrl);
-        netInit();
-        std::string raw = (u.scheme == "https") ? httpsGetRaw(u) : httpGetRaw(u);
-        netCleanup();
-        return extractBodyBytes(raw);
+        Url finalU;
+        return httpFetchProcessed(u, finalU, nullptr); // follows redirects + decompresses
     } catch (...) {
-        netCleanup();
         return "";
     }
 }
@@ -971,16 +1302,16 @@ static std::string extractTitleFromHtmlSimple(const std::string& html) {
 }
 
 #ifdef NOCHROME_ENABLE_JS
-#if defined(__APPLE__)
+#include "dom.h"
+#if defined(NOCHROME_USE_JSC)
 // -------------------- JavaScript (JavaScriptCore) --------------------
 
 struct JsHost {
     SDL_Window* window = nullptr;
     std::string currentUrl;
 
-    // Minimal DOM state used by JS stubs
-    std::unordered_set<std::string> domIds;
-    std::unordered_map<std::string, std::string> styleDisplayById; // id -> display value (e.g. "none")
+    // Real DOM tree (source of truth); the renderer walks it directly.
+    DomTree dom;
     bool domDirty = false;
 
     // --- Realistic-ish JS plumbing (minimal) ---
@@ -998,9 +1329,7 @@ struct JsHost {
     // Event listeners keyed by scope+type, e.g. "window:keydown", "document:DOMContentLoaded", "el:myid:click"
     std::unordered_map<std::string, std::vector<JSObjectRef>> listeners; // protected
 
-    // Best-effort "DOM" backing store: we mutate this HTML string and re-render when domDirty flips.
     Url baseUrl;
-    std::string domHtml;
 
     std::chrono::steady_clock::time_point perfStart = std::chrono::steady_clock::now();
 };
@@ -1041,7 +1370,7 @@ static JSValueRef jscConsoleLog(JSContextRef ctx, JSObjectRef /*function*/, JSOb
         std::cout << jsToUtf8(ctx, argv[i]);
         if (i + 1 < argc) std::cout << " ";
     }
-    std::cout << "\n";
+    std::cout << std::endl;
     return JSValueMakeUndefined(ctx);
 }
 
@@ -1495,14 +1824,11 @@ static std::vector<ScriptItem> extractScriptsSimple(const std::string& html, con
 // -------------------- Minimal DOM stubs (id map + style.display) --------------------
 
 struct JscElementPriv {
-    std::string id;
-    std::string tagName;
-    std::unordered_map<std::string, std::string> attrs;
-    std::string text;
+    int nodeId = -1; // index into JsHost::dom
 };
 
 struct JscStylePriv {
-    std::string id;
+    int nodeId = -1; // element this style belongs to
 };
 
 static JSClassRef g_jscElementClass = nullptr;
@@ -1527,17 +1853,28 @@ static void jscFinalizeStyle(JSObjectRef object) {
     delete priv;
 }
 
+static DomNode* jscElNode(JSObjectRef object) {
+    auto* priv = (JscElementPriv*)JSObjectGetPrivate(object);
+    if (!priv || !g_jsHost) return nullptr;
+    return g_jsHost->dom.get(priv->nodeId);
+}
+
+static int jscElNodeId(JSObjectRef object) {
+    auto* priv = (JscElementPriv*)JSObjectGetPrivate(object);
+    return priv ? priv->nodeId : -1;
+}
+
 static JSValueRef jscStyleGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef* /*exception*/) {
     auto* priv = (JscStylePriv*)JSObjectGetPrivate(object);
     if (!priv || !g_jsHost) return JSValueMakeUndefined(ctx);
 
     std::string prop = jsStringToUtf8(propertyName);
     if (prop == "display") {
-        auto it = g_jsHost->styleDisplayById.find(priv->id);
-        if (it == g_jsHost->styleDisplayById.end()) return JSValueMakeUndefined(ctx);
-        JSStringRef v = JSStringCreateWithUTF8CString(it->second.c_str());
-        JSValueRef vStr = JSValueMakeString(ctx, v);
-        JSStringRelease(v);
+        DomNode* n = g_jsHost->dom.get(priv->nodeId);
+        std::string v = n ? n->styleDisplay : "";
+        JSStringRef s = JSStringCreateWithUTF8CString(v.c_str());
+        JSValueRef vStr = JSValueMakeString(ctx, s);
+        JSStringRelease(s);
         return vStr;
     }
 
@@ -1550,9 +1887,10 @@ static bool jscStyleSetProperty(JSContextRef ctx, JSObjectRef object, JSStringRe
 
     std::string prop = jsStringToUtf8(propertyName);
     if (prop == "display") {
-        std::string v = jsToUtf8(ctx, value);
-        g_jsHost->styleDisplayById[priv->id] = v;
-        g_jsHost->domDirty = true;
+        if (DomNode* n = g_jsHost->dom.get(priv->nodeId)) {
+            n->styleDisplay = jsToUtf8(ctx, value);
+            g_jsHost->domDirty = true;
+        }
         return true;
     }
 
@@ -1560,7 +1898,7 @@ static bool jscStyleSetProperty(JSContextRef ctx, JSObjectRef object, JSStringRe
 }
 
 
-#if defined(__APPLE__)
+#if defined(NOCHROME_USE_JSC)
 // Forward declarations for element methods used by the property getter.
 static JSValueRef jscElementAddEventListener(JSContextRef ctx, JSObjectRef function,
                                              JSObjectRef thisObject, size_t argumentCount,
@@ -1568,92 +1906,93 @@ static JSValueRef jscElementAddEventListener(JSContextRef ctx, JSObjectRef funct
 static JSValueRef jscElementAppendChild(JSContextRef ctx, JSObjectRef function,
                                        JSObjectRef thisObject, size_t argumentCount,
                                        const JSValueRef arguments[], JSValueRef* exception);
+static JSValueRef jscElementRemoveChild(JSContextRef ctx, JSObjectRef function,
+                                        JSObjectRef thisObject, size_t argumentCount,
+                                        const JSValueRef arguments[], JSValueRef* exception);
 static JSValueRef jscElementSetAttribute(JSContextRef ctx, JSObjectRef function,
+                                        JSObjectRef thisObject, size_t argumentCount,
+                                        const JSValueRef arguments[], JSValueRef* exception);
+static JSValueRef jscElementGetAttribute(JSContextRef ctx, JSObjectRef function,
                                         JSObjectRef thisObject, size_t argumentCount,
                                         const JSValueRef arguments[], JSValueRef* exception);
 #endif
 
 static JSValueRef jscElementGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef* /*exception*/) {
-    auto* priv = (JscElementPriv*)JSObjectGetPrivate(object);
-    if (!priv) return JSValueMakeUndefined(ctx);
+    DomNode* n = jscElNode(object);
+    if (!n) return nullptr; // not our element: fall through to normal lookup
 
     std::string prop = jsStringToUtf8(propertyName);
+    int nid = jscElNodeId(object);
 
-    if (prop == "id") {
-        JSStringRef v = JSStringCreateWithUTF8CString(priv->id.c_str());
-        JSValueRef vStr = JSValueMakeString(ctx, v);
+    auto makeStr = [&](const std::string& s) -> JSValueRef {
+        JSStringRef v = JSStringCreateWithUTF8CString(s.c_str());
+        JSValueRef r = JSValueMakeString(ctx, v);
         JSStringRelease(v);
-        return vStr;
-    }
+        return r;
+    };
+    auto makeFn = [&](const char* name, JSObjectCallAsFunctionCallback cb) -> JSValueRef {
+        JSStringRef nm = JSStringCreateWithUTF8CString(name);
+        JSObjectRef fn = JSObjectMakeFunctionWithCallback(ctx, nm, cb);
+        JSStringRelease(nm);
+        return fn;
+    };
+
+    if (prop == "id")        return makeStr(domGetAttr(*n, "id"));
+    if (prop == "tagName")   return makeStr(n->tag.empty() ? "DIV" : toUpperCopy(n->tag));
+    if (prop == "textContent" || prop == "innerText")
+        return makeStr(domTextContent(g_jsHost->dom, nid));
+    if (prop == "innerHTML") return makeStr(domSerializeChildren(g_jsHost->dom, nid));
+    if (prop == "className") return makeStr(domGetAttr(*n, "class"));
+    if (prop == "src" || prop == "href" || prop == "type" || prop == "value" || prop == "name")
+        return makeStr(domGetAttr(*n, prop));
 
     if (prop == "style") {
-        // Create a style object bound to this element id
-        JSObjectRef styleObj = JSObjectMake(ctx, g_jscStyleClass, new JscStylePriv{priv->id});
-        return styleObj;
+        return JSObjectMake(ctx, g_jscStyleClass, new JscStylePriv{ nid });
+    }
+    if (prop == "parentNode") {
+        if (n->parent < 0 || n->parent == g_jsHost->dom.root) return JSValueMakeNull(ctx);
+        return JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ n->parent });
     }
 
+    if (prop == "addEventListener") return makeFn("addEventListener", jscElementAddEventListener);
+    if (prop == "appendChild")      return makeFn("appendChild", jscElementAppendChild);
+    if (prop == "removeChild")      return makeFn("removeChild", jscElementRemoveChild);
+    if (prop == "setAttribute")     return makeFn("setAttribute", jscElementSetAttribute);
+    if (prop == "getAttribute")     return makeFn("getAttribute", jscElementGetAttribute);
 
-    if (prop == "tagName") {
-        std::string tn = priv->tagName.empty() ? "DIV" : toUpperCopy(priv->tagName);
-        JSStringRef v = JSStringCreateWithUTF8CString(tn.c_str());
-        JSValueRef vStr = JSValueMakeString(ctx, v);
-        JSStringRelease(v);
-        return vStr;
-    }
-
-    if (prop == "addEventListener") {
-        JSStringRef n = JSStringCreateWithUTF8CString("addEventListener");
-        JSObjectRef fn = JSObjectMakeFunctionWithCallback(ctx, n, jscElementAddEventListener);
-        JSStringRelease(n);
-        return fn;
-    }
-
-    if (prop == "appendChild") {
-        JSStringRef n = JSStringCreateWithUTF8CString("appendChild");
-        JSObjectRef fn = JSObjectMakeFunctionWithCallback(ctx, n, jscElementAppendChild);
-        JSStringRelease(n);
-        return fn;
-    }
-
-    if (prop == "setAttribute") {
-        JSStringRef n = JSStringCreateWithUTF8CString("setAttribute");
-        JSObjectRef fn = JSObjectMakeFunctionWithCallback(ctx, n, jscElementSetAttribute);
-        JSStringRelease(n);
-        return fn;
-    }
-    return JSValueMakeUndefined(ctx);
+    return nullptr; // delegate (stored props / prototype)
 }
 
 static bool jscElementSetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef value, JSValueRef*) {
-    auto* priv = (JscElementPriv*)JSObjectGetPrivate(object);
-    if (!priv) return false;
+    DomNode* n = jscElNode(object);
+    if (!n) return false;
 
     std::string prop = jsStringToUtf8(propertyName);
+    int nid = jscElNodeId(object);
 
     if (prop == "id") {
-        std::string newId = jsToUtf8(ctx, value);
-        if (!newId.empty()) {
-            priv->id = newId;
-            if (g_jsHost) g_jsHost->domIds.insert(newId);
-        }
+        domSetAttr(*n, "id", jsToUtf8(ctx, value));
+        if (g_jsHost) g_jsHost->domDirty = true;
         return true;
     }
-
     if (prop == "textContent" || prop == "innerText") {
-        std::string t = jsToUtf8(ctx, value);
-        priv->text = t;
-        if (g_jsHost) {
-            if (!g_jsHost->domHtml.empty()) {
-                replaceElementTextById(g_jsHost->domHtml, priv->id, t);
-            }
-            g_jsHost->domDirty = true;
-        }
+        domSetTextContent(g_jsHost->dom, nid, jsToUtf8(ctx, value));
+        g_jsHost->domDirty = true;
         return true;
     }
-
-    if (prop == "src" || prop == "href" || prop == "type") {
-        std::string v = jsToUtf8(ctx, value);
-        priv->attrs[toLowerCopy(prop)] = v;
+    if (prop == "innerHTML") {
+        domSetInnerHtml(g_jsHost->dom, nid, jsToUtf8(ctx, value));
+        g_jsHost->domDirty = true;
+        return true;
+    }
+    if (prop == "className") {
+        domSetAttr(*n, "class", jsToUtf8(ctx, value));
+        g_jsHost->domDirty = true;
+        return true;
+    }
+    if (prop == "src" || prop == "href" || prop == "type" || prop == "value" || prop == "name") {
+        domSetAttr(*n, prop, jsToUtf8(ctx, value));
+        g_jsHost->domDirty = true;
         return true;
     }
 
@@ -1662,8 +2001,8 @@ static bool jscElementSetProperty(JSContextRef ctx, JSObjectRef object, JSString
 
 static JSValueRef jscElementAddEventListener(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
     if (!g_jsHost) return JSValueMakeUndefined(ctx);
-    auto* priv = (JscElementPriv*)JSObjectGetPrivate(thisObject);
-    if (!priv) return JSValueMakeUndefined(ctx);
+    DomNode* n = jscElNode(thisObject);
+    if (!n) return JSValueMakeUndefined(ctx);
     if (argc < 2) return JSValueMakeUndefined(ctx);
 
     std::string type = jsToUtf8(ctx, argv[0]);
@@ -1671,62 +2010,37 @@ static JSValueRef jscElementAddEventListener(JSContextRef ctx, JSObjectRef, JSOb
     JSObjectRef fn = JSValueToObject(ctx, argv[1], nullptr);
     if (!fn || !JSObjectIsFunction(ctx, fn)) return JSValueMakeUndefined(ctx);
 
-    jscAddListenerCtx(ctx, "el:" + priv->id + ":" + type, fn);
+    jscAddListenerCtx(ctx, "el:" + domGetAttr(*n, "id") + ":" + type, fn);
     return JSValueMakeUndefined(ctx);
-}
-
-static std::string jscElementOuterHtml(const JscElementPriv& el) {
-    std::string tag = el.tagName.empty() ? "div" : el.tagName;
-    std::string out = "<" + tag;
-    if (!el.id.empty() && el.id.rfind("__", 0) != 0) {
-        out += " id=\"" + el.id + "\"";
-    }
-    for (const auto& kv : el.attrs) {
-        out += " " + kv.first + "=\"" + escapeHtmlEntities(kv.second) + "\"";
-    }
-    out += ">";
-    out += escapeHtmlEntities(el.text);
-    out += "</" + tag + ">";
-    return out;
 }
 
 static JSValueRef jscElementAppendChild(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
     if (!g_jsHost) return JSValueMakeUndefined(ctx);
-    auto* parent = (JscElementPriv*)JSObjectGetPrivate(thisObject);
-    if (!parent) return JSValueMakeUndefined(ctx);
-    if (argc < 1) return JSValueMakeUndefined(ctx);
+    if (argc < 1 || !JSValueIsObject(ctx, argv[0])) return JSValueMakeUndefined(ctx);
 
-    if (!JSValueIsObject(ctx, argv[0])) return JSValueMakeUndefined(ctx);
+    int parentId = jscElNodeId(thisObject);
     JSObjectRef childObj = JSValueToObject(ctx, argv[0], nullptr);
-    auto* child = (JscElementPriv*)JSObjectGetPrivate(childObj);
-    if (!child) return JSValueMakeUndefined(ctx);
+    auto* childPriv = (JscElementPriv*)JSObjectGetPrivate(childObj);
+    if (parentId < 0 || !childPriv) return argv[0];
+    int childId = childPriv->nodeId;
 
-    // If appending a <script> into head/body, try to load/execute it.
-    if (toLowerCopy(parent->tagName) == "head" || toLowerCopy(parent->tagName) == "body") {
-        std::string snippet = jscElementOuterHtml(*child);
+    domAppendChild(g_jsHost->dom, parentId, childId);
+    g_jsHost->domDirty = true;
 
-        if (!g_jsHost->domHtml.empty()) {
-            insertBeforeClosingTag(g_jsHost->domHtml, parent->tagName, snippet);
-        }
-        g_jsHost->domDirty = true;
-
-        if (toLowerCopy(child->tagName) == "script") {
-            std::string src = "";
-            auto it = child->attrs.find("src");
-            if (it != child->attrs.end()) src = it->second;
-
+    // Appending a <script> element runs it (matches browser behavior).
+    if (DomNode* child = g_jsHost->dom.get(childId)) {
+        if (child->tag == "script") {
+            std::string src = domGetAttr(*child, "src");
+            std::string code;
             if (!src.empty()) {
                 std::string abs = resolveHref(g_jsHost->baseUrl, src);
                 if (abs.empty()) abs = src;
-                std::string code = fetchSubresourceText(abs);
-
+                code = fetchSubresourceText(abs);
+            } else {
+                code = domTextContent(g_jsHost->dom, childId);
+            }
+            if (!trimCopy(code).empty()) {
                 JSStringRef script = JSStringCreateWithUTF8CString(code.c_str());
-                JSValueRef exc = nullptr;
-                (void)JSEvaluateScript(ctx, script, nullptr, nullptr, 1, &exc);
-                JSStringRelease(script);
-                if (exc) std::cerr << "[JS Exception] " << jsToUtf8(ctx, exc) << "\n";
-            } else if (!child->text.empty()) {
-                JSStringRef script = JSStringCreateWithUTF8CString(child->text.c_str());
                 JSValueRef exc = nullptr;
                 (void)JSEvaluateScript(ctx, script, nullptr, nullptr, 1, &exc);
                 JSStringRelease(script);
@@ -1738,15 +2052,41 @@ static JSValueRef jscElementAppendChild(JSContextRef ctx, JSObjectRef, JSObjectR
     return argv[0];
 }
 
-static JSValueRef jscElementSetAttribute(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
-    auto* priv = (JscElementPriv*)JSObjectGetPrivate(thisObject);
-    if (!priv) return JSValueMakeUndefined(ctx);
-    if (argc < 2) return JSValueMakeUndefined(ctx);
+static JSValueRef jscElementRemoveChild(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost) return JSValueMakeUndefined(ctx);
+    if (argc < 1 || !JSValueIsObject(ctx, argv[0])) return JSValueMakeUndefined(ctx);
+    int parentId = jscElNodeId(thisObject);
+    JSObjectRef childObj = JSValueToObject(ctx, argv[0], nullptr);
+    auto* childPriv = (JscElementPriv*)JSObjectGetPrivate(childObj);
+    if (parentId < 0 || !childPriv) return argv[0];
+    domRemoveChild(g_jsHost->dom, parentId, childPriv->nodeId);
+    g_jsHost->domDirty = true;
+    return argv[0];
+}
 
+static JSValueRef jscElementSetAttribute(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    DomNode* n = jscElNode(thisObject);
+    if (!n || argc < 2) return JSValueMakeUndefined(ctx);
     std::string k = toLowerCopy(jsToUtf8(ctx, argv[0]));
     std::string v = jsToUtf8(ctx, argv[1]);
-    if (!k.empty()) priv->attrs[k] = v;
+    if (!k.empty()) {
+        domSetAttr(*n, k, v);
+        if (k == "style") domCaptureStyleDisplay(*n, v);
+        if (g_jsHost) g_jsHost->domDirty = true;
+    }
     return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef jscElementGetAttribute(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    DomNode* n = jscElNode(thisObject);
+    if (!n || argc < 1) return JSValueMakeNull(ctx);
+    std::string k = toLowerCopy(jsToUtf8(ctx, argv[0]));
+    const std::string* p = domGetAttrPtr(*n, k);
+    if (!p) return JSValueMakeNull(ctx);
+    JSStringRef s = JSStringCreateWithUTF8CString(p->c_str());
+    JSValueRef r = JSValueMakeString(ctx, s);
+    JSStringRelease(s);
+    return r;
 }
 
 
@@ -1767,97 +2107,36 @@ static void jscEnsureDomClasses() {
     }
 }
 
-static void indexDomIdsFromHtml(JsHost& host, const std::string& html) {
-    host.domIds.clear();
-
-    // Very simple scan for id="..." or id='...'
-    static const std::regex reId(R"(id\s*=\s*(['"])([^'"]+)\1)", std::regex_constants::icase);
-    auto begin = std::sregex_iterator(html.begin(), html.end(), reId);
-    auto end = std::sregex_iterator();
-    for (auto it = begin; it != end; ++it) {
-        host.domIds.insert((*it)[2].str());
-    }
-}
-
-static bool isDisplayNone(const JsHost& host, const std::string& id) {
-    auto it = host.styleDisplayById.find(id);
-    if (it == host.styleDisplayById.end()) return false;
-    std::string v = toLowerCopy(trimCopy(it->second));
-    return (v == "none");
-}
-
-static std::string stripFirstElementById(const std::string& html, const std::string& id) {
-    // Best-effort remover: find first tag containing id="id" and remove that element.
-    std::string needle1 = "id=\"" + id + "\"";
-    std::string needle2 = "id='" + id + "'";
-    size_t pos = html.find(needle1);
-    if (pos == std::string::npos) pos = html.find(needle2);
-    if (pos == std::string::npos) return html;
-
-    size_t tagStart = html.rfind('<', pos);
-    if (tagStart == std::string::npos) return html;
-
-    size_t tagEnd = html.find('>', pos);
-    if (tagEnd == std::string::npos) return html;
-
-    // Extract tag name
-    size_t nameStart = tagStart + 1;
-    while (nameStart < html.size() && std::isspace((unsigned char)html[nameStart])) nameStart++;
-    if (nameStart < html.size() && html[nameStart] == '/') return html;
-
-    size_t nameEnd = nameStart;
-    while (nameEnd < html.size() && std::isalpha((unsigned char)html[nameEnd])) nameEnd++;
-    std::string tag = toLowerCopy(html.substr(nameStart, nameEnd - nameStart));
-    if (tag.empty()) return html;
-
-    // Self-closing?
-    bool selfClose = false;
-    {
-        size_t check = tagEnd;
-        while (check > tagStart && std::isspace((unsigned char)html[check - 1])) check--;
-        if (check > tagStart && html[check - 1] == '/') selfClose = true;
-    }
-
-    if (selfClose || tag == "img" || tag == "br" || tag == "meta" || tag == "link" || tag == "input") {
-        // Remove only the tag itself
-        return html.substr(0, tagStart) + html.substr(tagEnd + 1);
-    }
-
-    std::string closeTag = "</" + tag + ">";
-    size_t closePos = html.find(closeTag, tagEnd + 1);
-    if (closePos == std::string::npos) {
-        // Fallback: remove opening tag only
-        return html.substr(0, tagStart) + html.substr(tagEnd + 1);
-    }
-
-    size_t closeEnd = closePos + closeTag.size();
-    return html.substr(0, tagStart) + html.substr(closeEnd);
-}
-
-static std::string applyDisplayNonePatches(const std::string& html, const JsHost& host) {
-    std::string out = html;
-    // Remove each element with display:none (best effort, first occurrence)
-    for (const auto& kv : host.styleDisplayById) {
-        if (isDisplayNone(host, kv.first)) {
-            out = stripFirstElementById(out, kv.first);
-        }
-    }
-    return out;
-}
-
 static JSValueRef jscGetElementById(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) {
-    if (!g_jsHost) return JSValueMakeNull(ctx);
-    if (argc < 1) return JSValueMakeNull(ctx);
-
+    if (!g_jsHost || argc < 1) return JSValueMakeNull(ctx);
     std::string id = jsToUtf8(ctx, argv[0]);
     if (id.empty()) return JSValueMakeNull(ctx);
 
-    // If the element is not known, return a "virtual" element instead of null.
-    // This prevents a lot of real-world scripts from crashing immediately.
-    g_jsHost->domIds.insert(id);
+    int nid = domFindById(g_jsHost->dom, g_jsHost->dom.root, id);
+    if (nid < 0) {
+        // Unknown id: hand back a detached element so getElementById(...).x
+        // doesn't throw. It is not part of the rendered tree.
+        nid = g_jsHost->dom.alloc(DomNodeType::Element);
+        g_jsHost->dom.nodes[nid].tag = "div";
+        domSetAttr(g_jsHost->dom.nodes[nid], "id", id);
+    }
     jscEnsureDomClasses();
-    JSObjectRef el = JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{id, "div", {}, ""});
-    return el;
+    return JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ nid });
+}
+
+static JSValueRef jscQuerySelector(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost || argc < 1) return JSValueMakeNull(ctx);
+    std::string sel = trimCopy(jsToUtf8(ctx, argv[0]));
+    if (sel.empty() || sel.find(' ') != std::string::npos) return JSValueMakeNull(ctx);
+
+    int nid = -1;
+    if (sel[0] == '#')      nid = domFindById(g_jsHost->dom, g_jsHost->dom.root, sel.substr(1));
+    else if (sel[0] == '.') nid = domFindByClass(g_jsHost->dom, g_jsHost->dom.root, sel.substr(1));
+    else                    nid = domFindByTag(g_jsHost->dom, g_jsHost->dom.root, toLowerCopy(sel));
+
+    if (nid < 0) return JSValueMakeNull(ctx);
+    jscEnsureDomClasses();
+    return JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ nid });
 }
 
 static JSValueRef jscPerformanceNow(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*) {
@@ -1904,24 +2183,23 @@ static void jsSetupPageGlobals(JSContextRef ctx, const std::string& url, const s
         // document.createElement
         JSStringRef ce = JSStringCreateWithUTF8CString("createElement");
         JSObjectRef ceFn = JSObjectMakeFunctionWithCallback(ctx, ce, [](JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) -> JSValueRef {
-            if (!g_jsHost) return JSValueMakeNull(ctx);
-            if (argc < 1) return JSValueMakeNull(ctx);
+            if (!g_jsHost || argc < 1) return JSValueMakeNull(ctx);
             std::string tag = toLowerCopy(jsToUtf8(ctx, argv[0]));
             if (tag.empty()) tag = "div";
 
-            g_jsHost->domIds.insert("__el" + std::to_string(g_jsHost->nextTimerId)); // minor uniqueness
+            int nid = g_jsHost->dom.alloc(DomNodeType::Element);
+            g_jsHost->dom.nodes[nid].tag = tag;
             jscEnsureDomClasses();
-            std::string vid = "__el" + std::to_string(g_jsHost->nextTimerId++);
-            JSObjectRef el = JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{vid, tag, {}, ""});
-            return el;
+            return JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ nid });
         });
         JSObjectSetProperty(ctx, document, ce, ceFn, kJSPropertyAttributeNone, nullptr);
         JSStringRelease(ce);
 
-        // document.body and document.head
+        // document.body / document.head resolve to the real <body>/<head> nodes
+        // (created if the page omitted them) so appendChild() actually renders.
         jscEnsureDomClasses();
-        JSObjectRef body = JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{"__body", "body", {}, ""});
-        JSObjectRef head = JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{"__head", "head", {}, ""});
+        JSObjectRef body = JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ domFindOrCreateTag(g_jsHost->dom, "body") });
+        JSObjectRef head = JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ domFindOrCreateTag(g_jsHost->dom, "head") });
         JSStringRef bname = JSStringCreateWithUTF8CString("body");
         JSObjectSetProperty(ctx, document, bname, body, kJSPropertyAttributeNone, nullptr);
         JSStringRelease(bname);
@@ -1930,7 +2208,7 @@ static void jsSetupPageGlobals(JSContextRef ctx, const std::string& url, const s
         JSStringRelease(hname);
 
         JSStringRef qs = JSStringCreateWithUTF8CString("querySelector");
-        JSObjectRef qsFn = JSObjectMakeFunctionWithCallback(ctx, qs, jscReturnNull);
+        JSObjectRef qsFn = JSObjectMakeFunctionWithCallback(ctx, qs, jscQuerySelector);
         JSObjectSetProperty(ctx, document, qs, qsFn, kJSPropertyAttributeNone, nullptr);
         JSStringRelease(qs);
     }
@@ -2009,11 +2287,13 @@ static std::string runJavaScriptForHtml(JsEngine& js,
                                        const std::string& urlString) {
     js.host.currentUrl = urlString;
     js.host.baseUrl = baseUrl;
+    js.host.domDirty = false;
 
     jsResetContext(js);
 
-    js.host.domHtml = stripNoscriptBlocks(html);
-    indexDomIdsFromHtml(js.host, js.host.domHtml);
+    // Build the real DOM tree (the source of truth for this page; the renderer
+    // walks it directly).
+    js.host.dom = domParse(stripNoscriptBlocks(html));
 
     std::string initialTitle = extractTitleFromHtmlSimple(html);
     jsSetupPageGlobals(js.ctx, urlString, initialTitle);
@@ -2093,9 +2373,33 @@ static void jsPumpTimers(JsEngine& js) {
 #else
 // -------------------- JavaScript (QuickJS) --------------------
 
+
 struct JsHost {
     SDL_Window* window = nullptr;
     std::string currentUrl;
+
+    // Set whenever JS mutates the DOM tree; triggers a re-render of the page.
+    bool domDirty = false;
+
+    // setTimeout/clearTimeout queue (no threads; pumped from the UI loop).
+    struct TimerItem {
+        int id = 0;
+        double dueMs = 0.0;
+        JSValue fn = JS_UNDEFINED; // duplicated; freed when the timer fires or is cleared
+        bool isCode = false;
+        std::string code;
+    };
+    int nextTimerId = 1;
+    std::vector<TimerItem> timers;
+
+    // Event listeners keyed by scope+type, e.g. "window:click", "document:keydown", "el:myid:click".
+    std::unordered_map<std::string, std::vector<JSValue>> listeners; // duplicated
+
+    // Real DOM tree (source of truth); the renderer walks it directly.
+    Url baseUrl;
+    DomTree dom;
+
+    std::chrono::steady_clock::time_point perfStart = std::chrono::steady_clock::now();
 };
 
 struct JsEngine {
@@ -2103,6 +2407,58 @@ struct JsEngine {
     JSContext* ctx = nullptr;
     JsHost host;
 };
+
+// QuickJS class ids for our minimal DOM wrappers (registered once for the runtime).
+static JSClassID g_qjsElementClassId = 0;
+static JSClassID g_qjsStyleClassId = 0;
+
+struct QjsElementPriv {
+    int nodeId = -1; // index into JsHost::dom
+};
+
+struct QjsStylePriv {
+    int nodeId = -1; // element this style belongs to
+};
+
+static JsHost* qjsHost(JSContext* ctx) {
+    return (JsHost*)JS_GetContextOpaque(ctx);
+}
+
+static std::string jsToUtf8(JSContext* ctx, JSValueConst v) {
+    const char* s = JS_ToCString(ctx, v);
+    if (!s) return "";
+    std::string out(s);
+    JS_FreeCString(ctx, s);
+    return out;
+}
+
+// -------------------- best-effort HTML mutation helpers --------------------
+
+static std::string stripNoscriptBlocks(const std::string& html) {
+    std::string lower = toLowerCopy(html);
+    std::string out;
+    out.reserve(html.size());
+
+    size_t pos = 0;
+    while (true) {
+        size_t ns = lower.find("<noscript", pos);
+        if (ns == std::string::npos) {
+            out.append(html, pos, std::string::npos);
+            break;
+        }
+        out.append(html, pos, ns - pos);
+
+        size_t gt = lower.find('>', ns);
+        if (gt == std::string::npos) break;
+
+        size_t end = lower.find("</noscript>", gt);
+        if (end == std::string::npos) break;
+
+        pos = end + std::string("</noscript>").size();
+    }
+
+    return out;
+}
 
 static void jsDumpException(JSContext* ctx) {
     JSValue exc = JS_GetException(ctx);
@@ -2137,7 +2493,7 @@ static JSValue jsConsoleLog(JSContext* ctx, JSValueConst /*this_val*/, int argc,
         }
         if (i + 1 < argc) std::cout << " ";
     }
-    std::cout << "\n";
+    std::cout << std::endl;
     return JS_UNDEFINED;
 }
 
@@ -2149,9 +2505,530 @@ static JSValue jsReturnNull(JSContext* /*ctx*/, JSValueConst /*this_val*/, int /
     return JS_NULL;
 }
 
-static JSValue jsSetTimeout(JSContext* ctx, JSValueConst /*this_val*/, int /*argc*/, JSValueConst* /*argv*/) {
-    // Stub: real timers require an event loop. Return 0 as fake timer id.
-    return JS_NewInt32(ctx, 0);
+static double qjsNowMs(JsHost* host) {
+    if (!host) return 0.0;
+    auto now = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(now - host->perfStart).count();
+}
+
+static JSValue jsSetTimeout(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (!host || argc < 1) return JS_NewInt32(ctx, 0);
+
+    double delay = 0.0;
+    if (argc >= 2) JS_ToFloat64(ctx, &delay, argv[1]);
+    if (delay < 0.0) delay = 0.0;
+
+    JsHost::TimerItem item;
+    int timerId = host->nextTimerId++;
+    item.id = timerId;
+    item.dueMs = qjsNowMs(host) + delay;
+
+    if (JS_IsString(argv[0])) {
+        item.isCode = true;
+        item.code = jsToUtf8(ctx, argv[0]);
+    } else if (JS_IsFunction(ctx, argv[0])) {
+        item.fn = JS_DupValue(ctx, argv[0]);
+    } else {
+        return JS_NewInt32(ctx, 0);
+    }
+
+    host->timers.push_back(std::move(item));
+    return JS_NewInt32(ctx, timerId);
+}
+
+static JSValue jsClearTimeout(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (!host || argc < 1) return JS_UNDEFINED;
+
+    int32_t id = 0;
+    JS_ToInt32(ctx, &id, argv[0]);
+    for (auto it = host->timers.begin(); it != host->timers.end(); ++it) {
+        if (it->id == id) {
+            if (!JS_IsUndefined(it->fn)) JS_FreeValue(ctx, it->fn);
+            host->timers.erase(it);
+            break;
+        }
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue jsPerformanceNow(JSContext* ctx, JSValueConst /*this_val*/, int /*argc*/, JSValueConst* /*argv*/) {
+    return JS_NewFloat64(ctx, qjsNowMs(qjsHost(ctx)));
+}
+
+// -------------------- fetch (very small synchronous subset) --------------------
+
+static JSValue qjsPromiseResolve(JSContext* ctx, JSValue value) {
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue promiseCtor = JS_GetPropertyStr(ctx, global, "Promise");
+    JSValue resolveFn = JS_GetPropertyStr(ctx, promiseCtor, "resolve");
+
+    JSValue result = value;
+    if (JS_IsFunction(ctx, resolveFn)) {
+        JSValueConst args[1] = { value };
+        result = JS_Call(ctx, resolveFn, promiseCtor, 1, args);
+        JS_FreeValue(ctx, value);
+    }
+
+    JS_FreeValue(ctx, resolveFn);
+    JS_FreeValue(ctx, promiseCtor);
+    JS_FreeValue(ctx, global);
+    return result;
+}
+
+static JSValue jsResponseText(JSContext* ctx, JSValueConst this_val, int /*argc*/, JSValueConst* /*argv*/) {
+    JSValue body = JS_GetPropertyStr(ctx, this_val, "_bodyText");
+    return qjsPromiseResolve(ctx, body);
+}
+
+static JSValue jsResponseJson(JSContext* ctx, JSValueConst this_val, int /*argc*/, JSValueConst* /*argv*/) {
+    JSValue body = JS_GetPropertyStr(ctx, this_val, "_bodyText");
+    std::string text = jsToUtf8(ctx, body);
+    JS_FreeValue(ctx, body);
+    JSValue parsed = JS_ParseJSON(ctx, text.c_str(), text.size(), "<fetch>");
+    if (JS_IsException(parsed)) {
+        jsDumpException(ctx);
+        parsed = JS_NULL;
+    }
+    return qjsPromiseResolve(ctx, parsed);
+}
+
+static JSValue jsFetch(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (!host || argc < 1) return JS_UNDEFINED;
+
+    std::string url = jsToUtf8(ctx, argv[0]);
+    std::string abs = resolveHref(host->baseUrl, url);
+    if (abs.empty()) abs = url;
+
+    std::string body = fetchSubresourceText(abs);
+
+    JSValue resp = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, resp, "ok", JS_NewBool(ctx, 1));
+    JS_SetPropertyStr(ctx, resp, "status", JS_NewInt32(ctx, 200));
+    JS_SetPropertyStr(ctx, resp, "url", JS_NewString(ctx, abs.c_str()));
+    JS_SetPropertyStr(ctx, resp, "_bodyText", JS_NewString(ctx, body.c_str()));
+    JS_SetPropertyStr(ctx, resp, "text", JS_NewCFunction(ctx, jsResponseText, "text", 0));
+    JS_SetPropertyStr(ctx, resp, "json", JS_NewCFunction(ctx, jsResponseJson, "json", 0));
+
+    return qjsPromiseResolve(ctx, resp);
+}
+
+// -------------------- DOM element / style wrappers --------------------
+
+static void qjsElementFinalizer(JSRuntime* /*rt*/, JSValue val) {
+    auto* p = (QjsElementPriv*)JS_GetOpaque(val, g_qjsElementClassId);
+    delete p;
+}
+
+static void qjsStyleFinalizer(JSRuntime* /*rt*/, JSValue val) {
+    auto* p = (QjsStylePriv*)JS_GetOpaque(val, g_qjsStyleClassId);
+    delete p;
+}
+
+static DomNode* qjsElNode(JSContext* ctx, JSValueConst this_val) {
+    JsHost* host = qjsHost(ctx);
+    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
+    if (!host || !p) return nullptr;
+    return host->dom.get(p->nodeId);
+}
+
+static int qjsElNodeId(JSValueConst this_val) {
+    auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
+    return p ? p->nodeId : -1;
+}
+
+static JSValue qjsMakeElement(JSContext* ctx, int nodeId) {
+    JSValue obj = JS_NewObjectClass(ctx, g_qjsElementClassId);
+    if (JS_IsException(obj)) return obj;
+    auto* p = new QjsElementPriv();
+    p->nodeId = nodeId;
+    JS_SetOpaque(obj, p);
+    return obj;
+}
+
+static JSValue qjsElGetId(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    DomNode* n = qjsElNode(ctx, this_val);
+    return n ? JS_NewString(ctx, domGetAttr(*n, "id").c_str()) : JS_UNDEFINED;
+}
+
+static JSValue qjsElSetId(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    DomNode* n = qjsElNode(ctx, this_val);
+    if (n && argc > 0) {
+        domSetAttr(*n, "id", jsToUtf8(ctx, argv[0]));
+        if (host) host->domDirty = true;
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue qjsElGetTagName(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    DomNode* n = qjsElNode(ctx, this_val);
+    std::string tn = (n && !n->tag.empty()) ? toUpperCopy(n->tag) : "DIV";
+    return JS_NewString(ctx, tn.c_str());
+}
+
+static JSValue qjsElGetText(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0) return JS_UNDEFINED;
+    return JS_NewString(ctx, domTextContent(host->dom, nid).c_str());
+}
+
+static JSValue qjsElSetText(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0) return JS_UNDEFINED;
+    domSetTextContent(host->dom, nid, (argc > 0) ? jsToUtf8(ctx, argv[0]) : "");
+    host->domDirty = true;
+    return JS_UNDEFINED;
+}
+
+static JSValue qjsElGetInnerHtml(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0) return JS_UNDEFINED;
+    return JS_NewString(ctx, domSerializeChildren(host->dom, nid).c_str());
+}
+
+static JSValue qjsElSetInnerHtml(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0) return JS_UNDEFINED;
+    domSetInnerHtml(host->dom, nid, (argc > 0) ? jsToUtf8(ctx, argv[0]) : "");
+    host->domDirty = true;
+    return JS_UNDEFINED;
+}
+
+static JSValue qjsElGetParent(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host) return JS_NULL;
+    DomNode* n = host->dom.get(nid);
+    if (!n || n->parent < 0 || n->parent == host->dom.root) return JS_NULL;
+    return qjsMakeElement(ctx, n->parent);
+}
+
+static JSValue qjsElGetStyle(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    int nid = qjsElNodeId(this_val);
+    if (nid < 0) return JS_UNDEFINED;
+    JSValue s = JS_NewObjectClass(ctx, g_qjsStyleClassId);
+    if (JS_IsException(s)) return s;
+    auto* sp = new QjsStylePriv();
+    sp->nodeId = nid;
+    JS_SetOpaque(s, sp);
+    return s;
+}
+
+static JSValue qjsElAttrGet(JSContext* ctx, JSValueConst this_val, int, JSValueConst*, int, JSValue* data) {
+    DomNode* n = qjsElNode(ctx, this_val);
+    if (!n) return JS_UNDEFINED;
+    return JS_NewString(ctx, domGetAttr(*n, jsToUtf8(ctx, data[0])).c_str());
+}
+
+static JSValue qjsElAttrSet(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv, int, JSValue* data) {
+    JsHost* host = qjsHost(ctx);
+    DomNode* n = qjsElNode(ctx, this_val);
+    if (!n) return JS_UNDEFINED;
+    domSetAttr(*n, jsToUtf8(ctx, data[0]), (argc > 0) ? jsToUtf8(ctx, argv[0]) : "");
+    if (host) host->domDirty = true;
+    return JS_UNDEFINED;
+}
+
+// Forward declarations for element methods used while building the prototype.
+static JSValue qjsElAddEventListener(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
+static JSValue qjsElAppendChild(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
+static JSValue qjsElRemoveChild(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
+static JSValue qjsElSetAttribute(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
+static JSValue qjsElGetAttribute(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
+
+static JSValue qjsStyleGetDisplay(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    JsHost* host = qjsHost(ctx);
+    auto* p = (QjsStylePriv*)JS_GetOpaque(this_val, g_qjsStyleClassId);
+    if (!host || !p) return JS_UNDEFINED;
+    DomNode* n = host->dom.get(p->nodeId);
+    return JS_NewString(ctx, n ? n->styleDisplay.c_str() : "");
+}
+
+static JSValue qjsStyleSetDisplay(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    auto* p = (QjsStylePriv*)JS_GetOpaque(this_val, g_qjsStyleClassId);
+    if (!host || !p) return JS_UNDEFINED;
+    if (DomNode* n = host->dom.get(p->nodeId)) {
+        n->styleDisplay = (argc > 0) ? jsToUtf8(ctx, argv[0]) : "";
+        host->domDirty = true;
+    }
+    return JS_UNDEFINED;
+}
+
+static void qjsRegisterDomClasses(JSRuntime* rt) {
+    if (g_qjsElementClassId == 0) {
+        JS_NewClassID(&g_qjsElementClassId);
+        JSClassDef def{};
+        def.class_name = "Element";
+        def.finalizer = qjsElementFinalizer;
+        JS_NewClass(rt, g_qjsElementClassId, &def);
+    }
+    if (g_qjsStyleClassId == 0) {
+        JS_NewClassID(&g_qjsStyleClassId);
+        JSClassDef def{};
+        def.class_name = "CSSStyleDeclaration";
+        def.finalizer = qjsStyleFinalizer;
+        JS_NewClass(rt, g_qjsStyleClassId, &def);
+    }
+}
+
+static void qjsDefineAccessor(JSContext* ctx, JSValueConst proto, const char* name,
+                              JSCFunction* getter, JSCFunction* setter) {
+    JSValue g = getter ? JS_NewCFunction(ctx, getter, name, 0) : JS_UNDEFINED;
+    JSValue s = setter ? JS_NewCFunction(ctx, setter, name, 1) : JS_UNDEFINED;
+    JSAtom atom = JS_NewAtom(ctx, name);
+    JS_DefinePropertyGetSet(ctx, proto, atom, g, s, JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE);
+    JS_FreeAtom(ctx, atom);
+}
+
+static void qjsDefineAttrAccessor(JSContext* ctx, JSValueConst proto, const char* name) {
+    JSValue nameVal = JS_NewString(ctx, name);
+    JSValueConst data[1] = { nameVal };
+    JSValue g = JS_NewCFunctionData(ctx, qjsElAttrGet, 0, 0, 1, data);
+    JSValue s = JS_NewCFunctionData(ctx, qjsElAttrSet, 1, 0, 1, data);
+    JS_FreeValue(ctx, nameVal);
+    JSAtom atom = JS_NewAtom(ctx, name);
+    JS_DefinePropertyGetSet(ctx, proto, atom, g, s, JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE);
+    JS_FreeAtom(ctx, atom);
+}
+
+// Installs element/style prototypes for the current context. Must run after the
+// context is created and before any DOM wrapper objects are made.
+static void qjsSetupDomProtos(JSContext* ctx) {
+    JSValue elProto = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, elProto, "addEventListener", JS_NewCFunction(ctx, qjsElAddEventListener, "addEventListener", 2));
+    JS_SetPropertyStr(ctx, elProto, "appendChild", JS_NewCFunction(ctx, qjsElAppendChild, "appendChild", 1));
+    JS_SetPropertyStr(ctx, elProto, "setAttribute", JS_NewCFunction(ctx, qjsElSetAttribute, "setAttribute", 2));
+    JS_SetPropertyStr(ctx, elProto, "getAttribute", JS_NewCFunction(ctx, qjsElGetAttribute, "getAttribute", 1));
+    JS_SetPropertyStr(ctx, elProto, "removeChild", JS_NewCFunction(ctx, qjsElRemoveChild, "removeChild", 1));
+    qjsDefineAccessor(ctx, elProto, "id", qjsElGetId, qjsElSetId);
+    qjsDefineAccessor(ctx, elProto, "tagName", qjsElGetTagName, nullptr);
+    qjsDefineAccessor(ctx, elProto, "style", qjsElGetStyle, nullptr);
+    qjsDefineAccessor(ctx, elProto, "parentNode", qjsElGetParent, nullptr);
+    qjsDefineAccessor(ctx, elProto, "textContent", qjsElGetText, qjsElSetText);
+    qjsDefineAccessor(ctx, elProto, "innerText", qjsElGetText, qjsElSetText);
+    qjsDefineAccessor(ctx, elProto, "innerHTML", qjsElGetInnerHtml, qjsElSetInnerHtml);
+    qjsDefineAttrAccessor(ctx, elProto, "src");
+    qjsDefineAttrAccessor(ctx, elProto, "href");
+    qjsDefineAttrAccessor(ctx, elProto, "type");
+    qjsDefineAttrAccessor(ctx, elProto, "value");
+    qjsDefineAttrAccessor(ctx, elProto, "name");
+    JS_SetClassProto(ctx, g_qjsElementClassId, elProto);
+
+    JSValue stProto = JS_NewObject(ctx);
+    qjsDefineAccessor(ctx, stProto, "display", qjsStyleGetDisplay, qjsStyleSetDisplay);
+    JS_SetClassProto(ctx, g_qjsStyleClassId, stProto);
+}
+
+static void qjsAddListener(JSContext* ctx, const std::string& key, JSValueConst fn) {
+    if (JsHost* host = qjsHost(ctx)) {
+        host->listeners[key].push_back(JS_DupValue(ctx, fn));
+    }
+}
+
+static JSValue qjsElAddEventListener(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    DomNode* n = qjsElNode(ctx, this_val);
+    if (!n || argc < 2 || !JS_IsFunction(ctx, argv[1])) return JS_UNDEFINED;
+    std::string type = jsToUtf8(ctx, argv[0]);
+    qjsAddListener(ctx, "el:" + domGetAttr(*n, "id") + ":" + type, argv[1]);
+    return JS_UNDEFINED;
+}
+
+static JSValue qjsElAppendChild(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (!host || argc < 1) return JS_UNDEFINED;
+
+    int parentId = qjsElNodeId(this_val);
+    auto* childP = (QjsElementPriv*)JS_GetOpaque(argv[0], g_qjsElementClassId);
+    if (parentId < 0 || !childP) return JS_DupValue(ctx, argv[0]);
+    int childId = childP->nodeId;
+
+    domAppendChild(host->dom, parentId, childId);
+    host->domDirty = true;
+
+    // Appending a <script> element executes it (matches browser behavior).
+    if (DomNode* child = host->dom.get(childId)) {
+        if (child->tag == "script") {
+            std::string src = domGetAttr(*child, "src");
+            std::string code;
+            if (!src.empty()) {
+                std::string abs = resolveHref(host->baseUrl, src);
+                if (abs.empty()) abs = src;
+                code = fetchSubresourceText(abs);
+            } else {
+                code = domTextContent(host->dom, childId);
+            }
+            if (!trimCopy(code).empty()) {
+                JSValue r = JS_Eval(ctx, code.c_str(), code.size(), "<appended>", JS_EVAL_TYPE_GLOBAL);
+                if (JS_IsException(r)) jsDumpException(ctx);
+                JS_FreeValue(ctx, r);
+            }
+        }
+    }
+
+    return JS_DupValue(ctx, argv[0]);
+}
+
+static JSValue qjsElRemoveChild(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (!host || argc < 1) return JS_UNDEFINED;
+    int parentId = qjsElNodeId(this_val);
+    auto* childP = (QjsElementPriv*)JS_GetOpaque(argv[0], g_qjsElementClassId);
+    if (parentId < 0 || !childP) return JS_DupValue(ctx, argv[0]);
+    domRemoveChild(host->dom, parentId, childP->nodeId);
+    host->domDirty = true;
+    return JS_DupValue(ctx, argv[0]);
+}
+
+static JSValue qjsElSetAttribute(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    DomNode* n = qjsElNode(ctx, this_val);
+    if (!n || argc < 2) return JS_UNDEFINED;
+    std::string k = toLowerCopy(jsToUtf8(ctx, argv[0]));
+    std::string v = jsToUtf8(ctx, argv[1]);
+    if (!k.empty()) {
+        domSetAttr(*n, k, v);
+        if (k == "style") domCaptureStyleDisplay(*n, v);
+        if (host) host->domDirty = true;
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue qjsElGetAttribute(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    DomNode* n = qjsElNode(ctx, this_val);
+    if (!n || argc < 1) return JS_NULL;
+    std::string k = toLowerCopy(jsToUtf8(ctx, argv[0]));
+    const std::string* p = domGetAttrPtr(*n, k);
+    return p ? JS_NewString(ctx, p->c_str()) : JS_NULL;
+}
+
+static JSValue jsGetElementById(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (!host || argc < 1) return JS_NULL;
+    std::string id = jsToUtf8(ctx, argv[0]);
+    if (id.empty()) return JS_NULL;
+
+    int nid = domFindById(host->dom, host->dom.root, id);
+    if (nid < 0) {
+        // Unknown id: hand back a detached element so getElementById(...).x
+        // does not throw. It is not part of the rendered tree.
+        nid = host->dom.alloc(DomNodeType::Element);
+        host->dom.nodes[nid].tag = "div";
+        domSetAttr(host->dom.nodes[nid], "id", id);
+    }
+    return qjsMakeElement(ctx, nid);
+}
+
+static JSValue jsCreateElement(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (!host || argc < 1) return JS_NULL;
+    std::string tag = toLowerCopy(jsToUtf8(ctx, argv[0]));
+    if (tag.empty()) tag = "div";
+    int nid = host->dom.alloc(DomNodeType::Element);
+    host->dom.nodes[nid].tag = tag;
+    return qjsMakeElement(ctx, nid);
+}
+
+static JSValue jsQuerySelector(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (!host || argc < 1) return JS_NULL;
+    std::string sel = trimCopy(jsToUtf8(ctx, argv[0]));
+    if (sel.empty() || sel.find(' ') != std::string::npos) return JS_NULL; // no combinators
+
+    int nid = -1;
+    if (sel[0] == '#') nid = domFindById(host->dom, host->dom.root, sel.substr(1));
+    else if (sel[0] == '.') nid = domFindByClass(host->dom, host->dom.root, sel.substr(1));
+    else nid = domFindByTag(host->dom, host->dom.root, toLowerCopy(sel));
+
+    if (nid < 0) return JS_NULL;
+    return qjsMakeElement(ctx, nid);
+}
+
+static JSValue jsDocAddEventListener(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    if (argc < 2 || !JS_IsFunction(ctx, argv[1])) return JS_UNDEFINED;
+    qjsAddListener(ctx, "document:" + jsToUtf8(ctx, argv[0]), argv[1]);
+    return JS_UNDEFINED;
+}
+
+static JSValue jsWinAddEventListener(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    if (argc < 2 || !JS_IsFunction(ctx, argv[1])) return JS_UNDEFINED;
+    qjsAddListener(ctx, "window:" + jsToUtf8(ctx, argv[0]), argv[1]);
+    return JS_UNDEFINED;
+}
+
+static void jsDispatchEventSimple(JSContext* ctx, const std::string& key, JSValueConst evt) {
+    JsHost* host = qjsHost(ctx);
+    if (!host) return;
+    auto it = host->listeners.find(key);
+    if (it == host->listeners.end()) return;
+
+    std::vector<JSValue> fns = it->second; // entries stay owned by host->listeners
+    for (auto& fn : fns) {
+        JSValueConst args[1] = { evt };
+        JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 1, args);
+        if (JS_IsException(r)) jsDumpException(ctx);
+        JS_FreeValue(ctx, r);
+    }
+}
+
+static void qjsFreeHostRefs(JsEngine& js) {
+    if (!js.ctx) return;
+    for (auto& t : js.host.timers) {
+        if (!JS_IsUndefined(t.fn)) JS_FreeValue(js.ctx, t.fn);
+    }
+    js.host.timers.clear();
+    for (auto& kv : js.host.listeners) {
+        for (auto& fn : kv.second) JS_FreeValue(js.ctx, fn);
+    }
+    js.host.listeners.clear();
+}
+
+static void jsDrainJobs(JsEngine& js) {
+    if (!js.rt) return;
+    JSContext* c = nullptr;
+    for (;;) {
+        int r = JS_ExecutePendingJob(js.rt, &c);
+        if (r == 0) break;
+        if (r < 0) { jsDumpException(c ? c : js.ctx); break; }
+    }
+}
+
+static void jsPumpTimers(JsEngine& js) {
+    if (!js.ctx) return;
+
+    double now = qjsNowMs(&js.host);
+    std::vector<JsHost::TimerItem> due;
+    for (auto it = js.host.timers.begin(); it != js.host.timers.end(); ) {
+        if (it->dueMs <= now) {
+            due.push_back(std::move(*it));
+            it = js.host.timers.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    for (auto& t : due) {
+        JSValue r;
+        if (t.isCode) {
+            r = JS_Eval(js.ctx, t.code.c_str(), t.code.size(), "<timeout>", JS_EVAL_TYPE_GLOBAL);
+        } else if (!JS_IsUndefined(t.fn)) {
+            r = JS_Call(js.ctx, t.fn, JS_UNDEFINED, 0, nullptr);
+        } else {
+            r = JS_UNDEFINED;
+        }
+        if (JS_IsException(r)) jsDumpException(js.ctx);
+        JS_FreeValue(js.ctx, r);
+        if (!JS_IsUndefined(t.fn)) JS_FreeValue(js.ctx, t.fn);
+    }
+
+    if (!due.empty()) jsDrainJobs(js);
 }
 
 static JSValue jsAlert(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
@@ -2173,11 +3050,14 @@ static JSValue jsAlert(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSVa
 
 static bool jsInit(JsEngine& js) {
     js.rt = JS_NewRuntime();
-    return js.rt != nullptr;
+    if (!js.rt) return false;
+    qjsRegisterDomClasses(js.rt);
+    return true;
 }
 
 static void jsResetContext(JsEngine& js) {
     if (js.ctx) {
+        qjsFreeHostRefs(js);
         JS_FreeContext(js.ctx);
         js.ctx = nullptr;
     }
@@ -2185,28 +3065,45 @@ static void jsResetContext(JsEngine& js) {
     js.ctx = JS_NewContext(js.rt);
     JS_SetContextOpaque(js.ctx, &js.host);
 
+    qjsSetupDomProtos(js.ctx);
+
     JSValue global = JS_GetGlobalObject(js.ctx);
 
-    // window = global
+    // window === self === global
     JS_SetPropertyStr(js.ctx, global, "window", JS_DupValue(js.ctx, global));
+    JS_SetPropertyStr(js.ctx, global, "self", JS_DupValue(js.ctx, global));
 
-    // console.log / console.error
+    // console.log / error / warn / info
     JSValue consoleObj = JS_NewObject(js.ctx);
     JS_SetPropertyStr(js.ctx, consoleObj, "log", JS_NewCFunction(js.ctx, jsConsoleLog, "log", 1));
     JS_SetPropertyStr(js.ctx, consoleObj, "error", JS_NewCFunction(js.ctx, jsConsoleLog, "error", 1));
+    JS_SetPropertyStr(js.ctx, consoleObj, "warn", JS_NewCFunction(js.ctx, jsConsoleLog, "warn", 1));
+    JS_SetPropertyStr(js.ctx, consoleObj, "info", JS_NewCFunction(js.ctx, jsConsoleLog, "info", 1));
     JS_SetPropertyStr(js.ctx, global, "console", consoleObj);
 
     // alert()
     JS_SetPropertyStr(js.ctx, global, "alert", JS_NewCFunction(js.ctx, jsAlert, "alert", 1));
 
-    // setTimeout (stub)
+    // timers
     JS_SetPropertyStr(js.ctx, global, "setTimeout", JS_NewCFunction(js.ctx, jsSetTimeout, "setTimeout", 2));
+    JS_SetPropertyStr(js.ctx, global, "clearTimeout", JS_NewCFunction(js.ctx, jsClearTimeout, "clearTimeout", 1));
+
+    // performance.now()
+    JSValue perfObj = JS_NewObject(js.ctx);
+    JS_SetPropertyStr(js.ctx, perfObj, "now", JS_NewCFunction(js.ctx, jsPerformanceNow, "now", 0));
+    JS_SetPropertyStr(js.ctx, global, "performance", perfObj);
+
+    // fetch()
+    JS_SetPropertyStr(js.ctx, global, "fetch", JS_NewCFunction(js.ctx, jsFetch, "fetch", 1));
 
     JS_FreeValue(js.ctx, global);
 }
 
 static void jsShutdown(JsEngine& js) {
-    if (js.ctx) JS_FreeContext(js.ctx);
+    if (js.ctx) {
+        qjsFreeHostRefs(js);
+        JS_FreeContext(js.ctx);
+    }
     if (js.rt) JS_FreeRuntime(js.rt);
     js.ctx = nullptr;
     js.rt = nullptr;
@@ -2260,11 +3157,17 @@ static void jsSetupPageGlobals(JSContext* ctx, const std::string& url, const std
 
     JSValue document = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, document, "title", JS_NewString(ctx, title.c_str()));
+    JS_SetPropertyStr(ctx, document, "addEventListener", JS_NewCFunction(ctx, jsDocAddEventListener, "addEventListener", 2));
+    JS_SetPropertyStr(ctx, document, "getElementById", JS_NewCFunction(ctx, jsGetElementById, "getElementById", 1));
+    JS_SetPropertyStr(ctx, document, "createElement", JS_NewCFunction(ctx, jsCreateElement, "createElement", 1));
+    JS_SetPropertyStr(ctx, document, "querySelector", JS_NewCFunction(ctx, jsQuerySelector, "querySelector", 1));
 
-    // Minimal DOM stubs so scripts don't crash instantly
-    JS_SetPropertyStr(ctx, document, "addEventListener", JS_NewCFunction(ctx, jsNoop, "addEventListener", 2));
-    JS_SetPropertyStr(ctx, document, "getElementById", JS_NewCFunction(ctx, jsReturnNull, "getElementById", 1));
-    JS_SetPropertyStr(ctx, document, "querySelector", JS_NewCFunction(ctx, jsReturnNull, "querySelector", 1));
+    // document.body / document.head map to the real <body>/<head> nodes
+    // (created if the page omitted them) so appendChild() actually renders.
+    if (JsHost* host = qjsHost(ctx)) {
+        JS_SetPropertyStr(ctx, document, "body", qjsMakeElement(ctx, domFindOrCreateTag(host->dom, "body")));
+        JS_SetPropertyStr(ctx, document, "head", qjsMakeElement(ctx, domFindOrCreateTag(host->dom, "head")));
+    }
 
     JS_SetPropertyStr(ctx, global, "document", document);
 
@@ -2276,12 +3179,8 @@ static void jsSetupPageGlobals(JSContext* ctx, const std::string& url, const std
     JS_SetPropertyStr(ctx, navigator, "userAgent", JS_NewString(ctx, "NoChrome/0.10 (QuickJS)"));
     JS_SetPropertyStr(ctx, global, "navigator", navigator);
 
-    // window.addEventListener stub
-    JSValue win = JS_GetPropertyStr(ctx, global, "window");
-    if (JS_IsObject(win)) {
-        JS_SetPropertyStr(ctx, win, "addEventListener", JS_NewCFunction(ctx, jsNoop, "addEventListener", 2));
-    }
-    JS_FreeValue(ctx, win);
+    // window/global addEventListener (window === global here).
+    JS_SetPropertyStr(ctx, global, "addEventListener", JS_NewCFunction(ctx, jsWinAddEventListener, "addEventListener", 2));
 
     JS_FreeValue(ctx, global);
 }
@@ -2313,8 +3212,14 @@ static std::string runJavaScriptForHtml(JsEngine& js,
                                        const Url& baseUrl,
                                        const std::string& urlString) {
     js.host.currentUrl = urlString;
+    js.host.baseUrl = baseUrl;
+    js.host.domDirty = false;
 
     jsResetContext(js);
+
+    // Build the real DOM tree (the source of truth for this page; the renderer
+    // walks it directly).
+    js.host.dom = domParse(stripNoscriptBlocks(html));
 
     std::string initialTitle = extractTitleFromHtmlSimple(html);
     jsSetupPageGlobals(js.ctx, urlString, initialTitle);
@@ -2345,6 +3250,9 @@ static std::string runJavaScriptForHtml(JsEngine& js,
             jsDumpException(js.ctx);
         }
         JS_FreeValue(js.ctx, v);
+
+        // Run any microtasks (e.g. fetch().then(...)) queued by this script.
+        jsDrainJobs(js);
     }
 
     return jsReadDocumentTitle(js.ctx);
@@ -2355,230 +3263,30 @@ static std::string runJavaScriptForHtml(JsEngine& js,
 
 // -------------------- HTML -> Styled tokens --------------------
 
-static std::vector<StyledToken> parseHtmlToStyledTokens(const std::string& html,
-                                                        const Url& baseUrl,
-                                                        SDL_Color* outPageBg) {
-    // 1) Inline CSS from <style>
-    std::string cssAll;
-    for (auto& block : extractTagContents(html, "style")) {
-        cssAll += block;
-        cssAll.push_back('\n');
-    }
-
-    // 2) External CSS from <link rel="stylesheet" href="...">
-    int externalCount = 0;
-    auto linkTags = extractStartTagContents(html, "link");
-    for (const auto& tagContent : linkTags) {
-        if (externalCount >= 8) break;
-
-        std::string rel = toLowerCopy(getAttrValue(tagContent, "rel"));
-        if (rel.find("stylesheet") == std::string::npos) continue;
-
-        std::string href = trimCopy(getAttrValue(tagContent, "href"));
-        if (href.empty()) continue;
-
-        std::string abs = resolveHref(baseUrl, href);
-        if (abs.empty()) continue;
-
-        std::string css = fetchSubresourceText(abs);
-        if (!css.empty()) {
-            cssAll += "\n";
-            cssAll += css;
-            cssAll += "\n";
-            externalCount++;
-        }
-    }
-
-    auto rules = parseCssRules(cssAll);
-
-    if (outPageBg) {
-        *outPageBg = extractPageBackgroundFromRules(rules);
-    }
-
-    // Remove non-rendered blocks
-    std::string cleaned = removeTagBlocks(html, "script");
-    cleaned = removeTagBlocks(cleaned, "style");
-    cleaned = removeTagBlocks(cleaned, "head");
-
-
-#ifdef NOCHROME_ENABLE_JS
-    // If JS is enabled, do not render <noscript> fallbacks.
-    cleaned = removeTagBlocks(cleaned, "noscript");
-#endif
-    std::vector<StyledToken> tokens;
-
-    bool inTag = false;
-    std::string tagBuf;
-    std::string textBuf;
-
-    std::vector<TextStyle> styleStack;
-    std::vector<std::string> hrefStack;
-
-    TextStyle base;
-    styleStack.push_back(base);
-    hrefStack.push_back("");
-
-    auto currentStyle = [&]()->TextStyle {
-        return styleStack.empty() ? base : styleStack.back();
-    };
-    auto currentHref = [&]()->std::string {
-        return hrefStack.empty() ? "" : hrefStack.back();
-    };
-
-    auto pushBreakN = [&](int n){
-        if (n <= 0) return;
-        StyledToken bt;
-        bt.kind = TokenKind::Break;
-        bt.style = base;
-        bt.breakCount = n;
-        tokens.push_back(bt);
-    };
-
-    auto flushText = [&](){
-        std::string t = decodeEntities(textBuf);
-        textBuf.clear();
-
-        t = trimCopy(t);
-        if (t.empty()) return;
-
-        std::istringstream iss(t);
-        std::string w;
-        TextStyle st = currentStyle();
-        std::string href = currentHref();
-
-        while (iss >> w) {
-            StyledToken tok;
-            tok.kind = TokenKind::Word;
-            tok.text = w;
-            tok.href = href;
-            tok.style = st;
-            tokens.push_back(std::move(tok));
-        }
-    };
-
-    auto popOne = [&](){
-        if (styleStack.size() > 1) styleStack.pop_back();
-        if (hrefStack.size() > 1) hrefStack.pop_back();
-    };
-
-    auto parseIntAttr = [&](const std::string& s)->int{
-        std::string v = trimCopy(s);
-        if (v.empty()) return 0;
-        try {
-            return std::max(0, std::stoi(v));
-        } catch (...) {
-            return 0;
-        }
-    };
-
-    auto processTag = [&](const std::string& raw){
-        std::string t = trimCopy(raw);
-        if (t.empty()) return;
-
-        if (!t.empty() && (t[0] == '!' || t[0] == '?')) return;
-
-        std::string lower = toLowerCopy(t);
-        bool isEnd = (!lower.empty() && lower[0] == '/');
-
-        size_t i = isEnd ? 1 : 0;
-        std::string name;
-        while (i < lower.size() && std::isalpha((unsigned char)lower[i])) {
-            name.push_back(lower[i]);
-            i++;
-        }
-        if (name.empty()) return;
-
-        bool selfClosing = (lower.find("/>") != std::string::npos);
-
-        if (name == "br") {
-            pushBreakN(1);
-            return;
-        }
-
-        if (!isEnd && name == "img") {
-            // Flush text before inserting an image token
-            flushText();
-
-            std::string src = trimCopy(getAttrValue(t, "src"));
-            if (!src.empty()) {
-                StyledToken it;
-                it.kind = TokenKind::Image;
-                it.imgSrcAbs = resolveHref(baseUrl, src);
-                it.imgAlt = decodeEntities(getAttrValue(t, "alt"));
-                it.imgAttrW = parseIntAttr(getAttrValue(t, "width"));
-                it.imgAttrH = parseIntAttr(getAttrValue(t, "height"));
-                tokens.push_back(std::move(it));
-
-                // Minimal separation
-                pushBreakN(1);
-            }
-            return;
-        }
-
-        if (isEnd) {
-            std::string fullName = "/" + name;
-            if (isBlockTagName(fullName)) {
-                pushBreakN(defaultBreakCountForTag(fullName));
-            }
-            popOne();
-            return;
-        }
-
-        TextStyle st = currentStyle();
-
-        std::string id = trimCopy(getAttrValue(t, "id"));
-        std::string classAttr = getAttrValue(t, "class");
-        auto classes = parseClassList(classAttr);
-
-        applyTagDefaults(name, st);
-        applyRulesForElement(rules, name, toLowerCopy(id), classes, st);
-
-        std::string inlineCss = getAttrValue(t, "style");
-        if (!inlineCss.empty()) applyInlineStyle(inlineCss, st);
-
-        styleStack.push_back(st);
-
-        std::string href = currentHref();
-        if (name == "a") {
-            href = trimCopy(getAttrValue(t, "href"));
-        }
-        hrefStack.push_back(href);
-
-        if (isBlockTagName(name)) {
-            pushBreakN(defaultBreakCountForTag(name));
-        }
-
-        if (selfClosing) {
-            popOne();
-        }
-    };
-
-    for (size_t idx = 0; idx < cleaned.size(); ++idx) {
-        char c = cleaned[idx];
-
-        if (!inTag) {
-            if (c == '<') {
-                flushText();
-                inTag = true;
-                tagBuf.clear();
-            } else {
-                textBuf.push_back(c);
-            }
-        } else {
-            if (c == '>') {
-                inTag = false;
-                processTag(tagBuf);
-            } else {
-                tagBuf.push_back(c);
+static void domCollectCssVisit(const DomTree& dom, int id, const Url& baseUrl,
+                               std::string& cssAll, int& externalCount) {
+    const DomNode* n = dom.get(id);
+    if (!n) return;
+    if (n->type == DomNodeType::Element) {
+        if (n->tag == "style") {
+            cssAll += domTextContent(dom, id);
+            cssAll.push_back('\n');
+        } else if (n->tag == "link") {
+            std::string rel = toLowerCopy(domGetAttr(*n, "rel"));
+            if (rel.find("stylesheet") != std::string::npos && externalCount < 8) {
+                std::string href = trimCopy(domGetAttr(*n, "href"));
+                if (!href.empty()) {
+                    std::string abs = resolveHref(baseUrl, href);
+                    std::string css = abs.empty() ? std::string() : fetchSubresourceText(abs);
+                    if (!css.empty()) {
+                        cssAll += "\n" + css + "\n";
+                        externalCount++;
+                    }
+                }
             }
         }
     }
-    flushText();
-
-    while (!tokens.empty() && tokens.back().kind == TokenKind::Break)
-        tokens.pop_back();
-
-    return tokens;
+    for (int c : n->children) domCollectCssVisit(dom, c, baseUrl, cssAll, externalCount);
 }
 
 // -------------------- Fonts --------------------
@@ -2591,33 +3299,47 @@ struct FontSet {
     TTF_Font* f34 = nullptr;
 };
 
-static std::string findFontPath() {
-    if (FILE* f = fopen("fonts/DejaVuSans.ttf", "rb")) { fclose(f); return "fonts/DejaVuSans.ttf"; }
-    if (FILE* f = fopen("DejaVuSans.ttf", "rb")) { fclose(f); return "DejaVuSans.ttf"; }
-
+static std::vector<std::string> fontCandidates() {
+    return {
+        "fonts/DejaVuSans.ttf",
+        "DejaVuSans.ttf",
 #ifdef __APPLE__
-    if (FILE* f = fopen("/System/Library/Fonts/Supplemental/Arial.ttf", "rb")) { fclose(f); return "/System/Library/Fonts/Supplemental/Arial.ttf"; }
-    if (FILE* f = fopen("/System/Library/Fonts/Supplemental/Helvetica.ttf", "rb")) { fclose(f); return "/System/Library/Fonts/Supplemental/Helvetica.ttf"; }
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Helvetica.ttf",
+        "/Library/Fonts/Arial.ttf",
 #endif
-
-#ifdef __linux__
-    if (FILE* f = fopen("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "rb")) { fclose(f); return "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"; }
-#endif
-
-    return "";
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    };
 }
 
 static bool loadFontSet(FontSet& fs) {
-    std::string path = findFontPath();
-    if (path.empty()) return false;
+    // Try each candidate; skip ones that fail to open (e.g. missing or a
+    // zero-byte placeholder) and fall through to the next.
+    for (const auto& path : fontCandidates()) {
+        TTF_Font* probe = TTF_OpenFont(path.c_str(), 16);
+        if (!probe) continue;
+        TTF_CloseFont(probe);
 
-    fs.f16 = TTF_OpenFont(path.c_str(), 16);
-    fs.f20 = TTF_OpenFont(path.c_str(), 20);
-    fs.f24 = TTF_OpenFont(path.c_str(), 24);
-    fs.f28 = TTF_OpenFont(path.c_str(), 28);
-    fs.f34 = TTF_OpenFont(path.c_str(), 34);
+        fs.f16 = TTF_OpenFont(path.c_str(), 16);
+        fs.f20 = TTF_OpenFont(path.c_str(), 20);
+        fs.f24 = TTF_OpenFont(path.c_str(), 24);
+        fs.f28 = TTF_OpenFont(path.c_str(), 28);
+        fs.f34 = TTF_OpenFont(path.c_str(), 34);
 
-    return fs.f16 && fs.f20 && fs.f24 && fs.f28 && fs.f34;
+        if (fs.f16 && fs.f20 && fs.f24 && fs.f28 && fs.f34) return true;
+
+        // Partial open: close whatever opened and try the next candidate.
+        if (fs.f16) TTF_CloseFont(fs.f16);
+        if (fs.f20) TTF_CloseFont(fs.f20);
+        if (fs.f24) TTF_CloseFont(fs.f24);
+        if (fs.f28) TTF_CloseFont(fs.f28);
+        if (fs.f34) TTF_CloseFont(fs.f34);
+        fs = {};
+    }
+    return false;
 }
 
 static void freeFontSet(FontSet& fs) {
@@ -2671,39 +3393,35 @@ struct StyledWord {
     std::string text;
     std::string href;
     TextStyle style;
+    std::string elementId;
 };
 
 struct RenderSpan {
     std::string text;
     std::string href;
     TextStyle style;
+    std::string elementId;
 
     SDL_Texture* texture = nullptr;
     int w = 0;
     int h = 0;
 };
 
-struct RenderTextLine {
-    std::vector<RenderSpan> spans;
-    int height = 0;
-};
+enum class ItemKind { Box, Text, Image };
 
-struct RenderImage {
-    SDL_Texture* texture = nullptr;
-    int w = 0;
-    int h = 0;
-    std::string srcAbs;
-};
-
-enum class BlockKind { Text, Spacer, Image };
-
-struct RenderBlock {
-    BlockKind kind = BlockKind::Text;
-    int y = 0;
-    int h = 0;
-
-    RenderTextLine text;
-    RenderImage image;
+// A positioned paint primitive in content coordinates (absolute, pre-scroll).
+struct RenderItem {
+    ItemKind kind = ItemKind::Text;
+    SDL_Rect rect {0, 0, 0, 0};
+    // Box:
+    bool hasBg = false;
+    SDL_Color bg {0, 0, 0, 0};
+    int borderW = 0;
+    SDL_Color borderColor {120, 120, 120, 255};
+    // Text / Image:
+    SDL_Texture* tex = nullptr;
+    bool underline = false;
+    SDL_Color underlineColor {0, 0, 0, 255};
 };
 
 struct LinkHit {
@@ -2711,20 +3429,16 @@ struct LinkHit {
     std::string href;
 };
 
-static void destroyBlocks(SDL_Renderer* renderer, std::vector<RenderBlock>& blocks) {
-    (void)renderer;
-    for (auto& b : blocks) {
-        if (b.kind == BlockKind::Text) {
-            for (auto& sp : b.text.spans) {
-                if (sp.texture) SDL_DestroyTexture(sp.texture);
-                sp.texture = nullptr;
-            }
-        } else if (b.kind == BlockKind::Image) {
-            if (b.image.texture) SDL_DestroyTexture(b.image.texture);
-            b.image.texture = nullptr;
-        }
+struct ElementHit {
+    SDL_Rect rect; // Content coordinates (bounding box of an element)
+    std::string id;
+};
+
+static void destroyItems(std::vector<RenderItem>& items) {
+    for (auto& it : items) {
+        if (it.tex) { SDL_DestroyTexture(it.tex); it.tex = nullptr; }
     }
-    blocks.clear();
+    items.clear();
 }
 
 static std::vector<RenderSpan> groupWordsToSpans(const std::vector<StyledWord>& words) {
@@ -2735,18 +3449,21 @@ static std::vector<RenderSpan> groupWordsToSpans(const std::vector<StyledWord>& 
     cur.text = words[0].text;
     cur.href = words[0].href;
     cur.style = words[0].style;
+    cur.elementId = words[0].elementId;
 
     for (size_t i = 1; i < words.size(); ++i) {
         bool sameHref = (words[i].href == cur.href);
         bool sameStyle = styleEquals(words[i].style, cur.style);
+        bool sameId = (words[i].elementId == cur.elementId);
 
-        if (sameHref && sameStyle) {
+        if (sameHref && sameStyle && sameId) {
             cur.text += " " + words[i].text;
         } else {
             spans.push_back(cur);
             cur.text = words[i].text;
             cur.href = words[i].href;
             cur.style = words[i].style;
+            cur.elementId = words[i].elementId;
         }
     }
 
@@ -2778,177 +3495,324 @@ static SDL_Texture* loadImageTexture(SDL_Renderer* renderer,
     return tex;
 }
 
-static std::vector<RenderBlock> buildBlocksFromTokens(SDL_Renderer* renderer,
-                                                      const FontSet& fonts,
-                                                      const std::vector<StyledToken>& tokens,
-                                                      int contentWidth,
-                                                      int padding,
-                                                      int baseLineHeight,
-                                                      std::vector<LinkHit>& outLinks) {
-    std::vector<RenderBlock> blocks;
-    outLinks.clear();
+static int domIntAttr(const std::string& s) {
+    std::string v = trimCopy(s);
+    if (v.empty()) return 0;
+    try { return std::max(0, std::stoi(v)); } catch (...) { return 0; }
+}
 
-    const int maxLineW = std::max(10, contentWidth - padding * 2);
+static bool isLayoutBlock(const std::string& tag) {
+    static const std::unordered_set<std::string> blocks = {
+        "#root","html","body","head","div","p","h1","h2","h3","h4","h5","h6",
+        "ul","ol","li","section","article","header","footer","nav","main","aside",
+        "blockquote","pre","figure","figcaption","table","thead","tbody","tfoot",
+        "tr","td","th","form","fieldset","legend","hr","dl","dt","dd","address",
+        "details","summary","script","style","title","meta","link","noscript"
+    };
+    return blocks.count(tag) > 0;
+}
 
-    std::vector<StyledWord> currentLine;
-    int lineW = 0;
+// -------------------- Block box layout --------------------
+// Walks the DOM tree producing positioned RenderItems (block boxes + inline
+// text/images). Block elements get margins/padding/border/background/width/
+// text-align; inline descendants flow into wrapped lines within each block.
+struct BoxLayout {
+    SDL_Renderer* renderer;
+    const FontSet& fonts;
+    const std::vector<StyleRule>& rules;
+    const DomTree& dom;
+    Url baseUrl;
+    int baseLineHeight;
+    std::vector<RenderItem>& items;
+    std::vector<LinkHit>& links;
+    std::unordered_map<std::string, SDL_Rect>& idRects;
 
-    auto flushLine = [&](){
-        if (currentLine.empty()) return;
+    void recordHit(const std::string& id, const SDL_Rect& r) {
+        auto it = idRects.find(id);
+        if (it == idRects.end()) { idRects[id] = r; return; }
+        SDL_Rect& u = it->second;
+        int x0 = std::min(u.x, r.x), y0 = std::min(u.y, r.y);
+        int x1 = std::max(u.x + u.w, r.x + r.w), y1 = std::max(u.y + u.h, r.y + r.h);
+        u = SDL_Rect{ x0, y0, x1 - x0, y1 - y0 };
+    }
 
-        RenderBlock b;
-        b.kind = BlockKind::Text;
+    // Gather inline tokens (words / <br> / <img>) from an inline subtree.
+    void collectInline(int nodeId, TextStyle style, std::string href,
+                       std::string eid, std::vector<StyledToken>& toks) {
+        const DomNode* n = dom.get(nodeId);
+        if (!n) return;
 
-        auto spans = groupWordsToSpans(currentLine);
-        int maxH = 0;
-
-        for (auto& sp : spans) {
-            TTF_Font* f = pickFont(fonts, sp.style.fontSize);
-
-            SDL_Surface* surf = renderTextWithStyle(f, sp.text, sp.style);
-            if (!surf) {
-                b.text.spans.push_back(std::move(sp));
-                continue;
+        if (n->type == DomNodeType::Text) {
+            std::istringstream iss(n->text);
+            std::string w;
+            while (iss >> w) {
+                StyledToken t; t.kind = TokenKind::Word; t.text = w;
+                t.href = href; t.style = style; t.elementId = eid;
+                toks.push_back(std::move(t));
             }
-
-            sp.w = surf->w;
-            sp.h = surf->h;
-            maxH = std::max(maxH, sp.h);
-            sp.texture = SDL_CreateTextureFromSurface(renderer, surf);
-            SDL_FreeSurface(surf);
-
-            b.text.spans.push_back(std::move(sp));
+            return;
         }
 
-        b.text.height = std::max(baseLineHeight, maxH + 6);
-        b.h = b.text.height;
+        const std::string& tag = n->tag;
+        if (tag == "br") { StyledToken t; t.kind = TokenKind::Break; t.breakCount = 1; toks.push_back(t); return; }
+        if (tag == "img") {
+            std::string src = trimCopy(domGetAttr(*n, "src"));
+            if (!src.empty()) {
+                StyledToken it; it.kind = TokenKind::Image;
+                it.imgSrcAbs = resolveHref(baseUrl, src);
+                it.imgAlt = domGetAttr(*n, "alt");
+                it.imgAttrW = domIntAttr(domGetAttr(*n, "width"));
+                it.imgAttrH = domIntAttr(domGetAttr(*n, "height"));
+                toks.push_back(std::move(it));
+            }
+            return;
+        }
+        if (tag == "script" || tag == "style" || tag == "head" || tag == "title" || tag == "noscript") return;
 
-        blocks.push_back(std::move(b));
-        currentLine.clear();
-        lineW = 0;
-    };
+        TextStyle st = style;
+        std::string id = trimCopy(domGetAttr(*n, "id"));
+        auto classes = parseClassList(domGetAttr(*n, "class"));
+        applyTagDefaults(tag, st);
+        applyRulesForElement(rules, tag, toLowerCopy(id), classes, st);
+        std::string inlineCss = domGetAttr(*n, "style");
+        if (!inlineCss.empty()) applyInlineStyle(inlineCss, st);
 
-    auto addSpacer = [&](int h){
-        if (h <= 0) return;
-        RenderBlock b;
-        b.kind = BlockKind::Spacer;
-        b.h = h;
-        blocks.push_back(std::move(b));
-    };
+        std::string childHref = (tag == "a") ? trimCopy(domGetAttr(*n, "href")) : href;
+        std::string childEid = id.empty() ? eid : id;
+        for (int c : n->children) collectInline(c, st, childHref, childEid, toks);
+    }
 
-    auto addImageBlock = [&](const StyledToken& it){
-        if (it.imgSrcAbs.empty()) return;
-
-        std::string bytes = fetchSubresourceBytes(it.imgSrcAbs);
+    int layoutImageToken(const StyledToken& t, int contentX, int y, int contentW) {
+        if (t.imgSrcAbs.empty()) return y;
+        std::string bytes = fetchSubresourceBytes(t.imgSrcAbs);
         int iw = 0, ih = 0;
         SDL_Texture* tex = loadImageTexture(renderer, bytes, &iw, &ih);
 
         if (!tex || iw <= 0 || ih <= 0) {
-            // Fallback: render alt text when image fails
-            std::string alt = it.imgAlt.empty() ? "[image]" : ("[image: " + it.imgAlt + "]");
-            StyledToken t;
-            t.kind = TokenKind::Word;
-            t.text = alt;
-            t.style = TextStyle{};
-            // Push as a simple text block via currentLine
-            currentLine.push_back({t.text, "", t.style});
-            flushLine();
-            addSpacer(baseLineHeight / 2);
-            return;
-        }
-
-        int targetW = iw;
-        int targetH = ih;
-
-        // Respect width/height attributes lightly (optional)
-        if (it.imgAttrW > 0 && it.imgAttrH > 0) {
-            targetW = it.imgAttrW;
-            targetH = it.imgAttrH;
-        } else if (it.imgAttrW > 0 && it.imgAttrH == 0) {
-            float s = (float)it.imgAttrW / (float)iw;
-            targetW = it.imgAttrW;
-            targetH = std::max(1, (int)std::lround(ih * s));
-        } else if (it.imgAttrH > 0 && it.imgAttrW == 0) {
-            float s = (float)it.imgAttrH / (float)ih;
-            targetH = it.imgAttrH;
-            targetW = std::max(1, (int)std::lround(iw * s));
-        }
-
-        // Fit into content width
-        if (targetW > maxLineW) {
-            float s = (float)maxLineW / (float)targetW;
-            targetW = maxLineW;
-            targetH = std::max(1, (int)std::lround(targetH * s));
-        }
-
-        RenderBlock b;
-        b.kind = BlockKind::Image;
-        b.image.texture = tex;
-        b.image.w = targetW;
-        b.image.h = targetH;
-        b.image.srcAbs = it.imgSrcAbs;
-        b.h = targetH + 8; // small bottom padding
-        blocks.push_back(std::move(b));
-    };
-
-    for (const auto& t : tokens) {
-        if (t.kind == TokenKind::Break) {
-            flushLine();
-            addSpacer(baseLineHeight * std::max(1, t.breakCount));
-            continue;
-        }
-
-        if (t.kind == TokenKind::Image) {
-            flushLine();
-            addImageBlock(t);
-            continue;
-        }
-
-        // Word
-        StyledWord w { t.text, t.href, t.style };
-        TTF_Font* f = pickFont(fonts, w.style.fontSize);
-
-        int wW = textWidth(f, w.text);
-        int spaceW = textWidth(f, " ");
-        int add = currentLine.empty() ? wW : (spaceW + wW);
-
-        if (!currentLine.empty() && lineW + add > maxLineW) {
-            flushLine();
-        }
-
-        if (currentLine.empty()) {
-            lineW = wW;
-            currentLine.push_back(std::move(w));
-        } else {
-            lineW += add;
-            currentLine.push_back(std::move(w));
-        }
-    }
-
-    flushLine();
-
-    // Assign y positions + build link hitboxes
-    int y = padding;
-    for (auto& b : blocks) {
-        b.y = y;
-        y += b.h;
-
-        if (b.kind != BlockKind::Text) continue;
-
-        int x = padding;
-        int lineTop = b.y;
-
-        for (const auto& sp : b.text.spans) {
-            SDL_Rect r { x, lineTop, sp.w, sp.h };
-            if (!sp.href.empty() && sp.w > 0 && sp.h > 0) {
-                outLinks.push_back({ r, sp.href });
+            std::string alt = t.imgAlt.empty() ? "[image]" : ("[image: " + t.imgAlt + "]");
+            TextStyle st;
+            TTF_Font* f = pickFont(fonts, st.fontSize);
+            SDL_Surface* surf = renderTextWithStyle(f, alt, st);
+            if (surf) {
+                RenderItem it; it.kind = ItemKind::Text;
+                it.rect = { contentX, y, surf->w, surf->h };
+                it.tex = SDL_CreateTextureFromSurface(renderer, surf);
+                int h = surf->h;
+                SDL_FreeSurface(surf);
+                items.push_back(it);
+                y += std::max(baseLineHeight, h + 6);
             }
-            TTF_Font* f = pickFont(fonts, sp.style.fontSize);
-            x += sp.w + textWidth(f, " ");
+            return y;
         }
+
+        int tw = iw, th = ih;
+        if (t.imgAttrW > 0 && t.imgAttrH > 0) { tw = t.imgAttrW; th = t.imgAttrH; }
+        else if (t.imgAttrW > 0) { float s = (float)t.imgAttrW / iw; tw = t.imgAttrW; th = std::max(1, (int)std::lround(ih * s)); }
+        else if (t.imgAttrH > 0) { float s = (float)t.imgAttrH / ih; th = t.imgAttrH; tw = std::max(1, (int)std::lround(iw * s)); }
+        if (tw > contentW && tw > 0) { float s = (float)contentW / tw; tw = contentW; th = std::max(1, (int)std::lround(th * s)); }
+
+        RenderItem it; it.kind = ItemKind::Image; it.rect = { contentX, y, tw, th }; it.tex = tex;
+        items.push_back(it);
+        return y + th + 8;
     }
 
-    return blocks;
+    // Lay out a stream of inline tokens into wrapped lines within [contentX, contentX+contentW).
+    int layoutInline(const std::vector<StyledToken>& toks, int contentX, int startY, int contentW, int textAlign) {
+        int y = startY;
+        int maxLineW = std::max(10, contentW);
+
+        std::vector<StyledWord> line;
+        int lineW = 0;
+
+        auto flush = [&]() {
+            if (line.empty()) return;
+            auto spans = groupWordsToSpans(line);
+            int maxH = 0;
+            for (auto& sp : spans) {
+                TTF_Font* f = pickFont(fonts, sp.style.fontSize);
+                SDL_Surface* surf = renderTextWithStyle(f, sp.text, sp.style);
+                if (surf) {
+                    sp.w = surf->w; sp.h = surf->h;
+                    sp.texture = SDL_CreateTextureFromSurface(renderer, surf);
+                    SDL_FreeSurface(surf);
+                }
+                maxH = std::max(maxH, sp.h);
+            }
+            int total = 0;
+            for (size_t i = 0; i < spans.size(); ++i) {
+                total += spans[i].w;
+                if (i + 1 < spans.size()) {
+                    TTF_Font* f = pickFont(fonts, spans[i].style.fontSize);
+                    total += textWidth(f, " ");
+                }
+            }
+            int lineH = std::max(baseLineHeight, maxH + 6);
+            int xoff = 0;
+            if (textAlign == 1) xoff = std::max(0, (contentW - total) / 2);
+            else if (textAlign == 2) xoff = std::max(0, contentW - total);
+            int x = contentX + xoff;
+            for (auto& sp : spans) {
+                SDL_Rect r { x, y, sp.w, sp.h };
+                if (sp.texture) {
+                    RenderItem it; it.kind = ItemKind::Text; it.rect = r; it.tex = sp.texture;
+                    if (!sp.href.empty()) { it.underline = true; it.underlineColor = sp.style.color; }
+                    items.push_back(it);
+                }
+                if (!sp.href.empty() && sp.w > 0) links.push_back({ r, sp.href });
+                if (!sp.elementId.empty() && sp.w > 0) recordHit(sp.elementId, r);
+                TTF_Font* f = pickFont(fonts, sp.style.fontSize);
+                x += sp.w + textWidth(f, " ");
+            }
+            y += lineH;
+            line.clear();
+            lineW = 0;
+        };
+
+        for (const auto& t : toks) {
+            if (t.kind == TokenKind::Break) {
+                if (line.empty()) y += baseLineHeight; else flush();
+                continue;
+            }
+            if (t.kind == TokenKind::Image) { flush(); y = layoutImageToken(t, contentX, y, contentW); continue; }
+
+            TTF_Font* f = pickFont(fonts, t.style.fontSize);
+            int wW = textWidth(f, t.text);
+            int spaceW = textWidth(f, " ");
+            int add = line.empty() ? wW : (spaceW + wW);
+            if (!line.empty() && lineW + add > maxLineW) flush();
+            if (line.empty()) lineW = wW; else lineW += add;
+            line.push_back(StyledWord{ t.text, t.href, t.style, t.elementId });
+        }
+        flush();
+        return y;
+    }
+
+    // Lay out a block element; returns the y just below it (incl. bottom margin).
+    int layoutBlock(int nodeId, int x, int y, int availWidth,
+                    TextStyle inheritStyle, int inheritAlign, std::string inheritEid) {
+        const DomNode* node = dom.get(nodeId);
+        if (!node || node->type != DomNodeType::Element) return y;
+        const std::string& tag = node->tag;
+
+        if (tag == "head" || tag == "script" || tag == "style" ||
+            tag == "title" || tag == "meta" || tag == "link") return y;
+#ifdef NOCHROME_ENABLE_JS
+        if (tag == "noscript") return y;
+#endif
+
+        std::string id = trimCopy(domGetAttr(*node, "id"));
+        auto classes = parseClassList(domGetAttr(*node, "class"));
+        std::string styleAttr = domGetAttr(*node, "style");
+
+        BoxStyle box;
+        applyBoxDefaults(tag, box);
+        applyBoxRulesForElement(rules, tag, toLowerCopy(id), classes, box);
+        if (!styleAttr.empty()) { StyleRule tmp; applyDeclarationsToRule(tmp, styleAttr); applyBoxRuleProps(tmp, box); }
+        if (box.displayNone) return y;
+
+        TextStyle st = inheritStyle;
+        applyTagDefaults(tag, st);
+        applyRulesForElement(rules, tag, toLowerCopy(id), classes, st);
+        if (!styleAttr.empty()) applyInlineStyle(styleAttr, st);
+
+        int effAlign = (box.textAlign >= 0) ? box.textAlign : inheritAlign;
+        std::string elemId = id.empty() ? inheritEid : id;
+
+        if (tag == "hr") {
+            int top = y + box.mTop;
+            int w = std::max(0, availWidth - box.mLeft - box.mRight);
+            int h = std::max(1, box.borderW);
+            RenderItem it; it.kind = ItemKind::Box;
+            it.rect = { x + box.mLeft, top, w, h };
+            it.hasBg = true; it.bg = box.borderColor;
+            items.push_back(it);
+            return top + h + box.mBottom;
+        }
+
+        int avail = std::max(0, availWidth - box.mLeft - box.mRight);
+        int borderBoxW;
+        if (box.width >= 0) borderBoxW = box.width + box.pLeft + box.pRight + 2 * box.borderW;
+        else if (box.widthPct >= 0) borderBoxW = avail * box.widthPct / 100;
+        else borderBoxW = avail;
+        borderBoxW = std::clamp(borderBoxW, 0, avail);
+
+        int boxLeft = x + box.mLeft;
+        if (box.marginAuto && (box.width >= 0 || box.widthPct >= 0))
+            boxLeft = x + box.mLeft + std::max(0, (avail - borderBoxW) / 2);
+
+        int contentW = std::max(0, borderBoxW - 2 * box.borderW - box.pLeft - box.pRight);
+        int boxTop = y + box.mTop;
+        int contentLeft = boxLeft + box.borderW + box.pLeft;
+        int contentTop = boxTop + box.borderW + box.pTop;
+
+        bool drawBox = box.hasBg || box.borderW > 0;
+        size_t boxIdx = (size_t)-1;
+        if (drawBox) { boxIdx = items.size(); items.push_back(RenderItem{}); }
+
+        int curY = contentTop;
+        std::vector<StyledToken> inlineToks;
+        auto flushInline = [&]() {
+            if (inlineToks.empty()) return;
+            curY = layoutInline(inlineToks, contentLeft, curY, contentW, effAlign);
+            inlineToks.clear();
+        };
+
+        if (tag == "li") {
+            StyledToken b; b.kind = TokenKind::Word; b.text = "\xE2\x80\xA2"; b.style = st; b.elementId = elemId;
+            inlineToks.push_back(b);
+        }
+
+        for (int c : node->children) {
+            const DomNode* cn = dom.get(c);
+            if (!cn) continue;
+            bool childBlock = (cn->type == DomNodeType::Element) && isLayoutBlock(cn->tag);
+            if (childBlock) {
+                flushInline();
+                curY = layoutBlock(c, contentLeft, curY, contentW, st, effAlign, elemId);
+            } else {
+                collectInline(c, st, "", elemId, inlineToks);
+            }
+        }
+        flushInline();
+
+        int contentBottom = curY;
+        int boxBottom = contentBottom + box.pBottom + box.borderW;
+
+        if (drawBox) {
+            RenderItem it; it.kind = ItemKind::Box;
+            it.rect = { boxLeft, boxTop, borderBoxW, std::max(0, boxBottom - boxTop) };
+            it.hasBg = box.hasBg; it.bg = box.bg;
+            it.borderW = box.borderW; it.borderColor = box.borderColor;
+            items[boxIdx] = it;
+        }
+
+        if (!id.empty())
+            recordHit(id, SDL_Rect{ boxLeft, boxTop, borderBoxW, std::max(0, boxBottom - boxTop) });
+
+        return boxBottom + box.mBottom;
+    }
+};
+
+static int layoutDocument(SDL_Renderer* renderer, const FontSet& fonts, const DomTree& dom,
+                          const Url& baseUrl, int contentWidth, int padding, int baseLineHeight,
+                          std::vector<RenderItem>& items, std::vector<LinkHit>& links,
+                          std::vector<ElementHit>& elements, SDL_Color* outPageBg) {
+    items.clear(); links.clear(); elements.clear();
+
+    std::string cssAll; int ext = 0;
+    domCollectCssVisit(dom, dom.root, baseUrl, cssAll, ext);
+    auto rules = parseCssRules(cssAll);
+    if (outPageBg) *outPageBg = extractPageBackgroundFromRules(rules);
+
+    std::unordered_map<std::string, SDL_Rect> idRects;
+    BoxLayout bl{ renderer, fonts, rules, dom, baseUrl, baseLineHeight, items, links, idRects };
+
+    int availWidth = std::max(10, contentWidth - 2 * padding);
+    TextStyle base;
+    int bottom = bl.layoutBlock(dom.root, padding, padding, availWidth, base, -1, "");
+
+    for (auto& kv : idRects) elements.push_back(ElementHit{ kv.second, kv.first });
+    return bottom + padding;
 }
 
 // -------------------- Page state --------------------
@@ -2957,25 +3821,26 @@ struct Page {
     Url baseUrl;
     std::string urlString;
     std::string body;
+    DomTree dom;   // parsed / post-JS DOM tree; the renderer walks this
 
     SDL_Color background {245, 245, 245, 255};
 
-    std::vector<RenderBlock> blocks;
+    std::vector<RenderItem> items;
     std::vector<LinkHit> linkHits;
+    std::vector<ElementHit> elementHits;
     int contentHeight = 0;
 };
 
 static std::string loadPageBodyText(const std::string& urlString, Url& outUrl) {
     std::string normalized = normalizeUserUrl(urlString);
-    outUrl = parseUrl(normalized);
+    Url u = parseUrl(normalized);
+    outUrl = u;
 
     try {
-        netInit();
-        std::string raw = (outUrl.scheme == "https") ? httpsGetRaw(outUrl) : httpGetRaw(outUrl);
-        netCleanup();
-        return extractBodyBytes(raw);
+        std::string headers;
+        std::string body = httpFetchProcessed(u, outUrl, &headers); // redirects + gzip
+        return decodeHtmlToUtf8(headers, body);
     } catch (const std::exception& ex) {
-        netCleanup();
         return std::string("<h2>Network error</h2><p>") + ex.what() + "</p>";
     }
 }
@@ -2986,19 +3851,13 @@ static void rebuildLayout(Page& page,
                           int contentWidth,
                           int padding,
                           int baseLineHeight) {
-    destroyBlocks(renderer, page.blocks);
+    destroyItems(page.items);
 
     SDL_Color bg = page.background;
-    auto tokens = parseHtmlToStyledTokens(page.body, page.baseUrl, &bg);
+    page.contentHeight = layoutDocument(renderer, fonts, page.dom, page.baseUrl,
+                                        contentWidth, padding, baseLineHeight,
+                                        page.items, page.linkHits, page.elementHits, &bg);
     page.background = bg;
-
-    page.blocks = buildBlocksFromTokens(renderer, fonts, tokens, contentWidth, padding, baseLineHeight, page.linkHits);
-
-    int last = padding;
-    for (const auto& b : page.blocks) {
-        last = std::max(last, b.y + b.h);
-    }
-    page.contentHeight = last + padding;
 }
 
 // -------------------- UI helpers --------------------
@@ -3122,6 +3981,9 @@ int main(int argc, char** argv) {
 
     std::vector<TabState> tabs;
     int activeTab = 0;
+#ifdef NOCHROME_ENABLE_JS
+    int activeJsTab = -1; // which tab the shared JS context currently belongs to
+#endif
 
     bool addressFocused = false;
 
@@ -3187,13 +4049,13 @@ int main(int argc, char** argv) {
             std::string jsTitle = runJavaScriptForHtml(js, t.page.body, t.page.baseUrl, t.page.urlString);
             if (!jsTitle.empty()) pageTitle = jsTitle;
 
-#if defined(__APPLE__)
-            // If JS mutated the HTML backing store, re-render from that.
-            if (!js.host.domHtml.empty()) {
-                t.page.body = js.host.domHtml;
-            }
-#endif
+            // The renderer walks the DOM tree; take the post-JS tree from the host.
+            t.page.dom = js.host.dom;
+            js.host.domDirty = false;
+            activeJsTab = idx;
         }
+#else
+        t.page.dom = domParse(t.page.body);
 #endif
 
         t.title = pageTitle;
@@ -3225,7 +4087,7 @@ int main(int argc, char** argv) {
     auto closeTab = [&](int idx){
         if (idx < 0 || idx >= (int)tabs.size()) return;
 
-        destroyBlocks(renderer, tabs[idx].page.blocks);
+        destroyItems(tabs[idx].page.items);
         tabs.erase(tabs.begin() + idx);
 
         if (tabs.empty()) {
@@ -3350,7 +4212,7 @@ int main(int argc, char** argv) {
 
                     
 #ifdef NOCHROME_ENABLE_JS
-#if defined(__APPLE__)
+#if defined(NOCHROME_USE_JSC)
                     // Dispatch click event (best-effort).
                     {
                         g_jsHost = &js.host;
@@ -3369,6 +4231,17 @@ int main(int argc, char** argv) {
 
                         jscDispatchEventSimple(js.ctx, "window:click", evt);
                         jscDispatchEventSimple(js.ctx, "document:click", evt);
+                    }
+#else
+                    if (js.ctx) {
+                        JSValue evt = JS_NewObject(js.ctx);
+                        JS_SetPropertyStr(js.ctx, evt, "type", JS_NewString(js.ctx, "click"));
+                        JS_SetPropertyStr(js.ctx, evt, "clientX", JS_NewInt32(js.ctx, mx));
+                        JS_SetPropertyStr(js.ctx, evt, "clientY", JS_NewInt32(js.ctx, my));
+                        jsDispatchEventSimple(js.ctx, "window:click", evt);
+                        jsDispatchEventSimple(js.ctx, "document:click", evt);
+                        JS_FreeValue(js.ctx, evt);
+                        jsDrainJobs(js);
                     }
 #endif
 #endif
@@ -3422,6 +4295,43 @@ int main(int argc, char** argv) {
 
                         auto& page = tabs[activeTab].page;
 
+#ifdef NOCHROME_ENABLE_JS
+                        // Dispatch a click to the innermost element with an id under the cursor.
+                        if (js.ctx && activeJsTab == activeTab) {
+                            std::string hitId;
+                            long bestArea = -1;
+                            for (const auto& eh : page.elementHits) {
+                                const SDL_Rect& r = eh.rect;
+                                if (mx >= r.x && mx < r.x + r.w &&
+                                    contentY >= r.y && contentY < r.y + r.h) {
+                                    long area = (long)r.w * (long)r.h;
+                                    if (bestArea < 0 || area < bestArea) {
+                                        bestArea = area;
+                                        hitId = eh.id;
+                                    }
+                                }
+                            }
+                            if (!hitId.empty()) {
+#if defined(NOCHROME_USE_JSC)
+                                g_jsHost = &js.host;
+                                JSObjectRef evt = JSObjectMake(js.ctx, nullptr, nullptr);
+                                JSStringRef tn = JSStringCreateWithUTF8CString("type");
+                                JSObjectSetProperty(js.ctx, evt, tn, JSValueMakeString(js.ctx, JSStringCreateWithUTF8CString("click")), kJSPropertyAttributeNone, nullptr);
+                                JSStringRelease(tn);
+                                jscDispatchEventSimple(js.ctx, "el:" + hitId + ":click", evt);
+#else
+                                JSValue evt = JS_NewObject(js.ctx);
+                                JS_SetPropertyStr(js.ctx, evt, "type", JS_NewString(js.ctx, "click"));
+                                JS_SetPropertyStr(js.ctx, evt, "clientX", JS_NewInt32(js.ctx, mx));
+                                JS_SetPropertyStr(js.ctx, evt, "clientY", JS_NewInt32(js.ctx, my));
+                                jsDispatchEventSimple(js.ctx, "el:" + hitId + ":click", evt);
+                                JS_FreeValue(js.ctx, evt);
+                                jsDrainJobs(js);
+#endif
+                            }
+                        }
+#endif
+
                         for (const auto& hit : page.linkHits) {
                             SDL_Rect r = hit.rect;
 
@@ -3459,7 +4369,7 @@ int main(int argc, char** argv) {
                     bool shift = (e.key.keysym.mod & KMOD_SHIFT);
 
 #ifdef NOCHROME_ENABLE_JS
-#if defined(__APPLE__)
+#if defined(NOCHROME_USE_JSC)
                     // Dispatch window/document keydown (best-effort, no target mapping).
                     {
                         g_jsHost = &js.host;
@@ -3483,6 +4393,19 @@ int main(int argc, char** argv) {
 
                         jscDispatchEventSimple(js.ctx, "window:keydown", evt);
                         jscDispatchEventSimple(js.ctx, "document:keydown", evt);
+                    }
+#else
+                    if (js.ctx) {
+                        JSValue evt = JS_NewObject(js.ctx);
+                        JS_SetPropertyStr(js.ctx, evt, "type", JS_NewString(js.ctx, "keydown"));
+                        const char* keyName = SDL_GetKeyName(e.key.keysym.sym);
+                        JS_SetPropertyStr(js.ctx, evt, "key", JS_NewString(js.ctx, keyName ? keyName : ""));
+                        JS_SetPropertyStr(js.ctx, evt, "ctrlKey", JS_NewBool(js.ctx, ctrl));
+                        JS_SetPropertyStr(js.ctx, evt, "shiftKey", JS_NewBool(js.ctx, shift));
+                        jsDispatchEventSimple(js.ctx, "window:keydown", evt);
+                        jsDispatchEventSimple(js.ctx, "document:keydown", evt);
+                        JS_FreeValue(js.ctx, evt);
+                        jsDrainJobs(js);
                     }
 #endif
 #endif
@@ -3552,6 +4475,26 @@ int main(int argc, char** argv) {
                 }
             }
         }
+
+#ifdef NOCHROME_ENABLE_JS
+        // Run due timers + microtasks, then re-render if JS mutated the active tab's DOM.
+        jsPumpTimers(js);
+        if (js.host.domDirty) {
+            js.host.domDirty = false;
+            if (activeJsTab == activeTab && !tabs.empty()) {
+                // The handler mutated the DOM tree; copy it over and re-render.
+                tabs[activeTab].page.dom = js.host.dom;
+                rebuildTabLayout(activeTab);
+                clampScroll();
+
+                std::string jsTitle = jsReadDocumentTitle(js.ctx);
+                if (!jsTitle.empty() && jsTitle != tabs[activeTab].title) {
+                    tabs[activeTab].title = jsTitle;
+                    setWindowTitleFromActive();
+                }
+            }
+        }
+#endif
 
         // ---------- Render ----------
         SDL_SetRenderDrawColor(renderer, 16, 16, 18, 255);
@@ -3654,36 +4597,35 @@ int main(int argc, char** argv) {
 
         int scrollY = (int)tabs[activeTab].scrollYf;
 
-        for (const auto& b : page.blocks) {
-            int yScreen = chromeH + b.y - scrollY;
+        for (const auto& it : page.items) {
+            int yScreen = chromeH + it.rect.y - scrollY;
 
-            if (yScreen + b.h < chromeH - 50) continue;
+            if (yScreen + it.rect.h < chromeH - 50) continue;
             if (yScreen > winH + 50) break;
 
-            if (b.kind == BlockKind::Text) {
-                int x = padding;
-                for (const auto& sp : b.text.spans) {
-                    if (sp.texture) {
-                        SDL_Rect dst { x, yScreen, sp.w, sp.h };
-                        SDL_RenderCopy(renderer, sp.texture, nullptr, &dst);
+            SDL_Rect dst { it.rect.x, yScreen, it.rect.w, it.rect.h };
 
-                        if (!sp.href.empty()) {
-                            SDL_SetRenderDrawColor(renderer,
-                                                   sp.style.color.r,
-                                                   sp.style.color.g,
-                                                   sp.style.color.b, 255);
-                            SDL_Rect ul { x, yScreen + sp.h + 2, sp.w, 1 };
-                            SDL_RenderFillRect(renderer, &ul);
-                        }
-                    }
-
-                    TTF_Font* f = pickFont(fonts, sp.style.fontSize);
-                    x += sp.w + textWidth(f, " ");
+            if (it.kind == ItemKind::Box) {
+                if (it.hasBg) {
+                    drawFilledRect(renderer, dst, it.bg.r, it.bg.g, it.bg.b, it.bg.a ? it.bg.a : 255);
                 }
-            } else if (b.kind == BlockKind::Image) {
-                if (b.image.texture) {
-                    SDL_Rect dst { padding, yScreen, b.image.w, b.image.h };
-                    SDL_RenderCopy(renderer, b.image.texture, nullptr, &dst);
+                if (it.borderW > 0) {
+                    int bw = it.borderW;
+                    SDL_SetRenderDrawColor(renderer, it.borderColor.r, it.borderColor.g, it.borderColor.b, 255);
+                    SDL_Rect sides[4] = {
+                        { dst.x, dst.y, dst.w, bw },
+                        { dst.x, dst.y + dst.h - bw, dst.w, bw },
+                        { dst.x, dst.y, bw, dst.h },
+                        { dst.x + dst.w - bw, dst.y, bw, dst.h }
+                    };
+                    for (auto& s : sides) SDL_RenderFillRect(renderer, &s);
+                }
+            } else if (it.tex) {
+                SDL_RenderCopy(renderer, it.tex, nullptr, &dst);
+                if (it.underline) {
+                    SDL_SetRenderDrawColor(renderer, it.underlineColor.r, it.underlineColor.g, it.underlineColor.b, 255);
+                    SDL_Rect ul { dst.x, dst.y + dst.h + 2, dst.w, 1 };
+                    SDL_RenderFillRect(renderer, &ul);
                 }
             }
         }
@@ -3692,7 +4634,7 @@ int main(int argc, char** argv) {
     }
 
     for (auto& t : tabs) {
-        destroyBlocks(renderer, t.page.blocks);
+        destroyItems(t.page.items);
     }
 
     freeFontSet(fonts);
