@@ -749,21 +749,54 @@ static std::vector<std::string> extractTagContents(const std::string& html, cons
     return blocks;
 }
 
-static std::string decodeEntities(std::string s) {
-    auto rep = [&](const std::string& a, const std::string& b){
-        size_t pos = 0;
-        while ((pos = s.find(a, pos)) != std::string::npos) {
-            s.replace(pos, a.size(), b);
-            pos += b.size();
-        }
+static std::string decodeEntities(const std::string& s) {
+    static const std::unordered_map<std::string, unsigned> named = {
+        {"amp",38},{"lt",60},{"gt",62},{"quot",34},{"apos",39},{"nbsp",160},
+        {"copy",169},{"reg",174},{"trade",8482},{"mdash",8212},{"ndash",8211},
+        {"hellip",8230},{"lsquo",8216},{"rsquo",8217},{"ldquo",8220},{"rdquo",8221},
+        {"middot",183},{"bull",8226},{"times",215},{"divide",247},{"deg",176},
+        {"euro",8364},{"pound",163},{"cent",162},{"yen",165},{"sect",167},
+        {"para",182},{"laquo",171},{"raquo",187},{"iexcl",161},{"iquest",191},
+        {"plusmn",177},{"micro",181},{"frac12",189},{"frac14",188},{"frac34",190},
+        {"larr",8592},{"rarr",8594},{"uarr",8593},{"darr",8595},{"harr",8596},
+        {"infin",8734},{"ne",8800},{"le",8804},{"ge",8805},{"shy",173},
+        {"agrave",224},{"aacute",225},{"acirc",226},{"atilde",227},{"auml",228},{"aring",229},
+        {"ccedil",231},{"egrave",232},{"eacute",233},{"ecirc",234},{"euml",235},
+        {"igrave",236},{"iacute",237},{"ntilde",241},{"ograve",242},{"oacute",243},
+        {"ocirc",244},{"otilde",245},{"ouml",246},{"ugrave",249},{"uacute",250},
+        {"ucirc",251},{"uuml",252},{"szlig",223}
     };
-    rep("&amp;", "&");
-    rep("&lt;", "<");
-    rep("&gt;", ">");
-    rep("&quot;", "\"");
-    rep("&#39;", "'");
-    rep("&nbsp;", " ");
-    return s;
+
+    std::string out;
+    out.reserve(s.size());
+    size_t i = 0;
+    while (i < s.size()) {
+        if (s[i] != '&') { out.push_back(s[i++]); continue; }
+        size_t semi = s.find(';', i + 1);
+        if (semi == std::string::npos || semi - i > 32) { out.push_back(s[i++]); continue; }
+
+        std::string ent = s.substr(i + 1, semi - i - 1);
+        unsigned cp = 0;
+        bool ok = false;
+
+        if (!ent.empty() && ent[0] == '#') {
+            try {
+                if (ent.size() > 2 && (ent[1] == 'x' || ent[1] == 'X'))
+                    cp = (unsigned)std::stoul(ent.substr(2), nullptr, 16);
+                else if (ent.size() > 1)
+                    cp = (unsigned)std::stoul(ent.substr(1), nullptr, 10);
+                ok = (cp != 0);
+            } catch (...) { ok = false; }
+        } else {
+            auto it = named.find(ent);
+            if (it == named.end()) it = named.find(toLowerCopy(ent));
+            if (it != named.end()) { cp = it->second; ok = true; }
+        }
+
+        if (ok) { appendUtf8(out, cp); i = semi + 1; }
+        else    { out.push_back(s[i++]); }
+    }
+    return out;
 }
 
 static std::string getAttrValue(const std::string& tagContent, const std::string& attrNameLower) {
@@ -1697,10 +1730,12 @@ static void jsInstallBaseGlobals(JsEngine& js) {
     JSObjectSetProperty(js.ctx, global, windowName, global, kJSPropertyAttributeNone, nullptr);
     JSStringRelease(windowName);
 
-    // self = global (common in browsers and workers)
-    JSStringRef selfName = JSStringCreateWithUTF8CString("self");
-    JSObjectSetProperty(js.ctx, global, selfName, global, kJSPropertyAttributeNone, nullptr);
-    JSStringRelease(selfName);
+    // self / top / parent / frames all refer to the window (no frames).
+    for (const char* nm : { "self", "top", "parent", "frames" }) {
+        JSStringRef n = JSStringCreateWithUTF8CString(nm);
+        JSObjectSetProperty(js.ctx, global, n, global, kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(n);
+    }
 
     // performance.now()
     JSObjectRef perfObj = JSObjectMake(js.ctx, nullptr, nullptr);
@@ -2139,6 +2174,40 @@ static JSValueRef jscQuerySelector(JSContextRef ctx, JSObjectRef, JSObjectRef, s
     return JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ nid });
 }
 
+static JSValueRef jscNodeArray(JSContextRef ctx, const std::vector<int>& nids) {
+    jscEnsureDomClasses();
+    std::vector<JSValueRef> elems;
+    elems.reserve(nids.size());
+    for (int nid : nids) elems.push_back(JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ nid }));
+    JSValueRef exc = nullptr;
+    JSObjectRef arr = JSObjectMakeArray(ctx, elems.size(), elems.empty() ? nullptr : elems.data(), &exc);
+    return arr ? (JSValueRef)arr : JSValueMakeNull(ctx);
+}
+
+static JSValueRef jscGetElementsByTagName(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost || argc < 1) return jscNodeArray(ctx, {});
+    std::vector<int> found;
+    domCollectByTag(g_jsHost->dom, g_jsHost->dom.root, toLowerCopy(jsToUtf8(ctx, argv[0])), found);
+    return jscNodeArray(ctx, found);
+}
+
+static JSValueRef jscGetElementsByClassName(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost || argc < 1) return jscNodeArray(ctx, {});
+    std::vector<int> found;
+    domCollectByClass(g_jsHost->dom, g_jsHost->dom.root, trimCopy(jsToUtf8(ctx, argv[0])), found);
+    return jscNodeArray(ctx, found);
+}
+
+static JSValueRef jscQuerySelectorAll(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost || argc < 1) return jscNodeArray(ctx, {});
+    std::string sel = trimCopy(jsToUtf8(ctx, argv[0]));
+    std::vector<int> found;
+    if (sel.size() > 1 && sel[0] == '.') domCollectByClass(g_jsHost->dom, g_jsHost->dom.root, sel.substr(1), found);
+    else if (sel.size() > 1 && sel[0] == '#') { int n = domFindById(g_jsHost->dom, g_jsHost->dom.root, sel.substr(1)); if (n >= 0) found.push_back(n); }
+    else if (!sel.empty() && sel.find(' ') == std::string::npos) domCollectByTag(g_jsHost->dom, g_jsHost->dom.root, toLowerCopy(sel), found);
+    return jscNodeArray(ctx, found);
+}
+
 static JSValueRef jscPerformanceNow(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*) {
     if (!g_jsHost) return JSValueMakeNumber(ctx, 0.0);
     auto now = std::chrono::steady_clock::now();
@@ -2211,6 +2280,20 @@ static void jsSetupPageGlobals(JSContextRef ctx, const std::string& url, const s
         JSObjectRef qsFn = JSObjectMakeFunctionWithCallback(ctx, qs, jscQuerySelector);
         JSObjectSetProperty(ctx, document, qs, qsFn, kJSPropertyAttributeNone, nullptr);
         JSStringRelease(qs);
+
+        auto setDocFn = [&](const char* name, JSObjectCallAsFunctionCallback cb) {
+            JSStringRef n = JSStringCreateWithUTF8CString(name);
+            JSObjectSetProperty(ctx, document, n, JSObjectMakeFunctionWithCallback(ctx, n, cb), kJSPropertyAttributeNone, nullptr);
+            JSStringRelease(n);
+        };
+        setDocFn("querySelectorAll", jscQuerySelectorAll);
+        setDocFn("getElementsByTagName", jscGetElementsByTagName);
+        setDocFn("getElementsByClassName", jscGetElementsByClassName);
+
+        JSObjectRef docEl = JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ domFindOrCreateTag(g_jsHost->dom, "html") });
+        JSStringRef den = JSStringCreateWithUTF8CString("documentElement");
+        JSObjectSetProperty(ctx, document, den, docEl, kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(den);
     }
 
     JSStringRef docName = JSStringCreateWithUTF8CString("document");
@@ -2951,6 +3034,41 @@ static JSValue jsQuerySelector(JSContext* ctx, JSValueConst /*this_val*/, int ar
     return qjsMakeElement(ctx, nid);
 }
 
+static JSValue qjsNodeArray(JSContext* ctx, JsHost* host, const std::vector<int>& nids) {
+    JSValue arr = JS_NewArray(ctx);
+    uint32_t i = 0;
+    for (int nid : nids) JS_SetPropertyUint32(ctx, arr, i++, qjsMakeElement(ctx, nid));
+    (void)host;
+    return arr;
+}
+
+static JSValue jsGetElementsByTagName(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (!host || argc < 1) return JS_NewArray(ctx);
+    std::vector<int> found;
+    domCollectByTag(host->dom, host->dom.root, toLowerCopy(jsToUtf8(ctx, argv[0])), found);
+    return qjsNodeArray(ctx, host, found);
+}
+
+static JSValue jsGetElementsByClassName(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (!host || argc < 1) return JS_NewArray(ctx);
+    std::vector<int> found;
+    domCollectByClass(host->dom, host->dom.root, trimCopy(jsToUtf8(ctx, argv[0])), found);
+    return qjsNodeArray(ctx, host, found);
+}
+
+static JSValue jsQuerySelectorAll(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (!host || argc < 1) return JS_NewArray(ctx);
+    std::string sel = trimCopy(jsToUtf8(ctx, argv[0]));
+    std::vector<int> found;
+    if (sel.size() > 1 && sel[0] == '.') domCollectByClass(host->dom, host->dom.root, sel.substr(1), found);
+    else if (sel.size() > 1 && sel[0] == '#') { int n = domFindById(host->dom, host->dom.root, sel.substr(1)); if (n >= 0) found.push_back(n); }
+    else if (!sel.empty() && sel.find(' ') == std::string::npos) domCollectByTag(host->dom, host->dom.root, toLowerCopy(sel), found);
+    return qjsNodeArray(ctx, host, found);
+}
+
 static JSValue jsDocAddEventListener(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
     if (argc < 2 || !JS_IsFunction(ctx, argv[1])) return JS_UNDEFINED;
     qjsAddListener(ctx, "document:" + jsToUtf8(ctx, argv[0]), argv[1]);
@@ -3069,9 +3187,10 @@ static void jsResetContext(JsEngine& js) {
 
     JSValue global = JS_GetGlobalObject(js.ctx);
 
-    // window === self === global
-    JS_SetPropertyStr(js.ctx, global, "window", JS_DupValue(js.ctx, global));
-    JS_SetPropertyStr(js.ctx, global, "self", JS_DupValue(js.ctx, global));
+    // window / self / top / parent / frames all refer to the global (no frames).
+    for (const char* nm : { "window", "self", "top", "parent", "frames" }) {
+        JS_SetPropertyStr(js.ctx, global, nm, JS_DupValue(js.ctx, global));
+    }
 
     // console.log / error / warn / info
     JSValue consoleObj = JS_NewObject(js.ctx);
@@ -3161,12 +3280,16 @@ static void jsSetupPageGlobals(JSContext* ctx, const std::string& url, const std
     JS_SetPropertyStr(ctx, document, "getElementById", JS_NewCFunction(ctx, jsGetElementById, "getElementById", 1));
     JS_SetPropertyStr(ctx, document, "createElement", JS_NewCFunction(ctx, jsCreateElement, "createElement", 1));
     JS_SetPropertyStr(ctx, document, "querySelector", JS_NewCFunction(ctx, jsQuerySelector, "querySelector", 1));
+    JS_SetPropertyStr(ctx, document, "querySelectorAll", JS_NewCFunction(ctx, jsQuerySelectorAll, "querySelectorAll", 1));
+    JS_SetPropertyStr(ctx, document, "getElementsByTagName", JS_NewCFunction(ctx, jsGetElementsByTagName, "getElementsByTagName", 1));
+    JS_SetPropertyStr(ctx, document, "getElementsByClassName", JS_NewCFunction(ctx, jsGetElementsByClassName, "getElementsByClassName", 1));
 
-    // document.body / document.head map to the real <body>/<head> nodes
+    // document.body / head / documentElement map to the real nodes
     // (created if the page omitted them) so appendChild() actually renders.
     if (JsHost* host = qjsHost(ctx)) {
         JS_SetPropertyStr(ctx, document, "body", qjsMakeElement(ctx, domFindOrCreateTag(host->dom, "body")));
         JS_SetPropertyStr(ctx, document, "head", qjsMakeElement(ctx, domFindOrCreateTag(host->dom, "head")));
+        JS_SetPropertyStr(ctx, document, "documentElement", qjsMakeElement(ctx, domFindOrCreateTag(host->dom, "html")));
     }
 
     JS_SetPropertyStr(ctx, global, "document", document);
