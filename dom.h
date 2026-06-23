@@ -55,6 +55,12 @@ static void domSetAttr(DomNode& n, const std::string& key, const std::string& va
     n.attrs.push_back({ key, val });
 }
 
+static void domRemoveAttr(DomNode& n, const std::string& key) {
+    for (size_t i = 0; i < n.attrs.size(); ++i) {
+        if (n.attrs[i].first == key) { n.attrs.erase(n.attrs.begin() + i); return; }
+    }
+}
+
 static void domAppendChild(DomTree& dom, int parentId, int childId) {
     DomNode* child = dom.get(childId);
     if (!child) return;
