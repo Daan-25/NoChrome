@@ -19,6 +19,7 @@ The current implementation is an early prototype of the rendering and UI pipelin
   - DOM: `getElementById`, `querySelector` (`#id`/`.class`/tag), `createElement`, `document.body`/`head`,
     `textContent`/`innerHTML`, `style.display`, `setAttribute`/`getAttribute`, `appendChild`/`removeChild`, `parentNode`
   - events: `window`/`document`/element `addEventListener` with `click` and `keydown` dispatch
+- Form controls: text/password inputs, `<textarea>`, buttons, checkbox/radio, `<select>` — with focus, typing, and GET form submission
 
 ## Limitations (Current Stage)
 - Block-level box model only (no inline boxes, floats, flexbox/grid; tables stack as blocks)
@@ -27,7 +28,7 @@ The current implementation is an early prototype of the rendering and UI pipelin
   - no ES module loading, event bubbling, or `removeEventListener`
   - `querySelector` takes a single simple selector (no combinators)
   - a single shared JS context (multi-tab JS is not isolated)
-- No form controls / input widgets yet
+- Forms submit via GET (POST best-effort); controls lay out block-level, with no caret/selection or `<select>` dropdown
 
 ## Requirements
 - C++17 compiler
