@@ -3545,6 +3545,7 @@ struct RenderItem {
     SDL_Texture* tex = nullptr;
     bool underline = false;
     SDL_Color underlineColor {0, 0, 0, 255};
+    bool clipSrc = false; // clip texture to rect width (left-aligned) instead of scaling
 };
 
 struct LinkHit {
@@ -3555,6 +3556,14 @@ struct LinkHit {
 struct ElementHit {
     SDL_Rect rect; // Content coordinates (bounding box of an element)
     std::string id;
+};
+
+enum class ControlType { Text, Password, TextArea, Button, Submit, Checkbox, Radio, Select };
+
+struct ControlHit {
+    SDL_Rect rect;       // Content coordinates
+    int nodeId = -1;     // DOM node of the control
+    ControlType type = ControlType::Text;
 };
 
 static void destroyItems(std::vector<RenderItem>& items) {
@@ -3630,9 +3639,14 @@ static bool isLayoutBlock(const std::string& tag) {
         "ul","ol","li","section","article","header","footer","nav","main","aside",
         "blockquote","pre","figure","figcaption","table","thead","tbody","tfoot",
         "tr","td","th","form","fieldset","legend","hr","dl","dt","dd","address",
-        "details","summary","script","style","title","meta","link","noscript"
+        "details","summary","script","style","title","meta","link","noscript",
+        "input","textarea","button","select"
     };
     return blocks.count(tag) > 0;
+}
+
+static bool isFormControl(const std::string& tag) {
+    return tag == "input" || tag == "textarea" || tag == "button" || tag == "select";
 }
 
 // -------------------- Block box layout --------------------
@@ -3648,6 +3662,7 @@ struct BoxLayout {
     int baseLineHeight;
     std::vector<RenderItem>& items;
     std::vector<LinkHit>& links;
+    std::vector<ControlHit>& controls;
     std::unordered_map<std::string, SDL_Rect>& idRects;
 
     void recordHit(const std::string& id, const SDL_Rect& r) {
@@ -3810,6 +3825,130 @@ struct BoxLayout {
         return y;
     }
 
+    // Render a form control (input / button / textarea / select) as a box and
+    // record a hit-rect so the UI can focus / click / submit it.
+    int layoutControl(int nodeId, const std::string& tag, int x, int y, int availWidth,
+                      TextStyle st, const BoxStyle& box, const std::string& elemId) {
+        const DomNode* node = dom.get(nodeId);
+        if (!node) return y;
+        std::string type = toLowerCopy(domGetAttr(*node, "type"));
+        int left = x + box.mLeft;
+        int top = y + box.mTop;
+        int avail = std::max(0, availWidth - box.mLeft - box.mRight);
+
+        auto makeText = [&](const std::string& s, SDL_Color col, int* outW, int* outH) -> SDL_Texture* {
+            TextStyle ts = st; ts.color = col;
+            TTF_Font* f = pickFont(fonts, ts.fontSize);
+            SDL_Surface* surf = renderTextWithStyle(f, s, ts);
+            if (!surf) { *outW = 0; *outH = 0; return nullptr; }
+            *outW = surf->w; *outH = surf->h;
+            SDL_Texture* t = SDL_CreateTextureFromSurface(renderer, surf);
+            SDL_FreeSurface(surf);
+            return t;
+        };
+        auto emitText = [&](SDL_Texture* tex, int tx, int ty, int tw, int th, int maxW) {
+            if (!tex) return;
+            RenderItem it; it.kind = ItemKind::Text; it.tex = tex;
+            if (tw > maxW && maxW > 0) { it.clipSrc = true; tw = maxW; }
+            it.rect = { tx, ty, tw, th };
+            items.push_back(it);
+        };
+        auto recordCtrl = [&](const SDL_Rect& r, ControlType ct) {
+            controls.push_back(ControlHit{ r, nodeId, ct });
+            if (!elemId.empty()) recordHit(elemId, r);
+        };
+
+        if (tag == "input" && (type == "checkbox" || type == "radio")) {
+            int sz = 18;
+            SDL_Rect r{ left, top, sz, sz };
+            RenderItem b; b.kind = ItemKind::Box; b.rect = r; b.hasBg = true; b.bg = {255,255,255,255};
+            b.borderW = 2; b.borderColor = {120,120,120,255}; items.push_back(b);
+            if (domGetAttrPtr(*node, "checked")) {
+                RenderItem c; c.kind = ItemKind::Box; c.rect = { left+4, top+4, sz-8, sz-8 };
+                c.hasBg = true; c.bg = {60,100,220,255}; items.push_back(c);
+            }
+            recordCtrl(r, type == "radio" ? ControlType::Radio : ControlType::Checkbox);
+            return top + sz + std::max(6, box.mBottom);
+        }
+
+        bool isBtn = (tag == "button") || (tag == "input" && (type == "submit" || type == "button" || type == "reset"));
+        if (isBtn) {
+            std::string label = (tag == "button") ? domTextContent(dom, nodeId) : domGetAttr(*node, "value");
+            if (label.empty()) label = (type == "submit" || (tag == "button" && type.empty())) ? "Submit" : "Button";
+            int tw = 0, th = 0;
+            SDL_Texture* tex = makeText(label, SDL_Color{20,20,25,255}, &tw, &th);
+            int h = std::max(32, th + 12);
+            int w = (box.width >= 0) ? box.width : std::min(avail, tw + 28);
+            SDL_Rect r{ left, top, w, h };
+            RenderItem b; b.kind = ItemKind::Box; b.rect = r; b.hasBg = true; b.bg = {228,228,232,255};
+            b.borderW = 1; b.borderColor = {140,140,140,255}; items.push_back(b);
+            emitText(tex, left + std::max(8, (w - tw) / 2), top + (h - th) / 2, tw, th, w - 12);
+            ControlType ct = ControlType::Button;
+            if (type == "submit" || (tag == "button" && (type.empty() || type == "submit"))) ct = ControlType::Submit;
+            recordCtrl(r, ct);
+            return top + h + std::max(6, box.mBottom);
+        }
+
+        if (tag == "textarea") {
+            int w = (box.width >= 0) ? box.width : std::min(avail, 460);
+            int rows = domIntAttr(domGetAttr(*node, "rows")); if (rows <= 0) rows = 4;
+            int h = rows * (st.fontSize + 8) + 12;
+            SDL_Rect r{ left, top, w, h };
+            RenderItem b; b.kind = ItemKind::Box; b.rect = r; b.hasBg = true; b.bg = {255,255,255,255};
+            b.borderW = 1; b.borderColor = {150,150,150,255}; items.push_back(b);
+            std::string val = domGetAttrPtr(*node, "value") ? domGetAttr(*node, "value") : domTextContent(dom, nodeId);
+            if (!val.empty()) {
+                std::vector<StyledToken> toks;
+                std::istringstream iss(val); std::string wtok;
+                while (iss >> wtok) { StyledToken t; t.kind = TokenKind::Word; t.text = wtok; t.style = st; toks.push_back(std::move(t)); }
+                layoutInline(toks, left + 8, top + 6, w - 16, 0);
+            }
+            recordCtrl(r, ControlType::TextArea);
+            return top + h + std::max(6, box.mBottom);
+        }
+
+        if (tag == "select") {
+            std::string label;
+            for (int c : node->children) {
+                const DomNode* opt = dom.get(c);
+                if (opt && opt->type == DomNodeType::Element && opt->tag == "option") {
+                    std::string t = domTextContent(dom, c);
+                    if (label.empty()) label = t;
+                    if (domGetAttrPtr(*opt, "selected")) { label = t; break; }
+                }
+            }
+            int tw = 0, th = 0;
+            SDL_Texture* tex = makeText(label.empty() ? " " : label, SDL_Color{30,30,30,255}, &tw, &th);
+            int h = std::max(32, th + 12);
+            int w = (box.width >= 0) ? box.width : std::min(avail, std::max(120, tw + 40));
+            SDL_Rect r{ left, top, w, h };
+            RenderItem b; b.kind = ItemKind::Box; b.rect = r; b.hasBg = true; b.bg = {245,245,247,255};
+            b.borderW = 1; b.borderColor = {150,150,150,255}; items.push_back(b);
+            emitText(tex, left + 8, top + (h - th) / 2, tw, th, w - 28);
+            recordCtrl(r, ControlType::Select);
+            return top + h + std::max(6, box.mBottom);
+        }
+
+        // text-like input (text/search/email/url/tel/number/password/empty/unknown)
+        int w = (box.width >= 0) ? box.width : std::min(avail, 300);
+        int h = std::max(34, st.fontSize + 16);
+        SDL_Rect r{ left, top, w, h };
+        RenderItem b; b.kind = ItemKind::Box; b.rect = r; b.hasBg = true; b.bg = {255,255,255,255};
+        b.borderW = 1; b.borderColor = {150,150,150,255}; items.push_back(b);
+        std::string raw = domGetAttr(*node, "value");
+        std::string shown = raw;
+        SDL_Color col{30,30,30,255};
+        if (shown.empty()) { shown = domGetAttr(*node, "placeholder"); col = {165,165,170,255}; }
+        if (type == "password" && !raw.empty()) shown = std::string(raw.size(), '*');
+        if (!shown.empty()) {
+            int tw = 0, th = 0;
+            SDL_Texture* tex = makeText(shown, col, &tw, &th);
+            emitText(tex, left + 8, top + (h - th) / 2, tw, th, w - 16);
+        }
+        recordCtrl(r, type == "password" ? ControlType::Password : ControlType::Text);
+        return top + h + std::max(6, box.mBottom);
+    }
+
     // Lay out a block element; returns the y just below it (incl. bottom margin).
     int layoutBlock(int nodeId, int x, int y, int availWidth,
                     TextStyle inheritStyle, int inheritAlign, std::string inheritEid) {
@@ -3850,6 +3989,10 @@ struct BoxLayout {
             it.hasBg = true; it.bg = box.borderColor;
             items.push_back(it);
             return top + h + box.mBottom;
+        }
+
+        if (isFormControl(tag)) {
+            return layoutControl(nodeId, tag, x, y, availWidth, st, box, elemId);
         }
 
         int avail = std::max(0, availWidth - box.mLeft - box.mRight);
@@ -3919,8 +4062,9 @@ struct BoxLayout {
 static int layoutDocument(SDL_Renderer* renderer, const FontSet& fonts, const DomTree& dom,
                           const Url& baseUrl, int contentWidth, int padding, int baseLineHeight,
                           std::vector<RenderItem>& items, std::vector<LinkHit>& links,
-                          std::vector<ElementHit>& elements, SDL_Color* outPageBg) {
-    items.clear(); links.clear(); elements.clear();
+                          std::vector<ElementHit>& elements, std::vector<ControlHit>& controls,
+                          SDL_Color* outPageBg) {
+    items.clear(); links.clear(); elements.clear(); controls.clear();
 
     std::string cssAll; int ext = 0;
     domCollectCssVisit(dom, dom.root, baseUrl, cssAll, ext);
@@ -3928,7 +4072,7 @@ static int layoutDocument(SDL_Renderer* renderer, const FontSet& fonts, const Do
     if (outPageBg) *outPageBg = extractPageBackgroundFromRules(rules);
 
     std::unordered_map<std::string, SDL_Rect> idRects;
-    BoxLayout bl{ renderer, fonts, rules, dom, baseUrl, baseLineHeight, items, links, idRects };
+    BoxLayout bl{ renderer, fonts, rules, dom, baseUrl, baseLineHeight, items, links, controls, idRects };
 
     int availWidth = std::max(10, contentWidth - 2 * padding);
     TextStyle base;
@@ -3951,6 +4095,7 @@ struct Page {
     std::vector<RenderItem> items;
     std::vector<LinkHit> linkHits;
     std::vector<ElementHit> elementHits;
+    std::vector<ControlHit> controlHits;
     int contentHeight = 0;
 };
 
@@ -3979,7 +4124,8 @@ static void rebuildLayout(Page& page,
     SDL_Color bg = page.background;
     page.contentHeight = layoutDocument(renderer, fonts, page.dom, page.baseUrl,
                                         contentWidth, padding, baseLineHeight,
-                                        page.items, page.linkHits, page.elementHits, &bg);
+                                        page.items, page.linkHits, page.elementHits,
+                                        page.controlHits, &bg);
     page.background = bg;
 }
 
@@ -3993,6 +4139,69 @@ static void drawFilledRect(SDL_Renderer* r, const SDL_Rect& rect,
                            Uint8 R, Uint8 G, Uint8 B, Uint8 A=255) {
     SDL_SetRenderDrawColor(r, R, G, B, A);
     SDL_RenderFillRect(r, &rect);
+}
+
+// -------------------- Form submission --------------------
+
+static std::string urlEncode(const std::string& s) {
+    static const char* hex = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') out.push_back((char)c);
+        else if (c == ' ') out.push_back('+');
+        else { out.push_back('%'); out.push_back(hex[c >> 4]); out.push_back(hex[c & 0xF]); }
+    }
+    return out;
+}
+
+// Collect successful form fields (name=value) under a node into a query string.
+static void collectFormFields(const DomTree& dom, int nodeId, std::string& query) {
+    const DomNode* n = dom.get(nodeId);
+    if (!n) return;
+
+    if (n->type == DomNodeType::Element) {
+        const std::string& tag = n->tag;
+        std::string name = domGetAttr(*n, "name");
+        if (!name.empty()) {
+            std::string type = toLowerCopy(domGetAttr(*n, "type"));
+            bool include = false;
+            std::string value;
+            if (tag == "input") {
+                if (type == "checkbox" || type == "radio") {
+                    if (domGetAttrPtr(*n, "checked")) {
+                        include = true;
+                        value = domGetAttr(*n, "value");
+                        if (value.empty()) value = "on";
+                    }
+                } else if (type == "submit" || type == "button" || type == "reset" ||
+                           type == "file" || type == "image") {
+                    // not a successful control on its own here
+                } else {
+                    include = true;
+                    value = domGetAttr(*n, "value");
+                }
+            } else if (tag == "textarea") {
+                include = true;
+                value = domGetAttrPtr(*n, "value") ? domGetAttr(*n, "value") : domTextContent(dom, nodeId);
+            } else if (tag == "select") {
+                include = true;
+                for (int c : n->children) {
+                    const DomNode* o = dom.get(c);
+                    if (o && o->type == DomNodeType::Element && o->tag == "option") {
+                        std::string v = domGetAttrPtr(*o, "value") ? domGetAttr(*o, "value") : domTextContent(dom, c);
+                        if (value.empty()) value = v;
+                        if (domGetAttrPtr(*o, "selected")) { value = v; break; }
+                    }
+                }
+            }
+            if (include) {
+                if (!query.empty()) query += "&";
+                query += urlEncode(name) + "=" + urlEncode(value);
+            }
+        }
+    }
+    for (int c : n->children) collectFormFields(dom, c, query);
 }
 
 // -------------------- main --------------------
@@ -4108,6 +4317,9 @@ int main(int argc, char** argv) {
     int activeJsTab = -1; // which tab the shared JS context currently belongs to
 #endif
 
+    int focusedCtrl = -1;   // DOM node id of the focused form control (active tab)
+    int lastActiveTab = 0;  // detect tab switches to drop control focus
+
     bool addressFocused = false;
 
     auto blurAddress = [&](){
@@ -4187,10 +4399,41 @@ int main(int argc, char** argv) {
 
         t.addressInput = t.page.urlString;
         t.scrollYf = 0.0f;
+        if (idx == activeTab) focusedCtrl = -1;
 
         if (idx == activeTab) {
             setWindowTitleFromActive();
         }
+    };
+
+    // Submit the form enclosing the given control node (GET; POST is best-effort).
+    auto submitForm = [&](int ctrlNode){
+        if (tabs.empty()) return;
+        Page& pg = tabs[activeTab].page;
+        DomTree& d = pg.dom;
+
+        int formId = -1;
+        for (int n = ctrlNode; n >= 0; ) {
+            DomNode* nd = d.get(n);
+            if (!nd) break;
+            if (nd->tag == "form") { formId = n; break; }
+            n = nd->parent;
+        }
+
+        std::string query;
+        collectFormFields(d, formId >= 0 ? formId : d.root, query);
+
+        std::string action;
+        if (formId >= 0) action = trimCopy(domGetAttr(*d.get(formId), "action"));
+        std::string target = action.empty() ? pg.urlString : resolveHref(pg.baseUrl, action);
+        if (target.empty()) target = pg.urlString;
+
+        if (!query.empty())
+            target += (target.find('?') == std::string::npos ? "?" : "&") + query;
+
+        focusedCtrl = -1;
+        loadUrlIntoTab(activeTab, target);
+        clampScroll();
     };
 
     auto openNewTab = [&](const std::string& url, bool activate){
@@ -4455,6 +4698,39 @@ int main(int argc, char** argv) {
                         }
 #endif
 
+                        // Form controls take priority over links / text.
+                        bool ctrlHandled = false;
+                        for (const auto& ch : page.controlHits) {
+                            const SDL_Rect& r = ch.rect;
+                            if (!(mx >= r.x && mx < r.x + r.w && contentY >= r.y && contentY < r.y + r.h)) continue;
+                            ctrlHandled = true;
+                            blurAddress();
+                            DomNode* n = page.dom.get(ch.nodeId);
+                            if (ch.type == ControlType::Text || ch.type == ControlType::Password ||
+                                ch.type == ControlType::TextArea) {
+                                focusedCtrl = ch.nodeId;
+                                SDL_StartTextInput();
+                            } else if (ch.type == ControlType::Checkbox || ch.type == ControlType::Radio) {
+                                focusedCtrl = -1;
+                                if (n) {
+                                    if (domGetAttrPtr(*n, "checked")) domRemoveAttr(*n, "checked");
+                                    else domSetAttr(*n, "checked", "");
+                                    rebuildTabLayout(activeTab);
+                                }
+                            } else if (ch.type == ControlType::Submit) {
+                                focusedCtrl = -1;
+                                submitForm(ch.nodeId);
+                            } else {
+                                focusedCtrl = -1; // button / select: no action yet
+                            }
+                            break;
+                        }
+                        if (!ctrlHandled && focusedCtrl >= 0) {
+                            focusedCtrl = -1;
+                            if (!addressFocused) SDL_StopTextInput();
+                        }
+
+                        if (!ctrlHandled)
                         for (const auto& hit : page.linkHits) {
                             SDL_Rect r = hit.rect;
 
@@ -4482,7 +4758,13 @@ int main(int argc, char** argv) {
                 }
 
                 case SDL_TEXTINPUT:
-                    if (addressFocused) {
+                    if (focusedCtrl >= 0) {
+                        DomNode* n = tabs[activeTab].page.dom.get(focusedCtrl);
+                        if (n) {
+                            domSetAttr(*n, "value", domGetAttr(*n, "value") + e.text.text);
+                            rebuildTabLayout(activeTab);
+                        }
+                    } else if (addressFocused) {
                         tabs[activeTab].addressInput += e.text.text;
                     }
                     break;
@@ -4534,6 +4816,8 @@ int main(int argc, char** argv) {
 #endif
 
                     if (e.key.keysym.sym == SDLK_ESCAPE) {
+                        if (focusedCtrl >= 0) { focusedCtrl = -1; if (!addressFocused) SDL_StopTextInput(); break; }
+                        if (addressFocused) { blurAddress(); break; }
                         running = false;
                         break;
                     }
@@ -4584,6 +4868,27 @@ int main(int argc, char** argv) {
                             clampScroll();
                             blurAddress();
                         }
+                    } else if (focusedCtrl >= 0) {
+                        DomNode* fn = tabs[activeTab].page.dom.get(focusedCtrl);
+                        if (fn) {
+                            if (e.key.keysym.sym == SDLK_BACKSPACE) {
+                                std::string v = domGetAttr(*fn, "value");
+                                if (!v.empty()) {
+                                    size_t k = v.size();
+                                    do { k--; } while (k > 0 && ((unsigned char)v[k] & 0xC0) == 0x80);
+                                    v.erase(k);
+                                    domSetAttr(*fn, "value", v);
+                                    rebuildTabLayout(activeTab);
+                                }
+                            } else if (e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_KP_ENTER) {
+                                if (fn->tag == "textarea") {
+                                    domSetAttr(*fn, "value", domGetAttr(*fn, "value") + "\n");
+                                    rebuildTabLayout(activeTab);
+                                } else {
+                                    submitForm(focusedCtrl);
+                                }
+                            }
+                        }
                     } else {
                         // Scrolling shortcuts
                         if (e.key.keysym.sym == SDLK_DOWN) { tabs[activeTab].scrollYf += baseLineHeight; clampScroll(); }
@@ -4618,6 +4923,9 @@ int main(int argc, char** argv) {
             }
         }
 #endif
+
+        // Dropping control focus when the active tab changes.
+        if (lastActiveTab != activeTab) { focusedCtrl = -1; lastActiveTab = activeTab; }
 
         // ---------- Render ----------
         SDL_SetRenderDrawColor(renderer, 16, 16, 18, 255);
@@ -4744,12 +5052,31 @@ int main(int argc, char** argv) {
                     for (auto& s : sides) SDL_RenderFillRect(renderer, &s);
                 }
             } else if (it.tex) {
-                SDL_RenderCopy(renderer, it.tex, nullptr, &dst);
+                if (it.clipSrc) {
+                    SDL_Rect src { 0, 0, it.rect.w, it.rect.h };
+                    SDL_RenderCopy(renderer, it.tex, &src, &dst);
+                } else {
+                    SDL_RenderCopy(renderer, it.tex, nullptr, &dst);
+                }
                 if (it.underline) {
                     SDL_SetRenderDrawColor(renderer, it.underlineColor.r, it.underlineColor.g, it.underlineColor.b, 255);
                     SDL_Rect ul { dst.x, dst.y + dst.h + 2, dst.w, 1 };
                     SDL_RenderFillRect(renderer, &ul);
                 }
+            }
+        }
+
+        // Focus ring on the active form control.
+        if (focusedCtrl >= 0) {
+            for (const auto& ch : page.controlHits) {
+                if (ch.nodeId != focusedCtrl) continue;
+                int ys = chromeH + ch.rect.y - scrollY;
+                SDL_SetRenderDrawColor(renderer, 70, 130, 255, 255);
+                SDL_Rect a { ch.rect.x - 1, ys - 1, ch.rect.w + 2, ch.rect.h + 2 };
+                SDL_Rect b { ch.rect.x, ys, ch.rect.w, ch.rect.h };
+                SDL_RenderDrawRect(renderer, &a);
+                SDL_RenderDrawRect(renderer, &b);
+                break;
             }
         }
 
