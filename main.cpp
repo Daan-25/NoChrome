@@ -1326,6 +1326,15 @@ static std::string fetchSubresourceText(const std::string& absUrl) {
     return fetchSubresourceBytes(absUrl);
 }
 
+// A <script src> that fails to load often yields an HTML error page; evaluating
+// that as JS throws a noisy SyntaxError ("unexpected token '<'"). Treat content
+// whose first non-space character is '<' as non-JS and skip it — except the
+// legacy "<!--" guard that some inline scripts still wrap their code in.
+static bool looksLikeHtmlNotJs(const std::string& code) {
+    std::string t = trimCopy(code);
+    return !t.empty() && t[0] == '<' && t.compare(0, 4, "<!--") != 0;
+}
+
 // -------------------- Page title helper --------------------
 
 static std::string extractTitleFromHtmlSimple(const std::string& html) {
@@ -2071,6 +2080,7 @@ static JSValueRef jscElementAppendChild(JSContextRef ctx, JSObjectRef, JSObjectR
                 std::string abs = resolveHref(g_jsHost->baseUrl, src);
                 if (abs.empty()) abs = src;
                 code = fetchSubresourceText(abs);
+                if (looksLikeHtmlNotJs(code)) code.clear();
             } else {
                 code = domTextContent(g_jsHost->dom, childId);
             }
@@ -2399,6 +2409,7 @@ static std::string runJavaScriptForHtml(JsEngine& js,
             code = fetchSubresourceText(sc.srcAbs);
             filename = sc.srcAbs;
             externalCount++;
+            if (looksLikeHtmlNotJs(code)) continue;
         }
 
         if (trimCopy(code).empty()) continue;
@@ -2945,6 +2956,7 @@ static JSValue qjsElAppendChild(JSContext* ctx, JSValueConst this_val, int argc,
                 std::string abs = resolveHref(host->baseUrl, src);
                 if (abs.empty()) abs = src;
                 code = fetchSubresourceText(abs);
+                if (looksLikeHtmlNotJs(code)) code.clear();
             } else {
                 code = domTextContent(host->dom, childId);
             }
@@ -3364,6 +3376,7 @@ static std::string runJavaScriptForHtml(JsEngine& js,
             code = fetchSubresourceText(sc.srcAbs);
             filename = sc.srcAbs;
             externalCount++;
+            if (looksLikeHtmlNotJs(code)) continue;
         }
 
         if (trimCopy(code).empty()) continue;
