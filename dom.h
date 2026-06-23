@@ -327,6 +327,32 @@ static DomTree domParse(const std::string& html) {
 
         domAppendChild(dom, top(), el);
 
+        // Raw-text / RCDATA elements: their content is NOT parsed as HTML
+        // (so a '<' inside inline <script> JS can't corrupt the tree).
+        if (!selfClose && (name == "script" || name == "style" ||
+                           name == "textarea" || name == "title")) {
+            std::string close = "</" + name;
+            size_t end = std::string::npos;
+            for (size_t p = html.find('<', i); p != std::string::npos; p = html.find('<', p + 1)) {
+                if (p + close.size() > html.size()) break;
+                bool m = true;
+                for (size_t k = 0; k < close.size(); ++k) {
+                    if ((char)std::tolower((unsigned char)html[p + k]) != close[k]) { m = false; break; }
+                }
+                if (m) { end = p; break; }
+            }
+            std::string content = (end == std::string::npos) ? html.substr(i) : html.substr(i, end - i);
+            if (!content.empty()) {
+                int tnode = dom.alloc(DomNodeType::Text);
+                dom.nodes[tnode].text = (name == "textarea" || name == "title")
+                                            ? decodeEntities(content) : content;
+                domAppendChild(dom, el, tnode);
+            }
+            if (end == std::string::npos) { i = html.size(); }
+            else { size_t gt2 = html.find('>', end); i = (gt2 == std::string::npos) ? html.size() : gt2 + 1; }
+            continue;
+        }
+
         if (!domVoidTags().count(name) && !selfClose) stack.push_back(el);
     }
     flushText();

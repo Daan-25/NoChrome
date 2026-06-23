@@ -1326,6 +1326,15 @@ static std::string fetchSubresourceText(const std::string& absUrl) {
     return fetchSubresourceBytes(absUrl);
 }
 
+// A <script src> that fails to load often yields an HTML error page; evaluating
+// that as JS throws a noisy SyntaxError ("unexpected token '<'"). Treat content
+// whose first non-space character is '<' as non-JS and skip it — except the
+// legacy "<!--" guard that some inline scripts still wrap their code in.
+static bool looksLikeHtmlNotJs(const std::string& code) {
+    std::string t = trimCopy(code);
+    return !t.empty() && t[0] == '<' && t.compare(0, 4, "<!--") != 0;
+}
+
 // -------------------- Page title helper --------------------
 
 static std::string extractTitleFromHtmlSimple(const std::string& html) {
@@ -2071,6 +2080,7 @@ static JSValueRef jscElementAppendChild(JSContextRef ctx, JSObjectRef, JSObjectR
                 std::string abs = resolveHref(g_jsHost->baseUrl, src);
                 if (abs.empty()) abs = src;
                 code = fetchSubresourceText(abs);
+                if (looksLikeHtmlNotJs(code)) code.clear();
             } else {
                 code = domTextContent(g_jsHost->dom, childId);
             }
@@ -2399,6 +2409,7 @@ static std::string runJavaScriptForHtml(JsEngine& js,
             code = fetchSubresourceText(sc.srcAbs);
             filename = sc.srcAbs;
             externalCount++;
+            if (looksLikeHtmlNotJs(code)) continue;
         }
 
         if (trimCopy(code).empty()) continue;
@@ -2945,6 +2956,7 @@ static JSValue qjsElAppendChild(JSContext* ctx, JSValueConst this_val, int argc,
                 std::string abs = resolveHref(host->baseUrl, src);
                 if (abs.empty()) abs = src;
                 code = fetchSubresourceText(abs);
+                if (looksLikeHtmlNotJs(code)) code.clear();
             } else {
                 code = domTextContent(host->dom, childId);
             }
@@ -3364,6 +3376,7 @@ static std::string runJavaScriptForHtml(JsEngine& js,
             code = fetchSubresourceText(sc.srcAbs);
             filename = sc.srcAbs;
             externalCount++;
+            if (looksLikeHtmlNotJs(code)) continue;
         }
 
         if (trimCopy(code).empty()) continue;
@@ -3633,20 +3646,20 @@ static int domIntAttr(const std::string& s) {
     try { return std::max(0, std::stoi(v)); } catch (...) { return 0; }
 }
 
-static bool isLayoutBlock(const std::string& tag) {
-    static const std::unordered_set<std::string> blocks = {
-        "#root","html","body","head","div","p","h1","h2","h3","h4","h5","h6",
-        "ul","ol","li","section","article","header","footer","nav","main","aside",
-        "blockquote","pre","figure","figcaption","table","thead","tbody","tfoot",
-        "tr","td","th","form","fieldset","legend","hr","dl","dt","dd","address",
-        "details","summary","script","style","title","meta","link","noscript",
-        "input","textarea","button","select"
-    };
-    return blocks.count(tag) > 0;
-}
-
 static bool isFormControl(const std::string& tag) {
     return tag == "input" || tag == "textarea" || tag == "button" || tag == "select";
+}
+
+// Genuinely inline elements. Everything else (including unknown wrappers like
+// <center> and block elements) is laid out as a block, so block content is
+// never mistakenly funneled through inline collection.
+static bool isInlineTag(const std::string& tag) {
+    static const std::unordered_set<std::string> inl = {
+        "a","b","i","em","strong","span","small","code","sub","sup","mark","u",
+        "s","strike","tt","big","abbr","cite","q","var","samp","kbd","font","time",
+        "ins","del","bdi","bdo","wbr","ruby","rt","rp","br","img"
+    };
+    return inl.count(tag) > 0;
 }
 
 // -------------------- Block box layout --------------------
@@ -3832,6 +3845,8 @@ struct BoxLayout {
         const DomNode* node = dom.get(nodeId);
         if (!node) return y;
         std::string type = toLowerCopy(domGetAttr(*node, "type"));
+        // Hidden inputs carry form data but render nothing and take no space.
+        if (tag == "input" && type == "hidden") return y;
         int left = x + box.mLeft;
         int top = y + box.mTop;
         int avail = std::max(0, availWidth - box.mLeft - box.mRight);
@@ -4031,7 +4046,7 @@ struct BoxLayout {
         for (int c : node->children) {
             const DomNode* cn = dom.get(c);
             if (!cn) continue;
-            bool childBlock = (cn->type == DomNodeType::Element) && isLayoutBlock(cn->tag);
+            bool childBlock = (cn->type == DomNodeType::Element) && !isInlineTag(cn->tag);
             if (childBlock) {
                 flushInline();
                 curY = layoutBlock(c, contentLeft, curY, contentW, st, effAlign, elemId);
