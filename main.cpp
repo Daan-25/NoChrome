@@ -2354,6 +2354,19 @@ static void jsSetupPageGlobals(JSContextRef ctx, const std::string& url, const s
     JSStringRef navName = JSStringCreateWithUTF8CString("navigator");
     JSObjectSetProperty(ctx, global, navName, navigator, kJSPropertyAttributeNone, nullptr);
     JSStringRelease(navName);
+
+    // Image(): minimal HTMLImageElement constructor. Sites use `new Image()`
+    // for preloading and tracking pixels (img.src = url). Delegates to
+    // createElement so it behaves like a real detached <img> node.
+    {
+        static const char kImageShim[] =
+            "function Image(w,h){var e=document.createElement('img');"
+            "if(w!=null)e.setAttribute('width',w);"
+            "if(h!=null)e.setAttribute('height',h);return e;}";
+        JSStringRef s = JSStringCreateWithUTF8CString(kImageShim);
+        JSEvaluateScript(ctx, s, nullptr, nullptr, 1, nullptr);
+        JSStringRelease(s);
+    }
 }
 
 static std::string jsReadDocumentTitle(JSContextRef ctx) {
@@ -3316,6 +3329,16 @@ static void jsSetupPageGlobals(JSContext* ctx, const std::string& url, const std
 
     // window/global addEventListener (window === global here).
     JS_SetPropertyStr(ctx, global, "addEventListener", JS_NewCFunction(ctx, jsWinAddEventListener, "addEventListener", 2));
+
+    // Image(): minimal HTMLImageElement constructor. Sites use `new Image()`
+    // for preloading and tracking pixels (img.src = url). Delegates to
+    // createElement so it behaves like a real detached <img> node.
+    static const char kImageShim[] =
+        "function Image(w,h){var e=document.createElement('img');"
+        "if(w!=null)e.setAttribute('width',w);"
+        "if(h!=null)e.setAttribute('height',h);return e;}";
+    JSValue imgRes = JS_Eval(ctx, kImageShim, sizeof(kImageShim) - 1, "<builtin>", JS_EVAL_TYPE_GLOBAL);
+    JS_FreeValue(ctx, imgRes);
 
     JS_FreeValue(ctx, global);
 }
