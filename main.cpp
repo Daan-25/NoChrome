@@ -1908,37 +1908,42 @@ static int jscElNodeId(JSObjectRef object) {
     return priv ? priv->nodeId : -1;
 }
 
+static int jscSiblingId(int nid, int dir) {   // dir +1 next, -1 prev
+    if (!g_jsHost) return -1;
+    DomNode* n = g_jsHost->dom.get(nid);
+    if (!n || n->parent < 0) return -1;
+    DomNode* p = g_jsHost->dom.get(n->parent);
+    if (!p) return -1;
+    auto& cs = p->children;
+    for (size_t i = 0; i < cs.size(); ++i)
+        if (cs[i] == nid) { int j = (int)i + dir; return (j < 0 || j >= (int)cs.size()) ? -1 : cs[j]; }
+    return -1;
+}
+static JSValueRef jscNodeArray(JSContextRef ctx, const std::vector<int>& nids);
+
 static JSValueRef jscStyleGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef* /*exception*/) {
     auto* priv = (JscStylePriv*)JSObjectGetPrivate(object);
-    if (!priv || !g_jsHost) return JSValueMakeUndefined(ctx);
-
+    if (!priv || !g_jsHost) return nullptr;
     std::string prop = jsStringToUtf8(propertyName);
-    if (prop == "display") {
-        DomNode* n = g_jsHost->dom.get(priv->nodeId);
-        std::string v = n ? n->styleDisplay : "";
-        JSStringRef s = JSStringCreateWithUTF8CString(v.c_str());
-        JSValueRef vStr = JSValueMakeString(ctx, s);
-        JSStringRelease(s);
-        return vStr;
-    }
-
-    return JSValueMakeUndefined(ctx);
+    if (!cssIsKnownProp(prop)) return nullptr; // delegate (methods, toString, ...)
+    DomNode* n = g_jsHost->dom.get(priv->nodeId);
+    std::string v = n ? domGetStyleProp(*n, prop) : "";
+    JSStringRef s = JSStringCreateWithUTF8CString(v.c_str());
+    JSValueRef vStr = JSValueMakeString(ctx, s);
+    JSStringRelease(s);
+    return vStr;
 }
 
 static bool jscStyleSetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef value, JSValueRef* /*exception*/) {
     auto* priv = (JscStylePriv*)JSObjectGetPrivate(object);
     if (!priv || !g_jsHost) return false;
-
     std::string prop = jsStringToUtf8(propertyName);
-    if (prop == "display") {
-        if (DomNode* n = g_jsHost->dom.get(priv->nodeId)) {
-            n->styleDisplay = jsToUtf8(ctx, value);
-            g_jsHost->domDirty = true;
-        }
-        return true;
+    if (!cssIsKnownProp(prop)) return false; // store as a plain JS property
+    if (DomNode* n = g_jsHost->dom.get(priv->nodeId)) {
+        domSetStyleProp(*n, prop, jsToUtf8(ctx, value));
+        g_jsHost->domDirty = true;
     }
-
-    return false;
+    return true;
 }
 
 
@@ -1959,6 +1964,13 @@ static JSValueRef jscElementSetAttribute(JSContextRef ctx, JSObjectRef function,
 static JSValueRef jscElementGetAttribute(JSContextRef ctx, JSObjectRef function,
                                         JSObjectRef thisObject, size_t argumentCount,
                                         const JSValueRef arguments[], JSValueRef* exception);
+// Batch 1 DOM additions.
+static JSValueRef jscElementInsertBefore(JSContextRef, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*);
+static JSValueRef jscElementReplaceChild(JSContextRef, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*);
+static JSValueRef jscElementCloneNode(JSContextRef, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*);
+static JSValueRef jscElementHasAttribute(JSContextRef, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*);
+static JSValueRef jscElementRemoveAttribute(JSContextRef, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*);
+static JSObjectRef jscMakeClassList(JSContextRef, int);
 #endif
 
 static JSValueRef jscElementGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef* /*exception*/) {
@@ -2003,6 +2015,39 @@ static JSValueRef jscElementGetProperty(JSContextRef ctx, JSObjectRef object, JS
     if (prop == "removeChild")      return makeFn("removeChild", jscElementRemoveChild);
     if (prop == "setAttribute")     return makeFn("setAttribute", jscElementSetAttribute);
     if (prop == "getAttribute")     return makeFn("getAttribute", jscElementGetAttribute);
+
+    // --- traversal (Batch 1) ---
+    if (prop == "classList")  return jscMakeClassList(ctx, nid);
+    if (prop == "childNodes") return jscNodeArray(ctx, n->children);
+    if (prop == "children") {
+        std::vector<int> els;
+        for (int c : n->children) {
+            DomNode* cn = g_jsHost->dom.get(c);
+            if (cn && cn->type == DomNodeType::Element) els.push_back(c);
+        }
+        return jscNodeArray(ctx, els);
+    }
+    if (prop == "firstChild")
+        return n->children.empty() ? JSValueMakeNull(ctx)
+            : (JSValueRef)JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ n->children.front() });
+    if (prop == "lastChild")
+        return n->children.empty() ? JSValueMakeNull(ctx)
+            : (JSValueRef)JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ n->children.back() });
+    if (prop == "nextSibling") {
+        int s = jscSiblingId(nid, +1);
+        return s < 0 ? JSValueMakeNull(ctx) : (JSValueRef)JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ s });
+    }
+    if (prop == "previousSibling") {
+        int s = jscSiblingId(nid, -1);
+        return s < 0 ? JSValueMakeNull(ctx) : (JSValueRef)JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ s });
+    }
+
+    // --- mutation / attribute methods (Batch 1) ---
+    if (prop == "insertBefore")    return makeFn("insertBefore", jscElementInsertBefore);
+    if (prop == "replaceChild")    return makeFn("replaceChild", jscElementReplaceChild);
+    if (prop == "cloneNode")       return makeFn("cloneNode", jscElementCloneNode);
+    if (prop == "hasAttribute")    return makeFn("hasAttribute", jscElementHasAttribute);
+    if (prop == "removeAttribute") return makeFn("removeAttribute", jscElementRemoveAttribute);
 
     return nullptr; // delegate (stored props / prototype)
 }
@@ -2194,6 +2239,117 @@ static JSValueRef jscNodeArray(JSContextRef ctx, const std::vector<int>& nids) {
     return arr ? (JSValueRef)arr : JSValueMakeNull(ctx);
 }
 
+// ---------- Batch 1: DOM mutation / classList / text nodes (JSC) ----------
+
+static int jscArgNodeId(JSContextRef ctx, JSValueRef v) {
+    if (!JSValueIsObject(ctx, v)) return -1;
+    auto* p = (JscElementPriv*)JSObjectGetPrivate(JSValueToObject(ctx, v, nullptr));
+    return p ? p->nodeId : -1;
+}
+
+static JSValueRef jscElementInsertBefore(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost || argc < 1) return JSValueMakeUndefined(ctx);
+    int pid = jscElNodeId(thisObject);
+    int newId = jscArgNodeId(ctx, argv[0]);
+    int refId = (argc >= 2) ? jscArgNodeId(ctx, argv[1]) : -1;
+    if (pid < 0 || newId < 0) return argv[0];
+    domInsertBefore(g_jsHost->dom, pid, newId, refId);
+    g_jsHost->domDirty = true;
+    return argv[0];
+}
+static JSValueRef jscElementReplaceChild(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost || argc < 2) return JSValueMakeUndefined(ctx);
+    int pid = jscElNodeId(thisObject);
+    int newId = jscArgNodeId(ctx, argv[0]);
+    int oldId = jscArgNodeId(ctx, argv[1]);
+    if (pid < 0 || newId < 0 || oldId < 0) return JSValueMakeUndefined(ctx);
+    domInsertBefore(g_jsHost->dom, pid, newId, oldId);
+    domRemoveChild(g_jsHost->dom, pid, oldId);
+    g_jsHost->domDirty = true;
+    return argv[1];
+}
+static JSValueRef jscElementCloneNode(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost) return JSValueMakeNull(ctx);
+    int nid = jscElNodeId(thisObject);
+    if (nid < 0) return JSValueMakeNull(ctx);
+    bool deep = (argc > 0) && JSValueToBoolean(ctx, argv[0]);
+    int cl = domCloneSubtree(g_jsHost->dom, nid, deep);
+    if (cl < 0) return JSValueMakeNull(ctx);
+    jscEnsureDomClasses();
+    return JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ cl });
+}
+static JSValueRef jscElementHasAttribute(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    DomNode* n = jscElNode(thisObject);
+    if (!n || argc < 1) return JSValueMakeBoolean(ctx, false);
+    return JSValueMakeBoolean(ctx, domGetAttrPtr(*n, toLowerCopy(jsToUtf8(ctx, argv[0]))) != nullptr);
+}
+static JSValueRef jscElementRemoveAttribute(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    DomNode* n = jscElNode(thisObject);
+    if (n && argc >= 1) {
+        domRemoveAttr(*n, toLowerCopy(jsToUtf8(ctx, argv[0])));
+        if (g_jsHost) g_jsHost->domDirty = true;
+    }
+    return JSValueMakeUndefined(ctx);
+}
+
+// classList: a plain object carrying its element id in a hidden "_nid" property.
+static int jscClassListNid(JSContextRef ctx, JSObjectRef thisObject) {
+    JSStringRef k = JSStringCreateWithUTF8CString("_nid");
+    JSValueRef v = JSObjectGetProperty(ctx, thisObject, k, nullptr);
+    JSStringRelease(k);
+    return (int)JSValueToNumber(ctx, v, nullptr);
+}
+static JSValueRef jscClassListAdd(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (g_jsHost) if (DomNode* n = g_jsHost->dom.get(jscClassListNid(ctx, thisObject)))
+        for (size_t i = 0; i < argc; ++i) { domClassAdd(*n, jsToUtf8(ctx, argv[i])); g_jsHost->domDirty = true; }
+    return JSValueMakeUndefined(ctx);
+}
+static JSValueRef jscClassListRemove(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (g_jsHost) if (DomNode* n = g_jsHost->dom.get(jscClassListNid(ctx, thisObject)))
+        for (size_t i = 0; i < argc; ++i) { domClassRemove(*n, jsToUtf8(ctx, argv[i])); g_jsHost->domDirty = true; }
+    return JSValueMakeUndefined(ctx);
+}
+static JSValueRef jscClassListContains(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (argc >= 1 && g_jsHost) if (DomNode* n = g_jsHost->dom.get(jscClassListNid(ctx, thisObject)))
+        return JSValueMakeBoolean(ctx, domClassContains(*n, jsToUtf8(ctx, argv[0])));
+    return JSValueMakeBoolean(ctx, false);
+}
+static JSValueRef jscClassListToggle(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (argc < 1 || !g_jsHost) return JSValueMakeBoolean(ctx, false);
+    DomNode* n = g_jsHost->dom.get(jscClassListNid(ctx, thisObject));
+    if (!n) return JSValueMakeBoolean(ctx, false);
+    std::string cls = jsToUtf8(ctx, argv[0]);
+    bool add = (argc >= 2) ? JSValueToBoolean(ctx, argv[1]) : !domClassContains(*n, cls);
+    if (add) domClassAdd(*n, cls); else domClassRemove(*n, cls);
+    g_jsHost->domDirty = true;
+    return JSValueMakeBoolean(ctx, add);
+}
+static JSObjectRef jscMakeClassList(JSContextRef ctx, int nid) {
+    JSObjectRef o = JSObjectMake(ctx, nullptr, nullptr);
+    JSStringRef k = JSStringCreateWithUTF8CString("_nid");
+    JSObjectSetProperty(ctx, o, k, JSValueMakeNumber(ctx, nid),
+                        kJSPropertyAttributeDontEnum | kJSPropertyAttributeReadOnly, nullptr);
+    JSStringRelease(k);
+    auto add = [&](const char* name, JSObjectCallAsFunctionCallback cb) {
+        JSStringRef nm = JSStringCreateWithUTF8CString(name);
+        JSObjectSetProperty(ctx, o, nm, JSObjectMakeFunctionWithCallback(ctx, nm, cb), kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(nm);
+    };
+    add("add", jscClassListAdd);
+    add("remove", jscClassListRemove);
+    add("toggle", jscClassListToggle);
+    add("contains", jscClassListContains);
+    return o;
+}
+
+static JSValueRef jscCreateTextNode(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost) return JSValueMakeNull(ctx);
+    int nid = g_jsHost->dom.alloc(DomNodeType::Text);
+    g_jsHost->dom.nodes[nid].text = (argc > 0) ? jsToUtf8(ctx, argv[0]) : "";
+    jscEnsureDomClasses();
+    return JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ nid });
+}
+
 static JSValueRef jscGetElementsByTagName(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) {
     if (!g_jsHost || argc < 1) return jscNodeArray(ctx, {});
     std::vector<int> found;
@@ -2273,6 +2429,12 @@ static void jsSetupPageGlobals(JSContextRef ctx, const std::string& url, const s
         });
         JSObjectSetProperty(ctx, document, ce, ceFn, kJSPropertyAttributeNone, nullptr);
         JSStringRelease(ce);
+
+        // document.createTextNode
+        JSStringRef ctn = JSStringCreateWithUTF8CString("createTextNode");
+        JSObjectRef ctnFn = JSObjectMakeFunctionWithCallback(ctx, ctn, jscCreateTextNode);
+        JSObjectSetProperty(ctx, document, ctn, ctnFn, kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(ctn);
 
         // document.body / document.head resolve to the real <body>/<head> nodes
         // (created if the page omitted them) so appendChild() actually renders.
@@ -2849,26 +3011,52 @@ static JSValue qjsElAppendChild(JSContext* ctx, JSValueConst this_val, int argc,
 static JSValue qjsElRemoveChild(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
 static JSValue qjsElSetAttribute(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
 static JSValue qjsElGetAttribute(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
+// Batch 1 DOM: traversal / mutation / classList (defined after qjsNodeArray).
+static JSValue qjsElInsertBefore(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElReplaceChild(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElCloneNode(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElHasAttribute(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElRemoveAttribute(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElGetClassName(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElSetClassName(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElGetClassList(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElGetChildNodes(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElGetChildren(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElGetFirstChild(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElGetLastChild(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElGetNextSibling(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElGetPrevSibling(JSContext*, JSValueConst, int, JSValueConst*);
 
-static JSValue qjsStyleGetDisplay(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+// style.<prop> get/set for a curated set of common CSS properties. The property
+// name is carried in CFunctionData so one pair of callbacks serves them all.
+static JSValue qjsStylePropGet(JSContext* ctx, JSValueConst this_val, int, JSValueConst*, int, JSValue* data) {
     JsHost* host = qjsHost(ctx);
     auto* p = (QjsStylePriv*)JS_GetOpaque(this_val, g_qjsStyleClassId);
-    if (!host || !p) return JS_UNDEFINED;
+    if (!host || !p) return JS_NewString(ctx, "");
     DomNode* n = host->dom.get(p->nodeId);
-    return JS_NewString(ctx, n ? n->styleDisplay.c_str() : "");
+    return JS_NewString(ctx, n ? domGetStyleProp(*n, jsToUtf8(ctx, data[0])).c_str() : "");
 }
-
-static JSValue qjsStyleSetDisplay(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+static JSValue qjsStylePropSet(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv, int, JSValue* data) {
     JsHost* host = qjsHost(ctx);
     auto* p = (QjsStylePriv*)JS_GetOpaque(this_val, g_qjsStyleClassId);
-    if (!host || !p) return JS_UNDEFINED;
-    if (DomNode* n = host->dom.get(p->nodeId)) {
-        n->styleDisplay = (argc > 0) ? jsToUtf8(ctx, argv[0]) : "";
-        host->domDirty = true;
+    if (host && p) {
+        if (DomNode* n = host->dom.get(p->nodeId)) {
+            domSetStyleProp(*n, jsToUtf8(ctx, data[0]), (argc > 0) ? jsToUtf8(ctx, argv[0]) : "");
+            host->domDirty = true;
+        }
     }
     return JS_UNDEFINED;
 }
-
+static void qjsDefineStyleProp(JSContext* ctx, JSValueConst proto, const char* jsName) {
+    JSValue nameVal = JS_NewString(ctx, jsName);
+    JSValueConst data[1] = { nameVal };
+    JSValue g = JS_NewCFunctionData(ctx, qjsStylePropGet, 0, 0, 1, data);
+    JSValue s = JS_NewCFunctionData(ctx, qjsStylePropSet, 1, 0, 1, data);
+    JS_FreeValue(ctx, nameVal);
+    JSAtom atom = JS_NewAtom(ctx, jsName);
+    JS_DefinePropertyGetSet(ctx, proto, atom, g, s, JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE);
+    JS_FreeAtom(ctx, atom);
+}
 static void qjsRegisterDomClasses(JSRuntime* rt) {
     if (g_qjsElementClassId == 0) {
         JS_NewClassID(&g_qjsElementClassId);
@@ -2915,7 +3103,20 @@ static void qjsSetupDomProtos(JSContext* ctx) {
     JS_SetPropertyStr(ctx, elProto, "setAttribute", JS_NewCFunction(ctx, qjsElSetAttribute, "setAttribute", 2));
     JS_SetPropertyStr(ctx, elProto, "getAttribute", JS_NewCFunction(ctx, qjsElGetAttribute, "getAttribute", 1));
     JS_SetPropertyStr(ctx, elProto, "removeChild", JS_NewCFunction(ctx, qjsElRemoveChild, "removeChild", 1));
+    JS_SetPropertyStr(ctx, elProto, "insertBefore", JS_NewCFunction(ctx, qjsElInsertBefore, "insertBefore", 2));
+    JS_SetPropertyStr(ctx, elProto, "replaceChild", JS_NewCFunction(ctx, qjsElReplaceChild, "replaceChild", 2));
+    JS_SetPropertyStr(ctx, elProto, "cloneNode", JS_NewCFunction(ctx, qjsElCloneNode, "cloneNode", 1));
+    JS_SetPropertyStr(ctx, elProto, "hasAttribute", JS_NewCFunction(ctx, qjsElHasAttribute, "hasAttribute", 1));
+    JS_SetPropertyStr(ctx, elProto, "removeAttribute", JS_NewCFunction(ctx, qjsElRemoveAttribute, "removeAttribute", 1));
     qjsDefineAccessor(ctx, elProto, "id", qjsElGetId, qjsElSetId);
+    qjsDefineAccessor(ctx, elProto, "className", qjsElGetClassName, qjsElSetClassName);
+    qjsDefineAccessor(ctx, elProto, "classList", qjsElGetClassList, nullptr);
+    qjsDefineAccessor(ctx, elProto, "childNodes", qjsElGetChildNodes, nullptr);
+    qjsDefineAccessor(ctx, elProto, "children", qjsElGetChildren, nullptr);
+    qjsDefineAccessor(ctx, elProto, "firstChild", qjsElGetFirstChild, nullptr);
+    qjsDefineAccessor(ctx, elProto, "lastChild", qjsElGetLastChild, nullptr);
+    qjsDefineAccessor(ctx, elProto, "nextSibling", qjsElGetNextSibling, nullptr);
+    qjsDefineAccessor(ctx, elProto, "previousSibling", qjsElGetPrevSibling, nullptr);
     qjsDefineAccessor(ctx, elProto, "tagName", qjsElGetTagName, nullptr);
     qjsDefineAccessor(ctx, elProto, "style", qjsElGetStyle, nullptr);
     qjsDefineAccessor(ctx, elProto, "parentNode", qjsElGetParent, nullptr);
@@ -2930,7 +3131,7 @@ static void qjsSetupDomProtos(JSContext* ctx) {
     JS_SetClassProto(ctx, g_qjsElementClassId, elProto);
 
     JSValue stProto = JS_NewObject(ctx);
-    qjsDefineAccessor(ctx, stProto, "display", qjsStyleGetDisplay, qjsStyleSetDisplay);
+    for (const char* pn : kCssProps) qjsDefineStyleProp(ctx, stProto, pn);
     JS_SetClassProto(ctx, g_qjsStyleClassId, stProto);
 }
 
@@ -3065,6 +3266,178 @@ static JSValue qjsNodeArray(JSContext* ctx, JsHost* host, const std::vector<int>
     for (int nid : nids) JS_SetPropertyUint32(ctx, arr, i++, qjsMakeElement(ctx, nid));
     (void)host;
     return arr;
+}
+
+// ---------- Batch 1: DOM traversal / mutation / classList / style ----------
+
+static int qjsSiblingId(JsHost* host, int nid, int dir) {   // dir +1 next, -1 prev
+    DomNode* n = host->dom.get(nid);
+    if (!n || n->parent < 0) return -1;
+    DomNode* p = host->dom.get(n->parent);
+    if (!p) return -1;
+    auto& cs = p->children;
+    for (size_t i = 0; i < cs.size(); ++i) {
+        if (cs[i] == nid) {
+            int j = (int)i + dir;
+            return (j < 0 || j >= (int)cs.size()) ? -1 : cs[j];
+        }
+    }
+    return -1;
+}
+
+static JSValue qjsElGetChildNodes(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0) return JS_NewArray(ctx);
+    DomNode* n = host->dom.get(nid);
+    return qjsNodeArray(ctx, host, n ? n->children : std::vector<int>{});
+}
+static JSValue qjsElGetChildren(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0) return JS_NewArray(ctx);
+    std::vector<int> els;
+    if (DomNode* n = host->dom.get(nid))
+        for (int c : n->children) {
+            DomNode* cn = host->dom.get(c);
+            if (cn && cn->type == DomNodeType::Element) els.push_back(c);
+        }
+    return qjsNodeArray(ctx, host, els);
+}
+static JSValue qjsElGetFirstChild(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0) return JS_NULL;
+    DomNode* n = host->dom.get(nid);
+    return (!n || n->children.empty()) ? JS_NULL : qjsMakeElement(ctx, n->children.front());
+}
+static JSValue qjsElGetLastChild(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0) return JS_NULL;
+    DomNode* n = host->dom.get(nid);
+    return (!n || n->children.empty()) ? JS_NULL : qjsMakeElement(ctx, n->children.back());
+}
+static JSValue qjsElGetNextSibling(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0) return JS_NULL;
+    int s = qjsSiblingId(host, nid, +1);
+    return s < 0 ? JS_NULL : qjsMakeElement(ctx, s);
+}
+static JSValue qjsElGetPrevSibling(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0) return JS_NULL;
+    int s = qjsSiblingId(host, nid, -1);
+    return s < 0 ? JS_NULL : qjsMakeElement(ctx, s);
+}
+static JSValue qjsElGetClassName(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    DomNode* n = qjsElNode(ctx, this_val);
+    return JS_NewString(ctx, n ? domGetAttr(*n, "class").c_str() : "");
+}
+static JSValue qjsElSetClassName(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (DomNode* n = qjsElNode(ctx, this_val)) {
+        domSetAttr(*n, "class", (argc > 0) ? jsToUtf8(ctx, argv[0]) : "");
+        if (host) host->domDirty = true;
+    }
+    return JS_UNDEFINED;
+}
+static JSValue qjsElInsertBefore(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    int pid = qjsElNodeId(this_val);
+    if (!host || pid < 0 || argc < 1) return JS_UNDEFINED;
+    int newId = qjsElNodeId(argv[0]);
+    int refId = (argc >= 2) ? qjsElNodeId(argv[1]) : -1;
+    if (newId < 0) return JS_UNDEFINED;
+    domInsertBefore(host->dom, pid, newId, refId);
+    host->domDirty = true;
+    return JS_DupValue(ctx, argv[0]);
+}
+static JSValue qjsElReplaceChild(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    int pid = qjsElNodeId(this_val);
+    if (!host || pid < 0 || argc < 2) return JS_UNDEFINED;
+    int newId = qjsElNodeId(argv[0]);
+    int oldId = qjsElNodeId(argv[1]);
+    if (newId < 0 || oldId < 0) return JS_UNDEFINED;
+    domInsertBefore(host->dom, pid, newId, oldId);   // place new where old was
+    domRemoveChild(host->dom, pid, oldId);
+    host->domDirty = true;
+    return JS_DupValue(ctx, argv[1]);
+}
+static JSValue qjsElCloneNode(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0) return JS_NULL;
+    bool deep = (argc > 0) && JS_ToBool(ctx, argv[0]);
+    int cl = domCloneSubtree(host->dom, nid, deep);
+    return cl < 0 ? JS_NULL : qjsMakeElement(ctx, cl);
+}
+static JSValue qjsElHasAttribute(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    DomNode* n = qjsElNode(ctx, this_val);
+    if (!n || argc < 1) return JS_FALSE;
+    return domGetAttrPtr(*n, jsToUtf8(ctx, argv[0])) ? JS_TRUE : JS_FALSE;
+}
+static JSValue qjsElRemoveAttribute(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (DomNode* n = qjsElNode(ctx, this_val)) {
+        if (argc >= 1) { domRemoveAttr(*n, jsToUtf8(ctx, argv[0])); if (host) host->domDirty = true; }
+    }
+    return JS_UNDEFINED;
+}
+
+// classList: a plain object whose methods carry the node id via CFunctionData.
+static int qjsDataNodeId(JSContext* ctx, JSValue* data) { int v = -1; JS_ToInt32(ctx, &v, data[0]); return v; }
+static JSValue qjsClassListAdd(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv, int, JSValue* data) {
+    JsHost* host = qjsHost(ctx);
+    if (host) if (DomNode* n = host->dom.get(qjsDataNodeId(ctx, data)))
+        for (int i = 0; i < argc; ++i) { domClassAdd(*n, jsToUtf8(ctx, argv[i])); host->domDirty = true; }
+    return JS_UNDEFINED;
+}
+static JSValue qjsClassListRemove(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv, int, JSValue* data) {
+    JsHost* host = qjsHost(ctx);
+    if (host) if (DomNode* n = host->dom.get(qjsDataNodeId(ctx, data)))
+        for (int i = 0; i < argc; ++i) { domClassRemove(*n, jsToUtf8(ctx, argv[i])); host->domDirty = true; }
+    return JS_UNDEFINED;
+}
+static JSValue qjsClassListContains(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv, int, JSValue* data) {
+    JsHost* host = qjsHost(ctx);
+    if (host && argc >= 1) if (DomNode* n = host->dom.get(qjsDataNodeId(ctx, data)))
+        return domClassContains(*n, jsToUtf8(ctx, argv[0])) ? JS_TRUE : JS_FALSE;
+    return JS_FALSE;
+}
+static JSValue qjsClassListToggle(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv, int, JSValue* data) {
+    JsHost* host = qjsHost(ctx);
+    if (!host || argc < 1) return JS_FALSE;
+    DomNode* n = host->dom.get(qjsDataNodeId(ctx, data));
+    if (!n) return JS_FALSE;
+    std::string cls = jsToUtf8(ctx, argv[0]);
+    bool add = (argc >= 2) ? (bool)JS_ToBool(ctx, argv[1]) : !domClassContains(*n, cls);
+    if (add) domClassAdd(*n, cls); else domClassRemove(*n, cls);
+    host->domDirty = true;
+    return add ? JS_TRUE : JS_FALSE;
+}
+static JSValue qjsElGetClassList(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    int nid = qjsElNodeId(this_val);
+    JSValue o = JS_NewObject(ctx);
+    JSValue idv = JS_NewInt32(ctx, nid);
+    JSValueConst data[1] = { idv };
+    JS_SetPropertyStr(ctx, o, "add", JS_NewCFunctionData(ctx, qjsClassListAdd, 1, 0, 1, data));
+    JS_SetPropertyStr(ctx, o, "remove", JS_NewCFunctionData(ctx, qjsClassListRemove, 1, 0, 1, data));
+    JS_SetPropertyStr(ctx, o, "toggle", JS_NewCFunctionData(ctx, qjsClassListToggle, 2, 0, 1, data));
+    JS_SetPropertyStr(ctx, o, "contains", JS_NewCFunctionData(ctx, qjsClassListContains, 1, 0, 1, data));
+    JS_FreeValue(ctx, idv);
+    return o;
+}
+
+static JSValue qjsCreateTextNode(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (!host) return JS_NULL;
+    int nid = host->dom.alloc(DomNodeType::Text);
+    host->dom.nodes[nid].text = (argc > 0) ? jsToUtf8(ctx, argv[0]) : "";
+    return qjsMakeElement(ctx, nid);
 }
 
 static JSValue jsGetElementsByTagName(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
@@ -3304,6 +3677,7 @@ static void jsSetupPageGlobals(JSContext* ctx, const std::string& url, const std
     JS_SetPropertyStr(ctx, document, "addEventListener", JS_NewCFunction(ctx, jsDocAddEventListener, "addEventListener", 2));
     JS_SetPropertyStr(ctx, document, "getElementById", JS_NewCFunction(ctx, jsGetElementById, "getElementById", 1));
     JS_SetPropertyStr(ctx, document, "createElement", JS_NewCFunction(ctx, jsCreateElement, "createElement", 1));
+    JS_SetPropertyStr(ctx, document, "createTextNode", JS_NewCFunction(ctx, qjsCreateTextNode, "createTextNode", 1));
     JS_SetPropertyStr(ctx, document, "querySelector", JS_NewCFunction(ctx, jsQuerySelector, "querySelector", 1));
     JS_SetPropertyStr(ctx, document, "querySelectorAll", JS_NewCFunction(ctx, jsQuerySelectorAll, "querySelectorAll", 1));
     JS_SetPropertyStr(ctx, document, "getElementsByTagName", JS_NewCFunction(ctx, jsGetElementsByTagName, "getElementsByTagName", 1));

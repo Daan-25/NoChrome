@@ -406,3 +406,135 @@ static void domSetInnerHtml(DomTree& dom, int nodeId, const std::string& html) {
         if (nid >= 0) domAppendChild(dom, nodeId, nid);
     }
 }
+
+// -------------------- DOM mutation / traversal extras --------------------
+
+// Insert childId before refChildId in parent's child list. If refChildId is < 0
+// or not a child of parent, append. Detaches child from any previous parent.
+static void domInsertBefore(DomTree& dom, int parentId, int childId, int refChildId) {
+    DomNode* child = dom.get(childId);
+    DomNode* parent = dom.get(parentId);
+    if (!child || !parent) return;
+    if (child->parent >= 0) {
+        if (DomNode* old = dom.get(child->parent)) {
+            auto& oc = old->children;
+            oc.erase(std::remove(oc.begin(), oc.end(), childId), oc.end());
+        }
+    }
+    auto& cs = parent->children;
+    auto it = (refChildId < 0) ? cs.end() : std::find(cs.begin(), cs.end(), refChildId);
+    cs.insert(it, childId);   // insert(end, x) == push_back
+    child->parent = parentId;
+}
+
+// Realloc-safe deep clone of a subtree within the SAME tree. (domImportNode
+// caches a source pointer across alloc(), which is unsafe when src == dst.)
+static int domCloneSubtree(DomTree& dom, int srcId, bool deep) {
+    const DomNode* s = dom.get(srcId);
+    if (!s) return -1;
+    DomNodeType type = s->type;                 // copy fields out before alloc()
+    std::string tag = s->tag, text = s->text, sd = s->styleDisplay;
+    std::vector<std::pair<std::string, std::string>> attrs = s->attrs;
+    std::vector<int> kids = s->children;
+    int nid = dom.alloc(type);
+    if (DomNode* d = dom.get(nid)) {
+        d->tag = tag; d->text = text; d->styleDisplay = sd; d->attrs = attrs;
+    }
+    if (deep) {
+        for (int c : kids) {
+            int cid = domCloneSubtree(dom, c, true);
+            if (cid >= 0) domAppendChild(dom, nid, cid);
+        }
+    }
+    return nid;
+}
+
+// -------------------- class / inline-style helpers --------------------
+
+static bool domClassContains(const DomNode& n, const std::string& cls) {
+    for (auto& c : parseClassList(domGetAttr(n, "class"))) if (c == cls) return true;
+    return false;
+}
+static void domClassAdd(DomNode& n, const std::string& cls) {
+    if (cls.empty() || domClassContains(n, cls)) return;
+    std::string cur = domGetAttr(n, "class");
+    domSetAttr(n, "class", cur.empty() ? cls : cur + " " + cls);
+}
+static void domClassRemove(DomNode& n, const std::string& cls) {
+    std::string out;
+    for (auto& c : parseClassList(domGetAttr(n, "class"))) {
+        if (c == cls) continue;
+        if (!out.empty()) out += " ";
+        out += c;
+    }
+    domSetAttr(n, "class", out);
+}
+
+// JS style properties are camelCase (backgroundColor); CSS is kebab
+// (background-color). Convert for storage in the inline "style" attribute.
+static std::string cssCamelToKebab(const std::string& s) {
+    std::string out;
+    for (char c : s) {
+        if (std::isupper((unsigned char)c)) { out.push_back('-'); out.push_back((char)std::tolower((unsigned char)c)); }
+        else out.push_back(c);
+    }
+    return out;
+}
+static std::vector<std::pair<std::string, std::string>> domParseStyle(const std::string& s) {
+    std::vector<std::pair<std::string, std::string>> out;
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t semi = s.find(';', i);
+        std::string decl = s.substr(i, (semi == std::string::npos ? s.size() : semi) - i);
+        size_t colon = decl.find(':');
+        if (colon != std::string::npos) {
+            std::string k = toLowerCopy(trimCopy(decl.substr(0, colon)));
+            std::string v = trimCopy(decl.substr(colon + 1));
+            if (!k.empty()) out.push_back({ k, v });
+        }
+        if (semi == std::string::npos) break;
+        i = semi + 1;
+    }
+    return out;
+}
+static std::string domSerializeStyle(const std::vector<std::pair<std::string, std::string>>& decls) {
+    std::string out;
+    for (auto& kv : decls) {
+        if (kv.second.empty()) continue;
+        if (!out.empty()) out += " ";
+        out += kv.first + ": " + kv.second + ";";
+    }
+    return out;
+}
+static std::string domGetStyleProp(const DomNode& n, const std::string& jsProp) {
+    std::string css = cssCamelToKebab(jsProp);
+    for (auto& kv : domParseStyle(domGetAttr(n, "style"))) if (kv.first == css) return kv.second;
+    return "";
+}
+static void domSetStyleProp(DomNode& n, const std::string& jsProp, const std::string& val) {
+    std::string css = cssCamelToKebab(jsProp);
+    auto decls = domParseStyle(domGetAttr(n, "style"));
+    bool found = false;
+    for (auto& kv : decls) if (kv.first == css) { kv.second = val; found = true; break; }
+    if (!found) decls.push_back({ css, val });
+    domSetAttr(n, "style", domSerializeStyle(decls));
+    if (css == "display") n.styleDisplay = toLowerCopy(trimCopy(val));
+}
+
+// Curated set of CSS properties exposed on element.style (camelCase). Both JS
+// backends reflect these through the inline "style" attribute; other names are
+// stored as plain JS properties (set, but not rendered).
+static const char* const kCssProps[] = {
+    "display", "color", "background", "backgroundColor", "backgroundImage", "width", "height",
+    "minWidth", "minHeight", "maxWidth", "maxHeight", "margin", "marginTop", "marginBottom",
+    "marginLeft", "marginRight", "padding", "paddingTop", "paddingBottom", "paddingLeft",
+    "paddingRight", "border", "borderColor", "borderWidth", "borderStyle", "borderRadius",
+    "fontSize", "fontWeight", "fontFamily", "fontStyle", "textAlign", "textDecoration",
+    "lineHeight", "letterSpacing", "position", "top", "left", "right", "bottom", "zIndex",
+    "visibility", "opacity", "overflow", "cursor", "float", "clear", "verticalAlign",
+    "whiteSpace", "boxShadow", "flex", "flexDirection", "justifyContent", "alignItems", "gap"
+};
+static bool cssIsKnownProp(const std::string& camel) {
+    for (const char* p : kCssProps) if (camel == p) return true;
+    return false;
+}
