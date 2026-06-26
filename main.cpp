@@ -213,6 +213,154 @@ static std::string hostHeaderValue(const Url& u) {
     return u.host;
 }
 
+// -------------------- Storage / cookie backing (shared by both JS backends) --------------------
+//
+// localStorage, sessionStorage and document.cookie must survive page navigation
+// (which recreates the JS context, and conceptually the JsHost). We therefore
+// keep the actual data in process-lifetime statics, ordered to support key(i)
+// and "k1=v1; k2=v2" enumeration. No disk persistence.
+
+struct OrderedStore {
+    std::vector<std::pair<std::string, std::string>> items;
+
+    int indexOf(const std::string& k) const {
+        for (size_t i = 0; i < items.size(); ++i)
+            if (items[i].first == k) return (int)i;
+        return -1;
+    }
+    bool get(const std::string& k, std::string& out) const {
+        int i = indexOf(k);
+        if (i < 0) return false;
+        out = items[(size_t)i].second;
+        return true;
+    }
+    void set(const std::string& k, const std::string& v) {
+        int i = indexOf(k);
+        if (i >= 0) items[(size_t)i].second = v;
+        else items.emplace_back(k, v);
+    }
+    void remove(const std::string& k) {
+        int i = indexOf(k);
+        if (i >= 0) items.erase(items.begin() + i);
+    }
+    void clear() { items.clear(); }
+    size_t size() const { return items.size(); }
+};
+
+// Two SEPARATE stores; both process-lifetime so they persist across navigations.
+static OrderedStore g_localStorage;
+static OrderedStore g_sessionStorage;
+static OrderedStore g_cookieStore;
+
+// Defined further down (form submission); URLSearchParams.toString() reuses it.
+static std::string urlEncode(const std::string& s);
+
+// Percent-decode a URL component (also turns '+' into space, as in query
+// strings). Counterpart to urlEncode() further down.
+static std::string urlDecode(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    auto hexVal = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (c == '+') { out.push_back(' '); }
+        else if (c == '%' && i + 2 < s.size()) {
+            int hi = hexVal(s[i + 1]), lo = hexVal(s[i + 2]);
+            if (hi >= 0 && lo >= 0) { out.push_back((char)((hi << 4) | lo)); i += 2; }
+            else out.push_back(c);
+        } else {
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
+// Fully-decomposed URL, as exposed by the JS URL object.
+struct UrlParts {
+    bool valid = false;
+    std::string href;
+    std::string protocol;   // e.g. "https:"
+    std::string hostname;   // host without port
+    std::string port;       // "" when default/absent
+    std::string host;       // hostname[:port] (port only when non-default)
+    std::string origin;     // protocol//host
+    std::string pathname;   // begins with '/'
+    std::string search;     // incl. leading '?', or ""
+    std::string hash;       // incl. leading '#', or ""
+};
+
+// Parse an already-resolved absolute URL string into its components.
+static UrlParts decomposeUrl(const std::string& resolved) {
+    UrlParts p;
+    std::string s = resolved;
+
+    // Split off fragment first, then query.
+    auto hashPos = s.find('#');
+    if (hashPos != std::string::npos) {
+        p.hash = s.substr(hashPos);          // includes '#'
+        if (p.hash == "#") p.hash = "";      // bare '#' -> empty hash (match browsers)
+        s = s.substr(0, hashPos);
+    }
+    auto qPos = s.find('?');
+    if (qPos != std::string::npos) {
+        p.search = s.substr(qPos);           // includes '?'
+        if (p.search == "?") p.search = "";  // bare '?' -> empty search
+        s = s.substr(0, qPos);
+    }
+
+    Url u = parseUrl(s);
+    if (u.host.empty()) return p; // no authority -> invalid
+
+    p.protocol = u.scheme + ":";
+    p.hostname = u.host;
+    p.pathname = u.path.empty() ? "/" : u.path;
+
+    bool defaultPort = (u.scheme == "http" && u.port == 80) ||
+                       (u.scheme == "https" && u.port == 443);
+    if (!defaultPort && u.port > 0) {
+        p.port = std::to_string(u.port);
+        p.host = u.host + ":" + p.port;
+    } else {
+        p.host = u.host;
+    }
+
+    p.origin = p.protocol + "//" + p.host;
+    p.href = p.origin + p.pathname + p.search + p.hash;
+    p.valid = true;
+    return p;
+}
+
+// Parse a query string ("a=1&b=2", with or without leading '?') into ordered,
+// percent-decoded key/value pairs. Used by URLSearchParams.
+static std::vector<std::pair<std::string, std::string>> parseQueryPairs(const std::string& query) {
+    std::vector<std::pair<std::string, std::string>> out;
+    std::string q = query;
+    if (!q.empty() && q[0] == '?') q = q.substr(1);
+    if (q.empty()) return out;
+    size_t start = 0;
+    while (start <= q.size()) {
+        size_t amp = q.find('&', start);
+        std::string token = (amp == std::string::npos) ? q.substr(start)
+                                                        : q.substr(start, amp - start);
+        if (!token.empty()) {
+            auto eq = token.find('=');
+            if (eq == std::string::npos) {
+                out.emplace_back(urlDecode(token), "");
+            } else {
+                out.emplace_back(urlDecode(token.substr(0, eq)), urlDecode(token.substr(eq + 1)));
+            }
+        }
+        if (amp == std::string::npos) break;
+        start = amp + 1;
+    }
+    return out;
+}
+
 // -------------------- Networking (raw HTTP) --------------------
 
 static void netInit() {
@@ -1376,6 +1524,13 @@ struct JsHost {
 
     Url baseUrl;
 
+    // Storage/cookie state. The data lives in process-lifetime statics
+    // (g_localStorage/g_sessionStorage/g_cookieStore) so it survives
+    // jsResetContext / page navigation; these references just name them.
+    OrderedStore& localStorage   = g_localStorage;
+    OrderedStore& sessionStorage = g_sessionStorage;
+    OrderedStore& cookies        = g_cookieStore;
+
     std::chrono::steady_clock::time_point perfStart = std::chrono::steady_clock::now();
 };
 
@@ -1968,6 +2123,19 @@ struct JscXhrPriv {
 };
 static JSClassRef g_jscXhrClass = nullptr;
 
+// Backing for a Storage instance (localStorage / sessionStorage). Points at the
+// process-lifetime store so values survive page navigation.
+struct JscStoragePriv {
+    OrderedStore* store = nullptr;
+};
+static JSClassRef g_jscStorageClass = nullptr;
+
+// Backing for a URLSearchParams instance: ordered, percent-decoded pairs.
+struct JscUspPriv {
+    std::vector<std::pair<std::string, std::string>> pairs;
+};
+static JSClassRef g_jscUspClass = nullptr;
+
 static std::string jsStringToUtf8(JSStringRef s) {
     size_t maxSize = JSStringGetMaximumUTF8CStringSize(s);
     std::string out(maxSize, '\0');
@@ -2324,6 +2492,13 @@ static void jscFinalizeXhr(JSObjectRef object);
 static JSValueRef jscXhrGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef* exception);
 static bool jscXhrSetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef value, JSValueRef* exception);
 
+// Storage / URLSearchParams class handlers (defined below; declared for jscEnsureDomClasses).
+static void jscFinalizeStorage(JSObjectRef object);
+static JSValueRef jscStorageGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef* exception);
+static bool jscStorageSetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef value, JSValueRef* exception);
+static void jscFinalizeUsp(JSObjectRef object);
+static JSValueRef jscUspGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef* exception);
+
 static void jscEnsureDomClasses() {
     if (!g_jscStyleClass) {
         JSClassDefinition def = kJSClassDefinitionEmpty;
@@ -2352,6 +2527,19 @@ static void jscEnsureDomClasses() {
         def.getProperty = jscXhrGetProperty;
         def.setProperty = jscXhrSetProperty;
         g_jscXhrClass = JSClassCreate(&def);
+    }
+    if (!g_jscStorageClass) {
+        JSClassDefinition def = kJSClassDefinitionEmpty;
+        def.finalize = jscFinalizeStorage;
+        def.getProperty = jscStorageGetProperty;
+        def.setProperty = jscStorageSetProperty;
+        g_jscStorageClass = JSClassCreate(&def);
+    }
+    if (!g_jscUspClass) {
+        JSClassDefinition def = kJSClassDefinitionEmpty;
+        def.finalize = jscFinalizeUsp;
+        def.getProperty = jscUspGetProperty;
+        g_jscUspClass = JSClassCreate(&def);
     }
 }
 
@@ -2656,6 +2844,314 @@ static JSValueRef jscMakeXhrNative(JSContextRef ctx, JSObjectRef /*function*/, J
     return jscMakeXhr(ctx);
 }
 
+// -------------------- Storage object (JavaScriptCore) --------------------
+//
+// One backed Storage per kind (localStorage / sessionStorage). The class
+// getProperty returns bound methods/length for reserved names, the stored value
+// for any other present key, else NULL (delegating to normal lookup). setProperty
+// stores arbitrary keys into the backing OrderedStore.
+
+static void jscFinalizeStorage(JSObjectRef object) {
+    delete (JscStoragePriv*)JSObjectGetPrivate(object);
+}
+
+static JscStoragePriv* jscStoragePriv(JSObjectRef object) {
+    return (JscStoragePriv*)JSObjectGetPrivate(object);
+}
+
+static bool jscStorageIsReserved(const std::string& n) {
+    return n == "setItem" || n == "getItem" || n == "removeItem" ||
+           n == "clear" || n == "key" || n == "length";
+}
+
+static JSValueRef jscStorageSetItem(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    auto* p = jscStoragePriv(thisObject);
+    if (p && p->store && argc >= 2)
+        p->store->set(jsToUtf8(ctx, argv[0]), jsToUtf8(ctx, argv[1]));
+    return JSValueMakeUndefined(ctx);
+}
+static JSValueRef jscStorageGetItem(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    auto* p = jscStoragePriv(thisObject);
+    std::string v;
+    if (p && p->store && argc >= 1 && p->store->get(jsToUtf8(ctx, argv[0]), v)) {
+        JSStringRef s = JSStringCreateWithUTF8CString(v.c_str());
+        JSValueRef r = JSValueMakeString(ctx, s);
+        JSStringRelease(s);
+        return r;
+    }
+    return JSValueMakeNull(ctx);
+}
+static JSValueRef jscStorageRemoveItem(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    auto* p = jscStoragePriv(thisObject);
+    if (p && p->store && argc >= 1) p->store->remove(jsToUtf8(ctx, argv[0]));
+    return JSValueMakeUndefined(ctx);
+}
+static JSValueRef jscStorageClear(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t, const JSValueRef[], JSValueRef*) {
+    auto* p = jscStoragePriv(thisObject);
+    if (p && p->store) p->store->clear();
+    return JSValueMakeUndefined(ctx);
+}
+static JSValueRef jscStorageKey(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    auto* p = jscStoragePriv(thisObject);
+    if (p && p->store && argc >= 1) {
+        int i = (int)JSValueToNumber(ctx, argv[0], nullptr);
+        if (i >= 0 && i < (int)p->store->size()) {
+            JSStringRef s = JSStringCreateWithUTF8CString(p->store->items[(size_t)i].first.c_str());
+            JSValueRef r = JSValueMakeString(ctx, s);
+            JSStringRelease(s);
+            return r;
+        }
+    }
+    return JSValueMakeNull(ctx);
+}
+
+static JSValueRef jscStorageGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef*) {
+    auto* p = jscStoragePriv(object);
+    if (!p || !p->store) return nullptr;
+    std::string prop = jsStringToUtf8(propertyName);
+
+    auto makeFn = [&](const char* name, JSObjectCallAsFunctionCallback cb) -> JSValueRef {
+        JSStringRef nm = JSStringCreateWithUTF8CString(name);
+        JSObjectRef fn = JSObjectMakeFunctionWithCallback(ctx, nm, cb);
+        JSStringRelease(nm);
+        return fn;
+    };
+
+    if (prop == "length")     return JSValueMakeNumber(ctx, (double)p->store->size());
+    if (prop == "setItem")    return makeFn("setItem", jscStorageSetItem);
+    if (prop == "getItem")    return makeFn("getItem", jscStorageGetItem);
+    if (prop == "removeItem") return makeFn("removeItem", jscStorageRemoveItem);
+    if (prop == "clear")      return makeFn("clear", jscStorageClear);
+    if (prop == "key")        return makeFn("key", jscStorageKey);
+
+    // Bracket / dot access to a stored key.
+    std::string v;
+    if (p->store->get(prop, v)) {
+        JSStringRef s = JSStringCreateWithUTF8CString(v.c_str());
+        JSValueRef r = JSValueMakeString(ctx, s);
+        JSStringRelease(s);
+        return r;
+    }
+    return nullptr; // unknown: undefined (delegates to default lookup)
+}
+
+static bool jscStorageSetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef value, JSValueRef*) {
+    auto* p = jscStoragePriv(object);
+    if (!p || !p->store) return false;
+    std::string prop = jsStringToUtf8(propertyName);
+    if (jscStorageIsReserved(prop)) return true; // don't let method names corrupt the API
+    p->store->set(prop, jsToUtf8(ctx, value));
+    return true;
+}
+
+static JSObjectRef jscMakeStorage(JSContextRef ctx, OrderedStore* store) {
+    jscEnsureDomClasses();
+    auto* p = new JscStoragePriv();
+    p->store = store;
+    return JSObjectMake(ctx, g_jscStorageClass, p);
+}
+
+// -------------------- URLSearchParams (JavaScriptCore) --------------------
+
+static void jscFinalizeUsp(JSObjectRef object) {
+    delete (JscUspPriv*)JSObjectGetPrivate(object);
+}
+static JscUspPriv* jscUspPriv(JSObjectRef object) {
+    return (JscUspPriv*)JSObjectGetPrivate(object);
+}
+
+static JSObjectRef jscMakeUsp(JSContextRef ctx, std::vector<std::pair<std::string, std::string>> pairs) {
+    jscEnsureDomClasses();
+    auto* p = new JscUspPriv();
+    p->pairs = std::move(pairs);
+    return JSObjectMake(ctx, g_jscUspClass, p);
+}
+
+static JSValueRef jscUspGet(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    auto* p = jscUspPriv(thisObject);
+    if (p && argc >= 1) {
+        std::string k = jsToUtf8(ctx, argv[0]);
+        for (auto& kv : p->pairs) if (kv.first == k) {
+            JSStringRef s = JSStringCreateWithUTF8CString(kv.second.c_str());
+            JSValueRef r = JSValueMakeString(ctx, s);
+            JSStringRelease(s);
+            return r;
+        }
+    }
+    return JSValueMakeNull(ctx);
+}
+static JSValueRef jscUspGetAll(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    auto* p = jscUspPriv(thisObject);
+    std::vector<JSValueRef> vals;
+    if (p && argc >= 1) {
+        std::string k = jsToUtf8(ctx, argv[0]);
+        for (auto& kv : p->pairs) if (kv.first == k) {
+            JSStringRef s = JSStringCreateWithUTF8CString(kv.second.c_str());
+            vals.push_back(JSValueMakeString(ctx, s));
+            JSStringRelease(s);
+        }
+    }
+    return JSObjectMakeArray(ctx, vals.size(), vals.empty() ? nullptr : vals.data(), nullptr);
+}
+static JSValueRef jscUspHas(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    auto* p = jscUspPriv(thisObject);
+    if (p && argc >= 1) {
+        std::string k = jsToUtf8(ctx, argv[0]);
+        for (auto& kv : p->pairs) if (kv.first == k) return JSValueMakeBoolean(ctx, true);
+    }
+    return JSValueMakeBoolean(ctx, false);
+}
+static JSValueRef jscUspSet(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    auto* p = jscUspPriv(thisObject);
+    if (p && argc >= 2) {
+        std::string k = jsToUtf8(ctx, argv[0]), v = jsToUtf8(ctx, argv[1]);
+        bool placed = false;
+        std::vector<std::pair<std::string, std::string>> out;
+        for (auto& kv : p->pairs) {
+            if (kv.first == k) { if (!placed) { out.emplace_back(k, v); placed = true; } }
+            else out.push_back(kv);
+        }
+        if (!placed) out.emplace_back(k, v);
+        p->pairs = std::move(out);
+    }
+    return JSValueMakeUndefined(ctx);
+}
+static JSValueRef jscUspAppend(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    auto* p = jscUspPriv(thisObject);
+    if (p && argc >= 2) p->pairs.emplace_back(jsToUtf8(ctx, argv[0]), jsToUtf8(ctx, argv[1]));
+    return JSValueMakeUndefined(ctx);
+}
+static JSValueRef jscUspDelete(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    auto* p = jscUspPriv(thisObject);
+    if (p && argc >= 1) {
+        std::string k = jsToUtf8(ctx, argv[0]);
+        p->pairs.erase(std::remove_if(p->pairs.begin(), p->pairs.end(),
+                       [&](const std::pair<std::string, std::string>& kv){ return kv.first == k; }),
+                       p->pairs.end());
+    }
+    return JSValueMakeUndefined(ctx);
+}
+static std::string jscUspSerialize(const JscUspPriv* p) {
+    std::string out;
+    for (size_t i = 0; i < p->pairs.size(); ++i) {
+        if (i) out += "&";
+        out += urlEncode(p->pairs[i].first) + "=" + urlEncode(p->pairs[i].second);
+    }
+    return out;
+}
+static JSValueRef jscUspToString(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t, const JSValueRef[], JSValueRef*) {
+    auto* p = jscUspPriv(thisObject);
+    std::string s = p ? jscUspSerialize(p) : "";
+    JSStringRef v = JSStringCreateWithUTF8CString(s.c_str());
+    JSValueRef r = JSValueMakeString(ctx, v);
+    JSStringRelease(v);
+    return r;
+}
+
+static JSValueRef jscUspGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef*) {
+    if (!jscUspPriv(object)) return nullptr;
+    std::string prop = jsStringToUtf8(propertyName);
+    auto makeFn = [&](const char* name, JSObjectCallAsFunctionCallback cb) -> JSValueRef {
+        JSStringRef nm = JSStringCreateWithUTF8CString(name);
+        JSObjectRef fn = JSObjectMakeFunctionWithCallback(ctx, nm, cb);
+        JSStringRelease(nm);
+        return fn;
+    };
+    if (prop == "get")      return makeFn("get", jscUspGet);
+    if (prop == "getAll")   return makeFn("getAll", jscUspGetAll);
+    if (prop == "has")      return makeFn("has", jscUspHas);
+    if (prop == "set")      return makeFn("set", jscUspSet);
+    if (prop == "append")   return makeFn("append", jscUspAppend);
+    if (prop == "delete")   return makeFn("delete", jscUspDelete);
+    if (prop == "toString") return makeFn("toString", jscUspToString);
+    return nullptr;
+}
+
+// new URLSearchParams(init): init may be a query string or omitted.
+static JSValueRef jscMakeUspNative(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    std::vector<std::pair<std::string, std::string>> pairs;
+    if (argc >= 1 && !JSValueIsUndefined(ctx, argv[0]) && !JSValueIsNull(ctx, argv[0]))
+        pairs = parseQueryPairs(jsToUtf8(ctx, argv[0]));
+    return jscMakeUsp(ctx, std::move(pairs));
+}
+
+// -------------------- URL object (JavaScriptCore) --------------------
+//
+// Plain object with read-only string properties + a searchParams accessor.
+// Thrown TypeError on an unparseable URL with no base.
+
+static JSValueRef jscMakeUrlNative(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef* exception) {
+    std::string urlArg = (argc >= 1) ? jsToUtf8(ctx, argv[0]) : "";
+
+    // Determine the base: explicit second arg, else the page base URL.
+    std::string baseStr;
+    if (argc >= 2 && !JSValueIsUndefined(ctx, argv[1]) && !JSValueIsNull(ctx, argv[1]))
+        baseStr = jsToUtf8(ctx, argv[1]);
+
+    std::string resolved;
+    if (urlArg.rfind("http://", 0) == 0 || urlArg.rfind("https://", 0) == 0) {
+        resolved = urlArg;
+    } else if (!baseStr.empty()) {
+        resolved = resolveHref(parseUrl(baseStr), urlArg);
+    } else if (g_jsHost && (urlArg.empty() || urlArg[0] == '/' || urlArg[0] == '?' ||
+                            urlArg[0] == '#' || urlArg.find("://") == std::string::npos)) {
+        // Relative URL with no explicit base: resolve against the page base only
+        // if it itself has an authority; otherwise it's invalid.
+        if (!g_jsHost->baseUrl.host.empty())
+            resolved = resolveHref(g_jsHost->baseUrl, urlArg);
+        else
+            resolved = urlArg;
+    } else {
+        resolved = urlArg;
+    }
+
+    UrlParts parts = decomposeUrl(resolved);
+    if (!parts.valid) {
+        JSStringRef msg = JSStringCreateWithUTF8CString(("Failed to construct 'URL': Invalid URL: " + urlArg).c_str());
+        JSValueRef m = JSValueMakeString(ctx, msg);
+        JSStringRelease(msg);
+        if (exception) *exception = JSObjectMakeError(ctx, 1, &m, nullptr);
+        return JSValueMakeUndefined(ctx);
+    }
+
+    JSObjectRef obj = JSObjectMake(ctx, nullptr, nullptr);
+    auto setStr = [&](const char* name, const std::string& val) {
+        JSStringRef k = JSStringCreateWithUTF8CString(name);
+        JSStringRef v = JSStringCreateWithUTF8CString(val.c_str());
+        JSObjectSetProperty(ctx, obj, k, JSValueMakeString(ctx, v), kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(v);
+        JSStringRelease(k);
+    };
+    setStr("href", parts.href);
+    setStr("protocol", parts.protocol);
+    setStr("host", parts.host);
+    setStr("hostname", parts.hostname);
+    setStr("port", parts.port);
+    setStr("pathname", parts.pathname);
+    setStr("search", parts.search);
+    setStr("hash", parts.hash);
+    setStr("origin", parts.origin);
+
+    // searchParams: a URLSearchParams over the query.
+    JSObjectRef usp = jscMakeUsp(ctx, parseQueryPairs(parts.search));
+    JSStringRef spk = JSStringCreateWithUTF8CString("searchParams");
+    JSObjectSetProperty(ctx, obj, spk, usp, kJSPropertyAttributeNone, nullptr);
+    JSStringRelease(spk);
+
+    // toString() returns href.
+    JSStringRef tsk = JSStringCreateWithUTF8CString("toString");
+    JSObjectRef tsFn = JSObjectMakeFunctionWithCallback(ctx, tsk, [](JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t, const JSValueRef[], JSValueRef*) -> JSValueRef {
+        JSStringRef hk = JSStringCreateWithUTF8CString("href");
+        JSValueRef hv = JSObjectGetProperty(ctx, thisObject, hk, nullptr);
+        JSStringRelease(hk);
+        return hv ? hv : JSValueMakeUndefined(ctx);
+    });
+    JSObjectSetProperty(ctx, obj, tsk, tsFn, kJSPropertyAttributeNone, nullptr);
+    JSStringRelease(tsk);
+
+    return obj;
+}
+
 // Fire every listener registered under `key`, passing evt as the single arg.
 // Stops early if the event's stopImmediatePropagation() was called.
 static void jscFireListeners(JSContextRef ctx, const std::string& key, JSObjectRef evt) {
@@ -2914,6 +3410,37 @@ static JSValueRef jscPerformanceNow(JSContextRef ctx, JSObjectRef, JSObjectRef, 
     return JSValueMakeNumber(ctx, ms);
 }
 
+// document.cookie getter/setter (process-static cookie store). Reading yields
+// "k1=v1; k2=v2"; writing parses only the first "name=value" pair (attributes
+// after the first ';' are ignored) and upserts it.
+static JSValueRef jscGetCookieNative(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*) {
+    std::string out;
+    for (size_t i = 0; i < g_cookieStore.items.size(); ++i) {
+        if (i) out += "; ";
+        out += g_cookieStore.items[i].first + "=" + g_cookieStore.items[i].second;
+    }
+    JSStringRef v = JSStringCreateWithUTF8CString(out.c_str());
+    JSValueRef r = JSValueMakeString(ctx, v);
+    JSStringRelease(v);
+    return r;
+}
+static JSValueRef jscSetCookieNative(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (argc >= 1) {
+        std::string raw = jsToUtf8(ctx, argv[0]);
+        std::string first = raw;
+        auto semi = first.find(';');
+        if (semi != std::string::npos) first = first.substr(0, semi);
+        first = trimCopy(first);
+        if (!first.empty()) {
+            auto eq = first.find('=');
+            std::string name = (eq == std::string::npos) ? first : trimCopy(first.substr(0, eq));
+            std::string val  = (eq == std::string::npos) ? "" : trimCopy(first.substr(eq + 1));
+            if (!name.empty()) g_cookieStore.set(name, val);
+        }
+    }
+    return JSValueMakeUndefined(ctx);
+}
+
 static void jsSetupPageGlobals(JSContextRef ctx, const std::string& url, const std::string& title) {
     JSObjectRef global = JSContextGetGlobalObject(ctx);
 
@@ -3018,6 +3545,24 @@ static void jsSetupPageGlobals(JSContextRef ctx, const std::string& url, const s
     JSObjectSetProperty(ctx, global, docName, document, kJSPropertyAttributeNone, nullptr);
     JSStringRelease(docName);
 
+    // document.cookie accessor. Hidden native get/set are installed, then
+    // Object.defineProperty wires them as a getter/setter on document.
+    {
+        JSStringRef gk = JSStringCreateWithUTF8CString("__nochromeGetCookie");
+        JSObjectSetProperty(ctx, global, gk, JSObjectMakeFunctionWithCallback(ctx, gk, jscGetCookieNative), kJSPropertyAttributeDontEnum, nullptr);
+        JSStringRelease(gk);
+        JSStringRef sk = JSStringCreateWithUTF8CString("__nochromeSetCookie");
+        JSObjectSetProperty(ctx, global, sk, JSObjectMakeFunctionWithCallback(ctx, sk, jscSetCookieNative), kJSPropertyAttributeDontEnum, nullptr);
+        JSStringRelease(sk);
+        static const char kCookieShim[] =
+            "Object.defineProperty(document,'cookie',{configurable:true,"
+            "get:function(){return __nochromeGetCookie();},"
+            "set:function(v){__nochromeSetCookie(v);}});";
+        JSStringRef s = JSStringCreateWithUTF8CString(kCookieShim);
+        JSEvaluateScript(ctx, s, nullptr, nullptr, 1, nullptr);
+        JSStringRelease(s);
+    }
+
     // location.href
     JSObjectRef location = JSObjectMake(ctx, nullptr, nullptr);
     {
@@ -3120,6 +3665,37 @@ static void jsSetupPageGlobals(JSContextRef ctx, const std::string& url, const s
             "if(w!=null)e.setAttribute('width',w);"
             "if(h!=null)e.setAttribute('height',h);return e;}";
         JSStringRef s = JSStringCreateWithUTF8CString(kImageShim);
+        JSEvaluateScript(ctx, s, nullptr, nullptr, 1, nullptr);
+        JSStringRelease(s);
+    }
+
+    // localStorage / sessionStorage: one backed Storage object each, pointing at
+    // the process-static stores (so they survive navigation).
+    {
+        JSStringRef lsk = JSStringCreateWithUTF8CString("localStorage");
+        JSObjectSetProperty(ctx, global, lsk, jscMakeStorage(ctx, &g_localStorage), kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(lsk);
+        JSStringRef ssk = JSStringCreateWithUTF8CString("sessionStorage");
+        JSObjectSetProperty(ctx, global, ssk, jscMakeStorage(ctx, &g_sessionStorage), kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(ssk);
+    }
+
+    // URL / URLSearchParams constructors. Hidden native factories + real JS
+    // constructor functions (typeof "function" AND `new`-able); `new` adopts the
+    // returned backed/plain object.
+    {
+        jscEnsureDomClasses();
+        JSStringRef mu = JSStringCreateWithUTF8CString("__nochromeMakeUrl");
+        JSObjectSetProperty(ctx, global, mu, JSObjectMakeFunctionWithCallback(ctx, mu, jscMakeUrlNative), kJSPropertyAttributeDontEnum, nullptr);
+        JSStringRelease(mu);
+        JSStringRef ms = JSStringCreateWithUTF8CString("__nochromeMakeUsp");
+        JSObjectSetProperty(ctx, global, ms, JSObjectMakeFunctionWithCallback(ctx, ms, jscMakeUspNative), kJSPropertyAttributeDontEnum, nullptr);
+        JSStringRelease(ms);
+
+        static const char kUrlShim[] =
+            "function URL(u,b){return __nochromeMakeUrl(u,b);}"
+            "function URLSearchParams(i){return __nochromeMakeUsp(i);}";
+        JSStringRef s = JSStringCreateWithUTF8CString(kUrlShim);
         JSEvaluateScript(ctx, s, nullptr, nullptr, 1, nullptr);
         JSStringRelease(s);
     }
@@ -3277,6 +3853,12 @@ struct JsHost {
     Url baseUrl;
     DomTree dom;
 
+    // Storage/cookie state. The data lives in process-lifetime statics so it
+    // survives jsResetContext / page navigation; these references just name them.
+    OrderedStore& localStorage   = g_localStorage;
+    OrderedStore& sessionStorage = g_sessionStorage;
+    OrderedStore& cookies        = g_cookieStore;
+
     std::chrono::steady_clock::time_point perfStart = std::chrono::steady_clock::now();
 };
 
@@ -3329,6 +3911,17 @@ struct QjsXhrPriv {
     std::string responseType;
     std::string responseHeaders; // raw header block from the last send()
     bool sent = false;
+};
+
+// Storage (localStorage / sessionStorage) and URLSearchParams backing.
+static JSClassID g_qjsStorageClassId = 0;
+static JSClassID g_qjsUspClassId = 0;
+
+struct QjsStoragePriv {
+    OrderedStore* store = nullptr; // points at a process-static store
+};
+struct QjsUspPriv {
+    std::vector<std::pair<std::string, std::string>> pairs;
 };
 
 static JsHost* qjsHost(JSContext* ctx) {
@@ -3589,6 +4182,13 @@ static void qjsEventFinalizer(JSRuntime* /*rt*/, JSValue val) {
 static void qjsXhrFinalizer(JSRuntime* /*rt*/, JSValue val) {
     auto* p = (QjsXhrPriv*)JS_GetOpaque(val, g_qjsXhrClassId);
     delete p;
+}
+
+static void qjsStorageFinalizer(JSRuntime* /*rt*/, JSValue val) {
+    delete (QjsStoragePriv*)JS_GetOpaque(val, g_qjsStorageClassId);
+}
+static void qjsUspFinalizer(JSRuntime* /*rt*/, JSValue val) {
+    delete (QjsUspPriv*)JS_GetOpaque(val, g_qjsUspClassId);
 }
 
 static DomNode* qjsElNode(JSContext* ctx, JSValueConst this_val) {
@@ -3929,6 +4529,260 @@ static JSValue qjsXhrCtor(JSContext* ctx, JSValueConst /*new_target*/, int /*arg
     return obj;
 }
 
+// -------------------- Storage object (QuickJS) --------------------
+//
+// Methods and `length` live on the prototype. Per-key bracket/dot access is
+// handled by class EXOTIC methods (get_own_property / set_property) so that
+// localStorage.foo and localStorage['foo'] read/write the same OrderedStore.
+
+static QjsStoragePriv* qjsStoragePriv(JSValueConst v) {
+    return (QjsStoragePriv*)JS_GetOpaque(v, g_qjsStorageClassId);
+}
+
+static JSValue qjsStorageGetLength(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    auto* p = qjsStoragePriv(this_val);
+    return JS_NewInt32(ctx, (p && p->store) ? (int)p->store->size() : 0);
+}
+static JSValue qjsStorageSetItem(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    auto* p = qjsStoragePriv(this_val);
+    if (p && p->store && argc >= 2)
+        p->store->set(jsToUtf8(ctx, argv[0]), jsToUtf8(ctx, argv[1]));
+    return JS_UNDEFINED;
+}
+static JSValue qjsStorageGetItem(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    auto* p = qjsStoragePriv(this_val);
+    std::string v;
+    if (p && p->store && argc >= 1 && p->store->get(jsToUtf8(ctx, argv[0]), v))
+        return JS_NewString(ctx, v.c_str());
+    return JS_NULL;
+}
+static JSValue qjsStorageRemoveItem(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    auto* p = qjsStoragePriv(this_val);
+    if (p && p->store && argc >= 1) p->store->remove(jsToUtf8(ctx, argv[0]));
+    return JS_UNDEFINED;
+}
+static JSValue qjsStorageClear(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    auto* p = qjsStoragePriv(this_val);
+    if (p && p->store) p->store->clear();
+    return JS_UNDEFINED;
+}
+static JSValue qjsStorageKey(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    auto* p = qjsStoragePriv(this_val);
+    if (p && p->store && argc >= 1) {
+        int32_t i = 0;
+        JS_ToInt32(ctx, &i, argv[0]);
+        if (i >= 0 && i < (int)p->store->size())
+            return JS_NewString(ctx, p->store->items[(size_t)i].first.c_str());
+    }
+    return JS_NULL;
+}
+
+// Exotic get_own_property: return the stored value for a key (else fall through
+// to the prototype, where methods/length live).
+static int qjsStorageGetOwn(JSContext* ctx, JSPropertyDescriptor* desc, JSValueConst obj, JSAtom prop) {
+    auto* p = qjsStoragePriv(obj);
+    if (!p || !p->store) return 0;
+    const char* cname = JS_AtomToCString(ctx, prop);
+    if (!cname) return 0;
+    std::string name(cname);
+    JS_FreeCString(ctx, cname);
+    std::string v;
+    if (p->store->get(name, v)) {
+        if (desc) {
+            desc->flags = JS_PROP_C_W_E;
+            desc->value = JS_NewString(ctx, v.c_str()); // engine takes ownership
+            desc->getter = JS_UNDEFINED;
+            desc->setter = JS_UNDEFINED;
+        }
+        return 1;
+    }
+    return 0; // not an own data prop -> prototype lookup (setItem/getItem/length/...)
+}
+
+// Exotic set_property: store any key into the OrderedStore.
+static int qjsStorageSetExotic(JSContext* ctx, JSValueConst obj, JSAtom atom,
+                               JSValueConst value, JSValueConst /*receiver*/, int /*flags*/) {
+    auto* p = qjsStoragePriv(obj);
+    if (!p || !p->store) return 0;
+    const char* cname = JS_AtomToCString(ctx, atom);
+    if (!cname) return 0;
+    std::string name(cname);
+    JS_FreeCString(ctx, cname);
+    p->store->set(name, jsToUtf8(ctx, value));
+    return 1;
+}
+
+static JSValue qjsMakeStorage(JSContext* ctx, OrderedStore* store) {
+    JSValue obj = JS_NewObjectClass(ctx, g_qjsStorageClassId);
+    if (JS_IsException(obj)) return obj;
+    auto* p = new QjsStoragePriv();
+    p->store = store;
+    JS_SetOpaque(obj, p);
+    return obj;
+}
+
+// -------------------- URLSearchParams (QuickJS) --------------------
+
+static QjsUspPriv* qjsUspPriv(JSValueConst v) {
+    return (QjsUspPriv*)JS_GetOpaque(v, g_qjsUspClassId);
+}
+
+static JSValue qjsMakeUsp(JSContext* ctx, std::vector<std::pair<std::string, std::string>> pairs) {
+    JSValue obj = JS_NewObjectClass(ctx, g_qjsUspClassId);
+    if (JS_IsException(obj)) return obj;
+    auto* p = new QjsUspPriv();
+    p->pairs = std::move(pairs);
+    JS_SetOpaque(obj, p);
+    return obj;
+}
+
+static JSValue qjsUspGet(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    auto* p = qjsUspPriv(this_val);
+    if (p && argc >= 1) {
+        std::string k = jsToUtf8(ctx, argv[0]);
+        for (auto& kv : p->pairs) if (kv.first == k) return JS_NewString(ctx, kv.second.c_str());
+    }
+    return JS_NULL;
+}
+static JSValue qjsUspGetAll(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    auto* p = qjsUspPriv(this_val);
+    JSValue arr = JS_NewArray(ctx);
+    if (p && argc >= 1) {
+        std::string k = jsToUtf8(ctx, argv[0]);
+        uint32_t idx = 0;
+        for (auto& kv : p->pairs)
+            if (kv.first == k)
+                JS_SetPropertyUint32(ctx, arr, idx++, JS_NewString(ctx, kv.second.c_str()));
+    }
+    return arr;
+}
+static JSValue qjsUspHas(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    auto* p = qjsUspPriv(this_val);
+    if (p && argc >= 1) {
+        std::string k = jsToUtf8(ctx, argv[0]);
+        for (auto& kv : p->pairs) if (kv.first == k) return JS_TRUE;
+    }
+    return JS_FALSE;
+}
+static JSValue qjsUspSet(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    auto* p = qjsUspPriv(this_val);
+    if (p && argc >= 2) {
+        std::string k = jsToUtf8(ctx, argv[0]), v = jsToUtf8(ctx, argv[1]);
+        bool placed = false;
+        std::vector<std::pair<std::string, std::string>> out;
+        for (auto& kv : p->pairs) {
+            if (kv.first == k) { if (!placed) { out.emplace_back(k, v); placed = true; } }
+            else out.push_back(kv);
+        }
+        if (!placed) out.emplace_back(k, v);
+        p->pairs = std::move(out);
+    }
+    return JS_UNDEFINED;
+}
+static JSValue qjsUspAppend(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    auto* p = qjsUspPriv(this_val);
+    if (p && argc >= 2) p->pairs.emplace_back(jsToUtf8(ctx, argv[0]), jsToUtf8(ctx, argv[1]));
+    return JS_UNDEFINED;
+}
+static JSValue qjsUspDelete(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    auto* p = qjsUspPriv(this_val);
+    if (p && argc >= 1) {
+        std::string k = jsToUtf8(ctx, argv[0]);
+        p->pairs.erase(std::remove_if(p->pairs.begin(), p->pairs.end(),
+                       [&](const std::pair<std::string, std::string>& kv){ return kv.first == k; }),
+                       p->pairs.end());
+    }
+    return JS_UNDEFINED;
+}
+static JSValue qjsUspToString(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    auto* p = qjsUspPriv(this_val);
+    std::string out;
+    if (p) {
+        for (size_t i = 0; i < p->pairs.size(); ++i) {
+            if (i) out += "&";
+            out += urlEncode(p->pairs[i].first) + "=" + urlEncode(p->pairs[i].second);
+        }
+    }
+    return JS_NewString(ctx, out.c_str());
+}
+
+// new URLSearchParams(init): init may be a query string or omitted.
+static JSValue qjsUspCtor(JSContext* ctx, JSValueConst /*new_target*/, int argc, JSValueConst* argv) {
+    std::vector<std::pair<std::string, std::string>> pairs;
+    if (argc >= 1 && !JS_IsUndefined(argv[0]) && !JS_IsNull(argv[0]))
+        pairs = parseQueryPairs(jsToUtf8(ctx, argv[0]));
+    return qjsMakeUsp(ctx, std::move(pairs));
+}
+
+// -------------------- URL object (QuickJS) --------------------
+
+static JSValue qjsUrlCtor(JSContext* ctx, JSValueConst /*new_target*/, int argc, JSValueConst* argv) {
+    std::string urlArg = (argc >= 1) ? jsToUtf8(ctx, argv[0]) : "";
+    std::string baseStr;
+    if (argc >= 2 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1]))
+        baseStr = jsToUtf8(ctx, argv[1]);
+
+    JsHost* host = qjsHost(ctx);
+    std::string resolved;
+    if (urlArg.rfind("http://", 0) == 0 || urlArg.rfind("https://", 0) == 0) {
+        resolved = urlArg;
+    } else if (!baseStr.empty()) {
+        resolved = resolveHref(parseUrl(baseStr), urlArg);
+    } else if (host && !host->baseUrl.host.empty() &&
+               (urlArg.empty() || urlArg.find("://") == std::string::npos)) {
+        resolved = resolveHref(host->baseUrl, urlArg);
+    } else {
+        resolved = urlArg;
+    }
+
+    UrlParts parts = decomposeUrl(resolved);
+    if (!parts.valid)
+        return JS_ThrowTypeError(ctx, "Failed to construct 'URL': Invalid URL: %s", urlArg.c_str());
+
+    JSValue obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, obj, "href", JS_NewString(ctx, parts.href.c_str()));
+    JS_SetPropertyStr(ctx, obj, "protocol", JS_NewString(ctx, parts.protocol.c_str()));
+    JS_SetPropertyStr(ctx, obj, "host", JS_NewString(ctx, parts.host.c_str()));
+    JS_SetPropertyStr(ctx, obj, "hostname", JS_NewString(ctx, parts.hostname.c_str()));
+    JS_SetPropertyStr(ctx, obj, "port", JS_NewString(ctx, parts.port.c_str()));
+    JS_SetPropertyStr(ctx, obj, "pathname", JS_NewString(ctx, parts.pathname.c_str()));
+    JS_SetPropertyStr(ctx, obj, "search", JS_NewString(ctx, parts.search.c_str()));
+    JS_SetPropertyStr(ctx, obj, "hash", JS_NewString(ctx, parts.hash.c_str()));
+    JS_SetPropertyStr(ctx, obj, "origin", JS_NewString(ctx, parts.origin.c_str()));
+    JS_SetPropertyStr(ctx, obj, "searchParams", qjsMakeUsp(ctx, parseQueryPairs(parts.search)));
+
+    static const char kUrlToString[] = "(function(){return this.href;})";
+    JSValue ts = JS_Eval(ctx, kUrlToString, sizeof(kUrlToString) - 1, "<builtin>", JS_EVAL_TYPE_GLOBAL);
+    JS_SetPropertyStr(ctx, obj, "toString", ts);
+    return obj;
+}
+
+// document.cookie getter/setter.
+static JSValue qjsGetCookie(JSContext* ctx, JSValueConst /*this_val*/, int, JSValueConst*) {
+    std::string out;
+    for (size_t i = 0; i < g_cookieStore.items.size(); ++i) {
+        if (i) out += "; ";
+        out += g_cookieStore.items[i].first + "=" + g_cookieStore.items[i].second;
+    }
+    return JS_NewString(ctx, out.c_str());
+}
+static JSValue qjsSetCookie(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    if (argc >= 1) {
+        std::string raw = jsToUtf8(ctx, argv[0]);
+        std::string first = raw;
+        auto semi = first.find(';');
+        if (semi != std::string::npos) first = first.substr(0, semi);
+        first = trimCopy(first);
+        if (!first.empty()) {
+            auto eq = first.find('=');
+            std::string name = (eq == std::string::npos) ? first : trimCopy(first.substr(0, eq));
+            std::string val  = (eq == std::string::npos) ? "" : trimCopy(first.substr(eq + 1));
+            if (!name.empty()) g_cookieStore.set(name, val);
+        }
+    }
+    return JS_UNDEFINED;
+}
+
 // Forward declarations for element methods used while building the prototype.
 static JSValue qjsElAddEventListener(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
 static JSValue qjsElRemoveEventListener(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
@@ -4011,6 +4865,26 @@ static void qjsRegisterDomClasses(JSRuntime* rt) {
         def.class_name = "XMLHttpRequest";
         def.finalizer = qjsXhrFinalizer;
         JS_NewClass(rt, g_qjsXhrClassId, &def);
+    }
+    if (g_qjsStorageClassId == 0) {
+        JS_NewClassID(&g_qjsStorageClassId);
+        // Exotic methods give per-key bracket/dot access; methods/length stay on
+        // the prototype (get_own_property returns 0 for those names).
+        static JSClassExoticMethods exotic{};
+        exotic.get_own_property = qjsStorageGetOwn;
+        exotic.set_property = qjsStorageSetExotic;
+        JSClassDef def{};
+        def.class_name = "Storage";
+        def.finalizer = qjsStorageFinalizer;
+        def.exotic = &exotic;
+        JS_NewClass(rt, g_qjsStorageClassId, &def);
+    }
+    if (g_qjsUspClassId == 0) {
+        JS_NewClassID(&g_qjsUspClassId);
+        JSClassDef def{};
+        def.class_name = "URLSearchParams";
+        def.finalizer = qjsUspFinalizer;
+        JS_NewClass(rt, g_qjsUspClassId, &def);
     }
 }
 
@@ -4103,6 +4977,28 @@ static void qjsSetupDomProtos(JSContext* ctx) {
     JS_SetPropertyStr(ctx, xhrProto, "getResponseHeader", JS_NewCFunction(ctx, qjsXhrGetResponseHeader, "getResponseHeader", 1));
     JS_SetPropertyStr(ctx, xhrProto, "abort", JS_NewCFunction(ctx, qjsXhrAbort, "abort", 0));
     JS_SetClassProto(ctx, g_qjsXhrClassId, xhrProto);
+
+    // Storage prototype: methods + length getter. Per-key access goes through the
+    // class exotic methods, not the prototype.
+    JSValue stoProto = JS_NewObject(ctx);
+    qjsDefineAccessor(ctx, stoProto, "length", qjsStorageGetLength, nullptr);
+    JS_SetPropertyStr(ctx, stoProto, "setItem", JS_NewCFunction(ctx, qjsStorageSetItem, "setItem", 2));
+    JS_SetPropertyStr(ctx, stoProto, "getItem", JS_NewCFunction(ctx, qjsStorageGetItem, "getItem", 1));
+    JS_SetPropertyStr(ctx, stoProto, "removeItem", JS_NewCFunction(ctx, qjsStorageRemoveItem, "removeItem", 1));
+    JS_SetPropertyStr(ctx, stoProto, "clear", JS_NewCFunction(ctx, qjsStorageClear, "clear", 0));
+    JS_SetPropertyStr(ctx, stoProto, "key", JS_NewCFunction(ctx, qjsStorageKey, "key", 1));
+    JS_SetClassProto(ctx, g_qjsStorageClassId, stoProto);
+
+    // URLSearchParams prototype.
+    JSValue uspProto = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, uspProto, "get", JS_NewCFunction(ctx, qjsUspGet, "get", 1));
+    JS_SetPropertyStr(ctx, uspProto, "getAll", JS_NewCFunction(ctx, qjsUspGetAll, "getAll", 1));
+    JS_SetPropertyStr(ctx, uspProto, "has", JS_NewCFunction(ctx, qjsUspHas, "has", 1));
+    JS_SetPropertyStr(ctx, uspProto, "set", JS_NewCFunction(ctx, qjsUspSet, "set", 2));
+    JS_SetPropertyStr(ctx, uspProto, "append", JS_NewCFunction(ctx, qjsUspAppend, "append", 2));
+    JS_SetPropertyStr(ctx, uspProto, "delete", JS_NewCFunction(ctx, qjsUspDelete, "delete", 1));
+    JS_SetPropertyStr(ctx, uspProto, "toString", JS_NewCFunction(ctx, qjsUspToString, "toString", 0));
+    JS_SetClassProto(ctx, g_qjsUspClassId, uspProto);
 }
 
 static void qjsAddListener(JSContext* ctx, const std::string& key, JSValueConst fn) {
@@ -4792,6 +5688,15 @@ static void jsSetupPageGlobals(JSContext* ctx, const std::string& url, const std
         JS_SetPropertyStr(ctx, document, "documentElement", qjsMakeElement(ctx, domFindOrCreateTag(host->dom, "html")));
     }
 
+    // document.cookie accessor (getter/setter backed by the process cookie store).
+    {
+        JSValue g = JS_NewCFunction(ctx, qjsGetCookie, "get cookie", 0);
+        JSValue s = JS_NewCFunction(ctx, qjsSetCookie, "set cookie", 1);
+        JSAtom atom = JS_NewAtom(ctx, "cookie");
+        JS_DefinePropertyGetSet(ctx, document, atom, g, s, JS_PROP_CONFIGURABLE);
+        JS_FreeAtom(ctx, atom);
+    }
+
     JS_SetPropertyStr(ctx, global, "document", document);
 
     JSValue location = JS_NewObject(ctx);
@@ -4825,6 +5730,17 @@ static void jsSetupPageGlobals(JSContext* ctx, const std::string& url, const std
         "if(h!=null)e.setAttribute('height',h);return e;}";
     JSValue imgRes = JS_Eval(ctx, kImageShim, sizeof(kImageShim) - 1, "<builtin>", JS_EVAL_TYPE_GLOBAL);
     JS_FreeValue(ctx, imgRes);
+
+    // localStorage / sessionStorage: backed Storage objects over the process
+    // stores (persist across navigation).
+    JS_SetPropertyStr(ctx, global, "localStorage", qjsMakeStorage(ctx, &g_localStorage));
+    JS_SetPropertyStr(ctx, global, "sessionStorage", qjsMakeStorage(ctx, &g_sessionStorage));
+
+    // URL / URLSearchParams constructors (native, usable with `new`).
+    JS_SetPropertyStr(ctx, global, "URL",
+                      JS_NewCFunction2(ctx, qjsUrlCtor, "URL", 2, JS_CFUNC_constructor, 0));
+    JS_SetPropertyStr(ctx, global, "URLSearchParams",
+                      JS_NewCFunction2(ctx, qjsUspCtor, "URLSearchParams", 1, JS_CFUNC_constructor, 0));
 
     JS_FreeValue(ctx, global);
 }
