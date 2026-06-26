@@ -1875,8 +1875,25 @@ struct JscStylePriv {
     int nodeId = -1; // element this style belongs to
 };
 
+// Backing store for a DOM Event object. Standard fields live here; ad-hoc
+// properties (clientX, key, ...) are stored as ordinary own properties on the
+// JS instance (the get/set handlers return NULL/false for unknown names so
+// normal property storage takes over).
+struct JscEventPriv {
+    std::string type;
+    bool bubbles = false;
+    bool cancelable = false;
+    bool defaultPrevented = false;
+    bool propagationStopped = false;
+    bool immediateStopped = false;
+    int eventPhase = 0;
+    int targetNodeId = -1;
+    int currentTargetNodeId = -1;
+};
+
 static JSClassRef g_jscElementClass = nullptr;
 static JSClassRef g_jscStyleClass = nullptr;
+static JSClassRef g_jscEventClass = nullptr;
 
 static std::string jsStringToUtf8(JSStringRef s) {
     size_t maxSize = JSStringGetMaximumUTF8CStringSize(s);
@@ -1908,37 +1925,42 @@ static int jscElNodeId(JSObjectRef object) {
     return priv ? priv->nodeId : -1;
 }
 
+static int jscSiblingId(int nid, int dir) {   // dir +1 next, -1 prev
+    if (!g_jsHost) return -1;
+    DomNode* n = g_jsHost->dom.get(nid);
+    if (!n || n->parent < 0) return -1;
+    DomNode* p = g_jsHost->dom.get(n->parent);
+    if (!p) return -1;
+    auto& cs = p->children;
+    for (size_t i = 0; i < cs.size(); ++i)
+        if (cs[i] == nid) { int j = (int)i + dir; return (j < 0 || j >= (int)cs.size()) ? -1 : cs[j]; }
+    return -1;
+}
+static JSValueRef jscNodeArray(JSContextRef ctx, const std::vector<int>& nids);
+
 static JSValueRef jscStyleGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef* /*exception*/) {
     auto* priv = (JscStylePriv*)JSObjectGetPrivate(object);
-    if (!priv || !g_jsHost) return JSValueMakeUndefined(ctx);
-
+    if (!priv || !g_jsHost) return nullptr;
     std::string prop = jsStringToUtf8(propertyName);
-    if (prop == "display") {
-        DomNode* n = g_jsHost->dom.get(priv->nodeId);
-        std::string v = n ? n->styleDisplay : "";
-        JSStringRef s = JSStringCreateWithUTF8CString(v.c_str());
-        JSValueRef vStr = JSValueMakeString(ctx, s);
-        JSStringRelease(s);
-        return vStr;
-    }
-
-    return JSValueMakeUndefined(ctx);
+    if (!cssIsKnownProp(prop)) return nullptr; // delegate (methods, toString, ...)
+    DomNode* n = g_jsHost->dom.get(priv->nodeId);
+    std::string v = n ? domGetStyleProp(*n, prop) : "";
+    JSStringRef s = JSStringCreateWithUTF8CString(v.c_str());
+    JSValueRef vStr = JSValueMakeString(ctx, s);
+    JSStringRelease(s);
+    return vStr;
 }
 
 static bool jscStyleSetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef value, JSValueRef* /*exception*/) {
     auto* priv = (JscStylePriv*)JSObjectGetPrivate(object);
     if (!priv || !g_jsHost) return false;
-
     std::string prop = jsStringToUtf8(propertyName);
-    if (prop == "display") {
-        if (DomNode* n = g_jsHost->dom.get(priv->nodeId)) {
-            n->styleDisplay = jsToUtf8(ctx, value);
-            g_jsHost->domDirty = true;
-        }
-        return true;
+    if (!cssIsKnownProp(prop)) return false; // store as a plain JS property
+    if (DomNode* n = g_jsHost->dom.get(priv->nodeId)) {
+        domSetStyleProp(*n, prop, jsToUtf8(ctx, value));
+        g_jsHost->domDirty = true;
     }
-
-    return false;
+    return true;
 }
 
 
@@ -1947,6 +1969,12 @@ static bool jscStyleSetProperty(JSContextRef ctx, JSObjectRef object, JSStringRe
 static JSValueRef jscElementAddEventListener(JSContextRef ctx, JSObjectRef function,
                                              JSObjectRef thisObject, size_t argumentCount,
                                              const JSValueRef arguments[], JSValueRef* exception);
+static JSValueRef jscElementRemoveEventListener(JSContextRef, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*);
+static JSValueRef jscElementDispatchEvent(JSContextRef, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*);
+// Defined below jscEnsureDomClasses; used by element event methods above it.
+static void jscRemoveListener(JSContextRef ctx, const std::string& key, JSObjectRef fn);
+static bool jscDispatchEvent(JSContextRef ctx, int targetNodeId, JSObjectRef evt,
+                             const std::string& type, bool bubbles);
 static JSValueRef jscElementAppendChild(JSContextRef ctx, JSObjectRef function,
                                        JSObjectRef thisObject, size_t argumentCount,
                                        const JSValueRef arguments[], JSValueRef* exception);
@@ -1959,6 +1987,13 @@ static JSValueRef jscElementSetAttribute(JSContextRef ctx, JSObjectRef function,
 static JSValueRef jscElementGetAttribute(JSContextRef ctx, JSObjectRef function,
                                         JSObjectRef thisObject, size_t argumentCount,
                                         const JSValueRef arguments[], JSValueRef* exception);
+// Batch 1 DOM additions.
+static JSValueRef jscElementInsertBefore(JSContextRef, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*);
+static JSValueRef jscElementReplaceChild(JSContextRef, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*);
+static JSValueRef jscElementCloneNode(JSContextRef, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*);
+static JSValueRef jscElementHasAttribute(JSContextRef, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*);
+static JSValueRef jscElementRemoveAttribute(JSContextRef, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*);
+static JSObjectRef jscMakeClassList(JSContextRef, int);
 #endif
 
 static JSValueRef jscElementGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef* /*exception*/) {
@@ -1999,10 +2034,45 @@ static JSValueRef jscElementGetProperty(JSContextRef ctx, JSObjectRef object, JS
     }
 
     if (prop == "addEventListener") return makeFn("addEventListener", jscElementAddEventListener);
+    if (prop == "removeEventListener") return makeFn("removeEventListener", jscElementRemoveEventListener);
+    if (prop == "dispatchEvent")    return makeFn("dispatchEvent", jscElementDispatchEvent);
     if (prop == "appendChild")      return makeFn("appendChild", jscElementAppendChild);
     if (prop == "removeChild")      return makeFn("removeChild", jscElementRemoveChild);
     if (prop == "setAttribute")     return makeFn("setAttribute", jscElementSetAttribute);
     if (prop == "getAttribute")     return makeFn("getAttribute", jscElementGetAttribute);
+
+    // --- traversal (Batch 1) ---
+    if (prop == "classList")  return jscMakeClassList(ctx, nid);
+    if (prop == "childNodes") return jscNodeArray(ctx, n->children);
+    if (prop == "children") {
+        std::vector<int> els;
+        for (int c : n->children) {
+            DomNode* cn = g_jsHost->dom.get(c);
+            if (cn && cn->type == DomNodeType::Element) els.push_back(c);
+        }
+        return jscNodeArray(ctx, els);
+    }
+    if (prop == "firstChild")
+        return n->children.empty() ? JSValueMakeNull(ctx)
+            : (JSValueRef)JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ n->children.front() });
+    if (prop == "lastChild")
+        return n->children.empty() ? JSValueMakeNull(ctx)
+            : (JSValueRef)JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ n->children.back() });
+    if (prop == "nextSibling") {
+        int s = jscSiblingId(nid, +1);
+        return s < 0 ? JSValueMakeNull(ctx) : (JSValueRef)JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ s });
+    }
+    if (prop == "previousSibling") {
+        int s = jscSiblingId(nid, -1);
+        return s < 0 ? JSValueMakeNull(ctx) : (JSValueRef)JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ s });
+    }
+
+    // --- mutation / attribute methods (Batch 1) ---
+    if (prop == "insertBefore")    return makeFn("insertBefore", jscElementInsertBefore);
+    if (prop == "replaceChild")    return makeFn("replaceChild", jscElementReplaceChild);
+    if (prop == "cloneNode")       return makeFn("cloneNode", jscElementCloneNode);
+    if (prop == "hasAttribute")    return makeFn("hasAttribute", jscElementHasAttribute);
+    if (prop == "removeAttribute") return makeFn("removeAttribute", jscElementRemoveAttribute);
 
     return nullptr; // delegate (stored props / prototype)
 }
@@ -2045,8 +2115,8 @@ static bool jscElementSetProperty(JSContextRef ctx, JSObjectRef object, JSString
 
 static JSValueRef jscElementAddEventListener(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
     if (!g_jsHost) return JSValueMakeUndefined(ctx);
-    DomNode* n = jscElNode(thisObject);
-    if (!n) return JSValueMakeUndefined(ctx);
+    int nid = jscElNodeId(thisObject);
+    if (nid < 0) return JSValueMakeUndefined(ctx);
     if (argc < 2) return JSValueMakeUndefined(ctx);
 
     std::string type = jsToUtf8(ctx, argv[0]);
@@ -2054,8 +2124,44 @@ static JSValueRef jscElementAddEventListener(JSContextRef ctx, JSObjectRef, JSOb
     JSObjectRef fn = JSValueToObject(ctx, argv[1], nullptr);
     if (!fn || !JSObjectIsFunction(ctx, fn)) return JSValueMakeUndefined(ctx);
 
-    jscAddListenerCtx(ctx, "el:" + domGetAttr(*n, "id") + ":" + type, fn);
+    jscAddListenerCtx(ctx, "node:" + std::to_string(nid) + ":" + type, fn);
     return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef jscElementRemoveEventListener(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost) return JSValueMakeUndefined(ctx);
+    int nid = jscElNodeId(thisObject);
+    if (nid < 0 || argc < 2 || !JSValueIsObject(ctx, argv[1])) return JSValueMakeUndefined(ctx);
+    std::string type = jsToUtf8(ctx, argv[0]);
+    JSObjectRef fn = JSValueToObject(ctx, argv[1], nullptr);
+    if (!fn) return JSValueMakeUndefined(ctx);
+    jscRemoveListener(ctx, "node:" + std::to_string(nid) + ":" + type, fn);
+    return JSValueMakeUndefined(ctx);
+}
+
+// element.dispatchEvent(evt): dispatch through the bubbling path rooted at this
+// element. Returns !defaultPrevented.
+static JSValueRef jscElementDispatchEvent(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost) return JSValueMakeBoolean(ctx, true);
+    int nid = jscElNodeId(thisObject);
+    if (nid < 0 || argc < 1 || !JSValueIsObject(ctx, argv[0])) return JSValueMakeBoolean(ctx, true);
+
+    JSObjectRef evt = JSValueToObject(ctx, argv[0], nullptr);
+    auto* ep = (JscEventPriv*)JSObjectGetPrivate(evt);
+    std::string type;
+    bool bubbles = false;
+    if (ep) {
+        type = ep->type;
+        bubbles = ep->bubbles;
+    } else {
+        // Best-effort for plain-object "events": read .type, assume non-bubbling.
+        JSStringRef tk = JSStringCreateWithUTF8CString("type");
+        JSValueRef tv = JSObjectGetProperty(ctx, evt, tk, nullptr);
+        JSStringRelease(tk);
+        type = jsToUtf8(ctx, tv);
+    }
+    bool prevented = jscDispatchEvent(ctx, nid, evt, type, bubbles);
+    return JSValueMakeBoolean(ctx, !prevented);
 }
 
 static JSValueRef jscElementAppendChild(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
@@ -2135,6 +2241,11 @@ static JSValueRef jscElementGetAttribute(JSContextRef ctx, JSObjectRef, JSObject
 }
 
 
+// Event class handlers (defined below; declared here for jscEnsureDomClasses).
+static void jscFinalizeEvent(JSObjectRef object);
+static JSValueRef jscEventGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef* exception);
+static bool jscEventSetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef value, JSValueRef* exception);
+
 static void jscEnsureDomClasses() {
     if (!g_jscStyleClass) {
         JSClassDefinition def = kJSClassDefinitionEmpty;
@@ -2150,6 +2261,220 @@ static void jscEnsureDomClasses() {
         def.setProperty = jscElementSetProperty;
         g_jscElementClass = JSClassCreate(&def);
     }
+    if (!g_jscEventClass) {
+        JSClassDefinition def = kJSClassDefinitionEmpty;
+        def.finalize = jscFinalizeEvent;
+        def.getProperty = jscEventGetProperty;
+        def.setProperty = jscEventSetProperty;
+        g_jscEventClass = JSClassCreate(&def);
+    }
+}
+
+// -------------------- Event object (JavaScriptCore) --------------------
+
+static void jscFinalizeEvent(JSObjectRef object) {
+    auto* priv = (JscEventPriv*)JSObjectGetPrivate(object);
+    delete priv;
+}
+
+static JscEventPriv* jscEvtPriv(JSObjectRef object) {
+    return (JscEventPriv*)JSObjectGetPrivate(object);
+}
+
+// Method callbacks: preventDefault / stopPropagation / stopImmediatePropagation.
+static JSValueRef jscEvtPreventDefault(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t, const JSValueRef[], JSValueRef*) {
+    if (auto* p = jscEvtPriv(thisObject)) { if (p->cancelable) p->defaultPrevented = true; }
+    return JSValueMakeUndefined(ctx);
+}
+static JSValueRef jscEvtStopPropagation(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t, const JSValueRef[], JSValueRef*) {
+    if (auto* p = jscEvtPriv(thisObject)) p->propagationStopped = true;
+    return JSValueMakeUndefined(ctx);
+}
+static JSValueRef jscEvtStopImmediate(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t, const JSValueRef[], JSValueRef*) {
+    if (auto* p = jscEvtPriv(thisObject)) { p->propagationStopped = true; p->immediateStopped = true; }
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef jscEventGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef* /*exception*/) {
+    auto* p = jscEvtPriv(object);
+    if (!p) return nullptr;
+    std::string prop = jsStringToUtf8(propertyName);
+
+    auto makeStr = [&](const std::string& s) -> JSValueRef {
+        JSStringRef v = JSStringCreateWithUTF8CString(s.c_str());
+        JSValueRef r = JSValueMakeString(ctx, v);
+        JSStringRelease(v);
+        return r;
+    };
+    auto makeFn = [&](const char* name, JSObjectCallAsFunctionCallback cb) -> JSValueRef {
+        JSStringRef nm = JSStringCreateWithUTF8CString(name);
+        JSObjectRef fn = JSObjectMakeFunctionWithCallback(ctx, nm, cb);
+        JSStringRelease(nm);
+        return fn;
+    };
+    auto makeEl = [&](int nid) -> JSValueRef {
+        if (nid < 0) return JSValueMakeNull(ctx);
+        jscEnsureDomClasses();
+        return JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ nid });
+    };
+
+    if (prop == "type")             return makeStr(p->type);
+    if (prop == "bubbles")          return JSValueMakeBoolean(ctx, p->bubbles);
+    if (prop == "cancelable")       return JSValueMakeBoolean(ctx, p->cancelable);
+    if (prop == "defaultPrevented") return JSValueMakeBoolean(ctx, p->defaultPrevented);
+    if (prop == "eventPhase")       return JSValueMakeNumber(ctx, p->eventPhase);
+    if (prop == "target")           return makeEl(p->targetNodeId);
+    if (prop == "currentTarget")    return makeEl(p->currentTargetNodeId);
+    if (prop == "preventDefault")          return makeFn("preventDefault", jscEvtPreventDefault);
+    if (prop == "stopPropagation")         return makeFn("stopPropagation", jscEvtStopPropagation);
+    if (prop == "stopImmediatePropagation") return makeFn("stopImmediatePropagation", jscEvtStopImmediate);
+
+    return nullptr; // unknown: delegate to normal own-property storage
+}
+
+static bool jscEventSetProperty(JSContextRef /*ctx*/, JSObjectRef object, JSStringRef propertyName, JSValueRef /*value*/, JSValueRef*) {
+    if (!jscEvtPriv(object)) return false;
+    std::string prop = jsStringToUtf8(propertyName);
+    // Standard fields are read-only here; everything else (clientX, key, ...) is
+    // stored as a normal own property (return false delegates to default store).
+    if (prop == "type" || prop == "bubbles" || prop == "cancelable" ||
+        prop == "defaultPrevented" || prop == "eventPhase" ||
+        prop == "target" || prop == "currentTarget" ||
+        prop == "preventDefault" || prop == "stopPropagation" ||
+        prop == "stopImmediatePropagation")
+        return true; // swallow writes to standard members
+    return false;
+}
+
+// Build a backed Event instance (no constructor invocation).
+static JSObjectRef jscMakeEvent(JSContextRef ctx, const std::string& type, bool bubbles, bool cancelable) {
+    jscEnsureDomClasses();
+    auto* p = new JscEventPriv();
+    p->type = type;
+    p->bubbles = bubbles;
+    p->cancelable = cancelable;
+    return JSObjectMake(ctx, g_jscEventClass, p);
+}
+
+// Read .bubbles/.cancelable off an options object (any may be missing).
+static void jscReadEventOptions(JSContextRef ctx, JSValueRef opts, bool& bubbles, bool& cancelable) {
+    if (!opts || !JSValueIsObject(ctx, opts)) return;
+    JSObjectRef o = JSValueToObject(ctx, opts, nullptr);
+    JSStringRef bk = JSStringCreateWithUTF8CString("bubbles");
+    JSValueRef bv = JSObjectGetProperty(ctx, o, bk, nullptr);
+    JSStringRelease(bk);
+    if (bv && !JSValueIsUndefined(ctx, bv)) bubbles = JSValueToBoolean(ctx, bv);
+    JSStringRef ck = JSStringCreateWithUTF8CString("cancelable");
+    JSValueRef cv = JSObjectGetProperty(ctx, o, ck, nullptr);
+    JSStringRelease(ck);
+    if (cv && !JSValueIsUndefined(ctx, cv)) cancelable = JSValueToBoolean(ctx, cv);
+}
+
+// Native factory backing the Event() JS shim. JavaScriptCore's C API can make
+// EITHER a callable function (typeof "function" but not `new`-able) OR a
+// constructor (new-able but typeof "object"); neither alone satisfies a page
+// that checks `typeof Event === "function"` AND does `new Event(...)`. So we
+// expose this native factory and define Event/CustomEvent as real JS functions
+// (see kEventShim) that return the backed object — which `new` then adopts.
+static JSValueRef jscMakeEventNative(JSContextRef ctx, JSObjectRef /*function*/, JSObjectRef /*thisObject*/, size_t argc, const JSValueRef argv[], JSValueRef* /*exception*/) {
+    std::string type = (argc > 0) ? jsToUtf8(ctx, argv[0]) : "";
+    bool bubbles = false, cancelable = false;
+    if (argc > 1) jscReadEventOptions(ctx, argv[1], bubbles, cancelable);
+    return jscMakeEvent(ctx, type, bubbles, cancelable);
+}
+
+static JSValueRef jscMakeCustomEventNative(JSContextRef ctx, JSObjectRef /*function*/, JSObjectRef /*thisObject*/, size_t argc, const JSValueRef argv[], JSValueRef* /*exception*/) {
+    std::string type = (argc > 0) ? jsToUtf8(ctx, argv[0]) : "";
+    bool bubbles = false, cancelable = false;
+    if (argc > 1) jscReadEventOptions(ctx, argv[1], bubbles, cancelable);
+    JSObjectRef obj = jscMakeEvent(ctx, type, bubbles, cancelable);
+    JSValueRef detail = JSValueMakeNull(ctx);
+    if (argc > 1 && JSValueIsObject(ctx, argv[1])) {
+        JSObjectRef o = JSValueToObject(ctx, argv[1], nullptr);
+        JSStringRef dk = JSStringCreateWithUTF8CString("detail");
+        JSValueRef dv = JSObjectGetProperty(ctx, o, dk, nullptr);
+        JSStringRelease(dk);
+        if (dv && !JSValueIsUndefined(ctx, dv)) detail = dv;
+    }
+    // detail is an ordinary own property.
+    JSStringRef dn = JSStringCreateWithUTF8CString("detail");
+    JSObjectSetProperty(ctx, obj, dn, detail, kJSPropertyAttributeNone, nullptr);
+    JSStringRelease(dn);
+    return obj;
+}
+
+// Fire every listener registered under `key`, passing evt as the single arg.
+// Stops early if the event's stopImmediatePropagation() was called.
+static void jscFireListeners(JSContextRef ctx, const std::string& key, JSObjectRef evt) {
+    if (!g_jsHost) return;
+    auto it = g_jsHost->listeners.find(key);
+    if (it == g_jsHost->listeners.end()) return;
+    auto* ep = (JscEventPriv*)JSObjectGetPrivate(evt); // may be null for plain events
+    std::vector<JSObjectRef> fns = it->second; // copy (handler may mutate the map)
+    for (auto* fn : fns) {
+        if (!fn) continue;
+        JSValueRef exc = nullptr;
+        JSValueRef arg = evt;
+        JSObjectCallAsFunction(ctx, fn, nullptr, 1, &arg, &exc);
+        if (exc) std::cerr << "[JS Exception] " << jsToUtf8(ctx, exc) << "\n";
+        if (ep && ep->immediateStopped) break; // stopImmediatePropagation()
+    }
+}
+
+// Remove every listener stored under `key` whose function is identity-equal to
+// fn; removed entries are unprotected.
+static void jscRemoveListener(JSContextRef ctx, const std::string& key, JSObjectRef fn) {
+    if (!g_jsHost || !fn) return;
+    auto it = g_jsHost->listeners.find(key);
+    if (it == g_jsHost->listeners.end()) return;
+    auto& vec = it->second;
+    for (size_t i = 0; i < vec.size();) {
+        if (vec[i] == fn) {
+            JSValueUnprotect(ctx, vec[i]);
+            vec.erase(vec.begin() + i);
+        } else {
+            ++i;
+        }
+    }
+}
+
+// Unified DOM event dispatch with bubbling. Returns evt.defaultPrevented.
+static bool jscDispatchEvent(JSContextRef ctx, int targetNodeId, JSObjectRef evt,
+                             const std::string& type, bool bubbles) {
+    if (!g_jsHost) return false;
+    auto* ep = (JscEventPriv*)JSObjectGetPrivate(evt);
+    if (ep) {
+        ep->targetNodeId = targetNodeId;
+        ep->propagationStopped = false;
+        ep->immediateStopped = false;
+    }
+
+    // Propagation path: target, then ancestors up to (not including) root.
+    std::vector<int> path;
+    if (targetNodeId >= 0) {
+        for (int n = targetNodeId; n >= 0 && n != g_jsHost->dom.root;) {
+            path.push_back(n);
+            DomNode* dn = g_jsHost->dom.get(n);
+            n = dn ? dn->parent : -1;
+        }
+    }
+
+    bool stopped = false;
+    for (size_t i = 0; i < path.size(); ++i) {
+        if (i > 0 && !bubbles) break; // non-bubbling: target only
+        if (ep) ep->currentTargetNodeId = path[i];
+        jscFireListeners(ctx, "node:" + std::to_string(path[i]) + ":" + type, evt);
+        if (ep && ep->propagationStopped) { stopped = true; break; }
+    }
+
+    if ((bubbles || path.empty()) && !stopped) {
+        if (ep) ep->currentTargetNodeId = -1;
+        jscFireListeners(ctx, "document:" + type, evt);
+        if (!(ep && ep->propagationStopped))
+            jscFireListeners(ctx, "window:" + type, evt);
+    }
+
+    return ep ? ep->defaultPrevented : false;
 }
 
 static JSValueRef jscGetElementById(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) {
@@ -2192,6 +2517,117 @@ static JSValueRef jscNodeArray(JSContextRef ctx, const std::vector<int>& nids) {
     JSValueRef exc = nullptr;
     JSObjectRef arr = JSObjectMakeArray(ctx, elems.size(), elems.empty() ? nullptr : elems.data(), &exc);
     return arr ? (JSValueRef)arr : JSValueMakeNull(ctx);
+}
+
+// ---------- Batch 1: DOM mutation / classList / text nodes (JSC) ----------
+
+static int jscArgNodeId(JSContextRef ctx, JSValueRef v) {
+    if (!JSValueIsObject(ctx, v)) return -1;
+    auto* p = (JscElementPriv*)JSObjectGetPrivate(JSValueToObject(ctx, v, nullptr));
+    return p ? p->nodeId : -1;
+}
+
+static JSValueRef jscElementInsertBefore(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost || argc < 1) return JSValueMakeUndefined(ctx);
+    int pid = jscElNodeId(thisObject);
+    int newId = jscArgNodeId(ctx, argv[0]);
+    int refId = (argc >= 2) ? jscArgNodeId(ctx, argv[1]) : -1;
+    if (pid < 0 || newId < 0) return argv[0];
+    domInsertBefore(g_jsHost->dom, pid, newId, refId);
+    g_jsHost->domDirty = true;
+    return argv[0];
+}
+static JSValueRef jscElementReplaceChild(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost || argc < 2) return JSValueMakeUndefined(ctx);
+    int pid = jscElNodeId(thisObject);
+    int newId = jscArgNodeId(ctx, argv[0]);
+    int oldId = jscArgNodeId(ctx, argv[1]);
+    if (pid < 0 || newId < 0 || oldId < 0) return JSValueMakeUndefined(ctx);
+    domInsertBefore(g_jsHost->dom, pid, newId, oldId);
+    domRemoveChild(g_jsHost->dom, pid, oldId);
+    g_jsHost->domDirty = true;
+    return argv[1];
+}
+static JSValueRef jscElementCloneNode(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost) return JSValueMakeNull(ctx);
+    int nid = jscElNodeId(thisObject);
+    if (nid < 0) return JSValueMakeNull(ctx);
+    bool deep = (argc > 0) && JSValueToBoolean(ctx, argv[0]);
+    int cl = domCloneSubtree(g_jsHost->dom, nid, deep);
+    if (cl < 0) return JSValueMakeNull(ctx);
+    jscEnsureDomClasses();
+    return JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ cl });
+}
+static JSValueRef jscElementHasAttribute(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    DomNode* n = jscElNode(thisObject);
+    if (!n || argc < 1) return JSValueMakeBoolean(ctx, false);
+    return JSValueMakeBoolean(ctx, domGetAttrPtr(*n, toLowerCopy(jsToUtf8(ctx, argv[0]))) != nullptr);
+}
+static JSValueRef jscElementRemoveAttribute(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    DomNode* n = jscElNode(thisObject);
+    if (n && argc >= 1) {
+        domRemoveAttr(*n, toLowerCopy(jsToUtf8(ctx, argv[0])));
+        if (g_jsHost) g_jsHost->domDirty = true;
+    }
+    return JSValueMakeUndefined(ctx);
+}
+
+// classList: a plain object carrying its element id in a hidden "_nid" property.
+static int jscClassListNid(JSContextRef ctx, JSObjectRef thisObject) {
+    JSStringRef k = JSStringCreateWithUTF8CString("_nid");
+    JSValueRef v = JSObjectGetProperty(ctx, thisObject, k, nullptr);
+    JSStringRelease(k);
+    return (int)JSValueToNumber(ctx, v, nullptr);
+}
+static JSValueRef jscClassListAdd(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (g_jsHost) if (DomNode* n = g_jsHost->dom.get(jscClassListNid(ctx, thisObject)))
+        for (size_t i = 0; i < argc; ++i) { domClassAdd(*n, jsToUtf8(ctx, argv[i])); g_jsHost->domDirty = true; }
+    return JSValueMakeUndefined(ctx);
+}
+static JSValueRef jscClassListRemove(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (g_jsHost) if (DomNode* n = g_jsHost->dom.get(jscClassListNid(ctx, thisObject)))
+        for (size_t i = 0; i < argc; ++i) { domClassRemove(*n, jsToUtf8(ctx, argv[i])); g_jsHost->domDirty = true; }
+    return JSValueMakeUndefined(ctx);
+}
+static JSValueRef jscClassListContains(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (argc >= 1 && g_jsHost) if (DomNode* n = g_jsHost->dom.get(jscClassListNid(ctx, thisObject)))
+        return JSValueMakeBoolean(ctx, domClassContains(*n, jsToUtf8(ctx, argv[0])));
+    return JSValueMakeBoolean(ctx, false);
+}
+static JSValueRef jscClassListToggle(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (argc < 1 || !g_jsHost) return JSValueMakeBoolean(ctx, false);
+    DomNode* n = g_jsHost->dom.get(jscClassListNid(ctx, thisObject));
+    if (!n) return JSValueMakeBoolean(ctx, false);
+    std::string cls = jsToUtf8(ctx, argv[0]);
+    bool add = (argc >= 2) ? JSValueToBoolean(ctx, argv[1]) : !domClassContains(*n, cls);
+    if (add) domClassAdd(*n, cls); else domClassRemove(*n, cls);
+    g_jsHost->domDirty = true;
+    return JSValueMakeBoolean(ctx, add);
+}
+static JSObjectRef jscMakeClassList(JSContextRef ctx, int nid) {
+    JSObjectRef o = JSObjectMake(ctx, nullptr, nullptr);
+    JSStringRef k = JSStringCreateWithUTF8CString("_nid");
+    JSObjectSetProperty(ctx, o, k, JSValueMakeNumber(ctx, nid),
+                        kJSPropertyAttributeDontEnum | kJSPropertyAttributeReadOnly, nullptr);
+    JSStringRelease(k);
+    auto add = [&](const char* name, JSObjectCallAsFunctionCallback cb) {
+        JSStringRef nm = JSStringCreateWithUTF8CString(name);
+        JSObjectSetProperty(ctx, o, nm, JSObjectMakeFunctionWithCallback(ctx, nm, cb), kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(nm);
+    };
+    add("add", jscClassListAdd);
+    add("remove", jscClassListRemove);
+    add("toggle", jscClassListToggle);
+    add("contains", jscClassListContains);
+    return o;
+}
+
+static JSValueRef jscCreateTextNode(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost) return JSValueMakeNull(ctx);
+    int nid = g_jsHost->dom.alloc(DomNodeType::Text);
+    g_jsHost->dom.nodes[nid].text = (argc > 0) ? jsToUtf8(ctx, argv[0]) : "";
+    jscEnsureDomClasses();
+    return JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ nid });
 }
 
 static JSValueRef jscGetElementsByTagName(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) {
@@ -2253,6 +2689,19 @@ static void jsSetupPageGlobals(JSContextRef ctx, const std::string& url, const s
         JSObjectSetProperty(ctx, document, ael, aelFn, kJSPropertyAttributeNone, nullptr);
         JSStringRelease(ael);
 
+        // document.removeEventListener
+        JSStringRef rel = JSStringCreateWithUTF8CString("removeEventListener");
+        JSObjectRef relFn = JSObjectMakeFunctionWithCallback(ctx, rel, [](JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) -> JSValueRef {
+            if (!g_jsHost) return JSValueMakeUndefined(ctx);
+            if (argc < 2 || !JSValueIsObject(ctx, argv[1])) return JSValueMakeUndefined(ctx);
+            std::string type = jsToUtf8(ctx, argv[0]);
+            JSObjectRef fn = JSValueToObject(ctx, argv[1], nullptr);
+            if (fn) jscRemoveListener(ctx, "document:" + type, fn);
+            return JSValueMakeUndefined(ctx);
+        });
+        JSObjectSetProperty(ctx, document, rel, relFn, kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(rel);
+
         // document.getElementById
         JSStringRef gebi = JSStringCreateWithUTF8CString("getElementById");
         JSObjectRef gebiFn = JSObjectMakeFunctionWithCallback(ctx, gebi, jscGetElementById);
@@ -2273,6 +2722,12 @@ static void jsSetupPageGlobals(JSContextRef ctx, const std::string& url, const s
         });
         JSObjectSetProperty(ctx, document, ce, ceFn, kJSPropertyAttributeNone, nullptr);
         JSStringRelease(ce);
+
+        // document.createTextNode
+        JSStringRef ctn = JSStringCreateWithUTF8CString("createTextNode");
+        JSObjectRef ctnFn = JSObjectMakeFunctionWithCallback(ctx, ctn, jscCreateTextNode);
+        JSObjectSetProperty(ctx, document, ctn, ctnFn, kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(ctn);
 
         // document.body / document.head resolve to the real <body>/<head> nodes
         // (created if the page omitted them) so appendChild() actually renders.
@@ -2340,6 +2795,19 @@ static void jsSetupPageGlobals(JSContextRef ctx, const std::string& url, const s
         });
         JSObjectSetProperty(ctx, global, ael, aelFn, kJSPropertyAttributeNone, nullptr);
         JSStringRelease(ael);
+
+        // window.removeEventListener
+        JSStringRef rel = JSStringCreateWithUTF8CString("removeEventListener");
+        JSObjectRef relFn = JSObjectMakeFunctionWithCallback(ctx, rel, [](JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) -> JSValueRef {
+            if (!g_jsHost) return JSValueMakeUndefined(ctx);
+            if (argc < 2 || !JSValueIsObject(ctx, argv[1])) return JSValueMakeUndefined(ctx);
+            std::string type = jsToUtf8(ctx, argv[0]);
+            JSObjectRef fn = JSValueToObject(ctx, argv[1], nullptr);
+            if (fn) jscRemoveListener(ctx, "window:" + type, fn);
+            return JSValueMakeUndefined(ctx);
+        });
+        JSObjectSetProperty(ctx, global, rel, relFn, kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(rel);
     }
 // navigator.userAgent
     JSObjectRef navigator = JSObjectMake(ctx, nullptr, nullptr);
@@ -2354,6 +2822,26 @@ static void jsSetupPageGlobals(JSContextRef ctx, const std::string& url, const s
     JSStringRef navName = JSStringCreateWithUTF8CString("navigator");
     JSObjectSetProperty(ctx, global, navName, navigator, kJSPropertyAttributeNone, nullptr);
     JSStringRelease(navName);
+
+    // Event / CustomEvent constructors. Native factories are installed under
+    // hidden names, then real JS constructor functions (typeof "function" AND
+    // `new`-able) delegate to them; `new` adopts the returned backed object.
+    {
+        jscEnsureDomClasses();
+        JSStringRef mk = JSStringCreateWithUTF8CString("__nochromeMakeEvent");
+        JSObjectSetProperty(ctx, global, mk, JSObjectMakeFunctionWithCallback(ctx, mk, jscMakeEventNative), kJSPropertyAttributeDontEnum, nullptr);
+        JSStringRelease(mk);
+        JSStringRef mkc = JSStringCreateWithUTF8CString("__nochromeMakeCustomEvent");
+        JSObjectSetProperty(ctx, global, mkc, JSObjectMakeFunctionWithCallback(ctx, mkc, jscMakeCustomEventNative), kJSPropertyAttributeDontEnum, nullptr);
+        JSStringRelease(mkc);
+
+        static const char kEventShim[] =
+            "function Event(t,o){return __nochromeMakeEvent(t,o);}"
+            "function CustomEvent(t,o){return __nochromeMakeCustomEvent(t,o);}";
+        JSStringRef s = JSStringCreateWithUTF8CString(kEventShim);
+        JSEvaluateScript(ctx, s, nullptr, nullptr, 1, nullptr);
+        JSStringRelease(s);
+    }
 
     // Image(): minimal HTMLImageElement constructor. Sites use `new Image()`
     // for preloading and tracking pixels (img.src = url). Delegates to
@@ -2518,6 +3006,7 @@ struct JsEngine {
 // QuickJS class ids for our minimal DOM wrappers (registered once for the runtime).
 static JSClassID g_qjsElementClassId = 0;
 static JSClassID g_qjsStyleClassId = 0;
+static JSClassID g_qjsEventClassId = 0;
 
 struct QjsElementPriv {
     int nodeId = -1; // index into JsHost::dom
@@ -2525,6 +3014,21 @@ struct QjsElementPriv {
 
 struct QjsStylePriv {
     int nodeId = -1; // element this style belongs to
+};
+
+// Backing store for a DOM Event object. Standard fields live here; ad-hoc
+// properties (clientX, key, ...) are stored as ordinary own properties on the
+// JS instance.
+struct QjsEventPriv {
+    std::string type;
+    bool bubbles = false;
+    bool cancelable = false;
+    bool defaultPrevented = false;
+    bool propagationStopped = false;
+    bool immediateStopped = false;
+    int eventPhase = 0;
+    int targetNodeId = -1;
+    int currentTargetNodeId = -1;
 };
 
 static JsHost* qjsHost(JSContext* ctx) {
@@ -2734,6 +3238,11 @@ static void qjsStyleFinalizer(JSRuntime* /*rt*/, JSValue val) {
     delete p;
 }
 
+static void qjsEventFinalizer(JSRuntime* /*rt*/, JSValue val) {
+    auto* p = (QjsEventPriv*)JS_GetOpaque(val, g_qjsEventClassId);
+    delete p;
+}
+
 static DomNode* qjsElNode(JSContext* ctx, JSValueConst this_val) {
     JsHost* host = qjsHost(ctx);
     auto* p = (QjsElementPriv*)JS_GetOpaque(this_val, g_qjsElementClassId);
@@ -2843,32 +3352,157 @@ static JSValue qjsElAttrSet(JSContext* ctx, JSValueConst this_val, int argc, JSV
     return JS_UNDEFINED;
 }
 
+// -------------------- Event object (QuickJS) --------------------
+
+static QjsEventPriv* qjsEvtPriv(JSValueConst this_val) {
+    return (QjsEventPriv*)JS_GetOpaque(this_val, g_qjsEventClassId);
+}
+
+static JSValue qjsEvtGetType(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    QjsEventPriv* p = qjsEvtPriv(this_val);
+    return p ? JS_NewString(ctx, p->type.c_str()) : JS_UNDEFINED;
+}
+static JSValue qjsEvtGetBubbles(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    QjsEventPriv* p = qjsEvtPriv(this_val);
+    return JS_NewBool(ctx, p && p->bubbles);
+}
+static JSValue qjsEvtGetCancelable(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    QjsEventPriv* p = qjsEvtPriv(this_val);
+    return JS_NewBool(ctx, p && p->cancelable);
+}
+static JSValue qjsEvtGetDefaultPrevented(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    QjsEventPriv* p = qjsEvtPriv(this_val);
+    return JS_NewBool(ctx, p && p->defaultPrevented);
+}
+static JSValue qjsEvtGetEventPhase(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    QjsEventPriv* p = qjsEvtPriv(this_val);
+    return JS_NewInt32(ctx, p ? p->eventPhase : 0);
+}
+static JSValue qjsEvtGetTarget(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    QjsEventPriv* p = qjsEvtPriv(this_val);
+    if (!p || p->targetNodeId < 0) return JS_NULL;
+    return qjsMakeElement(ctx, p->targetNodeId);
+}
+static JSValue qjsEvtGetCurrentTarget(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    QjsEventPriv* p = qjsEvtPriv(this_val);
+    if (!p || p->currentTargetNodeId < 0) return JS_NULL;
+    return qjsMakeElement(ctx, p->currentTargetNodeId);
+}
+static JSValue qjsEvtPreventDefault(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    QjsEventPriv* p = qjsEvtPriv(this_val);
+    if (p && p->cancelable) p->defaultPrevented = true;
+    return JS_UNDEFINED;
+}
+static JSValue qjsEvtStopPropagation(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    QjsEventPriv* p = qjsEvtPriv(this_val);
+    if (p) p->propagationStopped = true;
+    return JS_UNDEFINED;
+}
+static JSValue qjsEvtStopImmediatePropagation(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    QjsEventPriv* p = qjsEvtPriv(this_val);
+    if (p) { p->propagationStopped = true; p->immediateStopped = true; }
+    return JS_UNDEFINED;
+}
+
+// Build a backed Event instance (no constructor invocation).
+static JSValue qjsMakeEvent(JSContext* ctx, const std::string& type, bool bubbles, bool cancelable) {
+    JSValue obj = JS_NewObjectClass(ctx, g_qjsEventClassId);
+    if (JS_IsException(obj)) return obj;
+    auto* p = new QjsEventPriv();
+    p->type = type;
+    p->bubbles = bubbles;
+    p->cancelable = cancelable;
+    JS_SetOpaque(obj, p);
+    return obj;
+}
+
+// Read .bubbles/.cancelable/.detail off an options object (any may be missing).
+static void qjsReadEventOptions(JSContext* ctx, JSValueConst opts, bool& bubbles, bool& cancelable) {
+    if (!JS_IsObject(opts)) return;
+    JSValue b = JS_GetPropertyStr(ctx, opts, "bubbles");
+    if (!JS_IsUndefined(b)) bubbles = JS_ToBool(ctx, b);
+    JS_FreeValue(ctx, b);
+    JSValue c = JS_GetPropertyStr(ctx, opts, "cancelable");
+    if (!JS_IsUndefined(c)) cancelable = JS_ToBool(ctx, c);
+    JS_FreeValue(ctx, c);
+}
+
+// new Event(type, {bubbles, cancelable})
+static JSValue qjsEventCtor(JSContext* ctx, JSValueConst /*new_target*/, int argc, JSValueConst* argv) {
+    std::string type = (argc > 0) ? jsToUtf8(ctx, argv[0]) : "";
+    bool bubbles = false, cancelable = false;
+    if (argc > 1) qjsReadEventOptions(ctx, argv[1], bubbles, cancelable);
+    return qjsMakeEvent(ctx, type, bubbles, cancelable);
+}
+
+// new CustomEvent(type, {bubbles, cancelable, detail})
+static JSValue qjsCustomEventCtor(JSContext* ctx, JSValueConst /*new_target*/, int argc, JSValueConst* argv) {
+    std::string type = (argc > 0) ? jsToUtf8(ctx, argv[0]) : "";
+    bool bubbles = false, cancelable = false;
+    if (argc > 1) qjsReadEventOptions(ctx, argv[1], bubbles, cancelable);
+    JSValue obj = qjsMakeEvent(ctx, type, bubbles, cancelable);
+    if (JS_IsException(obj)) return obj;
+    JSValue detail = JS_UNDEFINED;
+    if (argc > 1 && JS_IsObject(argv[1])) detail = JS_GetPropertyStr(ctx, argv[1], "detail");
+    // detail is an ordinary own property (default null when absent).
+    JS_SetPropertyStr(ctx, obj, "detail", JS_IsUndefined(detail) ? JS_NULL : detail);
+    return obj;
+}
+
 // Forward declarations for element methods used while building the prototype.
 static JSValue qjsElAddEventListener(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
+static JSValue qjsElRemoveEventListener(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
+static JSValue qjsElDispatchEvent(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
 static JSValue qjsElAppendChild(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
 static JSValue qjsElRemoveChild(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
 static JSValue qjsElSetAttribute(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
 static JSValue qjsElGetAttribute(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
+// Batch 1 DOM: traversal / mutation / classList (defined after qjsNodeArray).
+static JSValue qjsElInsertBefore(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElReplaceChild(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElCloneNode(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElHasAttribute(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElRemoveAttribute(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElGetClassName(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElSetClassName(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElGetClassList(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElGetChildNodes(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElGetChildren(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElGetFirstChild(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElGetLastChild(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElGetNextSibling(JSContext*, JSValueConst, int, JSValueConst*);
+static JSValue qjsElGetPrevSibling(JSContext*, JSValueConst, int, JSValueConst*);
 
-static JSValue qjsStyleGetDisplay(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+// style.<prop> get/set for a curated set of common CSS properties. The property
+// name is carried in CFunctionData so one pair of callbacks serves them all.
+static JSValue qjsStylePropGet(JSContext* ctx, JSValueConst this_val, int, JSValueConst*, int, JSValue* data) {
     JsHost* host = qjsHost(ctx);
     auto* p = (QjsStylePriv*)JS_GetOpaque(this_val, g_qjsStyleClassId);
-    if (!host || !p) return JS_UNDEFINED;
+    if (!host || !p) return JS_NewString(ctx, "");
     DomNode* n = host->dom.get(p->nodeId);
-    return JS_NewString(ctx, n ? n->styleDisplay.c_str() : "");
+    return JS_NewString(ctx, n ? domGetStyleProp(*n, jsToUtf8(ctx, data[0])).c_str() : "");
 }
-
-static JSValue qjsStyleSetDisplay(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+static JSValue qjsStylePropSet(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv, int, JSValue* data) {
     JsHost* host = qjsHost(ctx);
     auto* p = (QjsStylePriv*)JS_GetOpaque(this_val, g_qjsStyleClassId);
-    if (!host || !p) return JS_UNDEFINED;
-    if (DomNode* n = host->dom.get(p->nodeId)) {
-        n->styleDisplay = (argc > 0) ? jsToUtf8(ctx, argv[0]) : "";
-        host->domDirty = true;
+    if (host && p) {
+        if (DomNode* n = host->dom.get(p->nodeId)) {
+            domSetStyleProp(*n, jsToUtf8(ctx, data[0]), (argc > 0) ? jsToUtf8(ctx, argv[0]) : "");
+            host->domDirty = true;
+        }
     }
     return JS_UNDEFINED;
 }
-
+static void qjsDefineStyleProp(JSContext* ctx, JSValueConst proto, const char* jsName) {
+    JSValue nameVal = JS_NewString(ctx, jsName);
+    JSValueConst data[1] = { nameVal };
+    JSValue g = JS_NewCFunctionData(ctx, qjsStylePropGet, 0, 0, 1, data);
+    JSValue s = JS_NewCFunctionData(ctx, qjsStylePropSet, 1, 0, 1, data);
+    JS_FreeValue(ctx, nameVal);
+    JSAtom atom = JS_NewAtom(ctx, jsName);
+    JS_DefinePropertyGetSet(ctx, proto, atom, g, s, JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE);
+    JS_FreeAtom(ctx, atom);
+}
 static void qjsRegisterDomClasses(JSRuntime* rt) {
     if (g_qjsElementClassId == 0) {
         JS_NewClassID(&g_qjsElementClassId);
@@ -2883,6 +3517,13 @@ static void qjsRegisterDomClasses(JSRuntime* rt) {
         def.class_name = "CSSStyleDeclaration";
         def.finalizer = qjsStyleFinalizer;
         JS_NewClass(rt, g_qjsStyleClassId, &def);
+    }
+    if (g_qjsEventClassId == 0) {
+        JS_NewClassID(&g_qjsEventClassId);
+        JSClassDef def{};
+        def.class_name = "Event";
+        def.finalizer = qjsEventFinalizer;
+        JS_NewClass(rt, g_qjsEventClassId, &def);
     }
 }
 
@@ -2911,11 +3552,26 @@ static void qjsDefineAttrAccessor(JSContext* ctx, JSValueConst proto, const char
 static void qjsSetupDomProtos(JSContext* ctx) {
     JSValue elProto = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, elProto, "addEventListener", JS_NewCFunction(ctx, qjsElAddEventListener, "addEventListener", 2));
+    JS_SetPropertyStr(ctx, elProto, "removeEventListener", JS_NewCFunction(ctx, qjsElRemoveEventListener, "removeEventListener", 2));
+    JS_SetPropertyStr(ctx, elProto, "dispatchEvent", JS_NewCFunction(ctx, qjsElDispatchEvent, "dispatchEvent", 1));
     JS_SetPropertyStr(ctx, elProto, "appendChild", JS_NewCFunction(ctx, qjsElAppendChild, "appendChild", 1));
     JS_SetPropertyStr(ctx, elProto, "setAttribute", JS_NewCFunction(ctx, qjsElSetAttribute, "setAttribute", 2));
     JS_SetPropertyStr(ctx, elProto, "getAttribute", JS_NewCFunction(ctx, qjsElGetAttribute, "getAttribute", 1));
     JS_SetPropertyStr(ctx, elProto, "removeChild", JS_NewCFunction(ctx, qjsElRemoveChild, "removeChild", 1));
+    JS_SetPropertyStr(ctx, elProto, "insertBefore", JS_NewCFunction(ctx, qjsElInsertBefore, "insertBefore", 2));
+    JS_SetPropertyStr(ctx, elProto, "replaceChild", JS_NewCFunction(ctx, qjsElReplaceChild, "replaceChild", 2));
+    JS_SetPropertyStr(ctx, elProto, "cloneNode", JS_NewCFunction(ctx, qjsElCloneNode, "cloneNode", 1));
+    JS_SetPropertyStr(ctx, elProto, "hasAttribute", JS_NewCFunction(ctx, qjsElHasAttribute, "hasAttribute", 1));
+    JS_SetPropertyStr(ctx, elProto, "removeAttribute", JS_NewCFunction(ctx, qjsElRemoveAttribute, "removeAttribute", 1));
     qjsDefineAccessor(ctx, elProto, "id", qjsElGetId, qjsElSetId);
+    qjsDefineAccessor(ctx, elProto, "className", qjsElGetClassName, qjsElSetClassName);
+    qjsDefineAccessor(ctx, elProto, "classList", qjsElGetClassList, nullptr);
+    qjsDefineAccessor(ctx, elProto, "childNodes", qjsElGetChildNodes, nullptr);
+    qjsDefineAccessor(ctx, elProto, "children", qjsElGetChildren, nullptr);
+    qjsDefineAccessor(ctx, elProto, "firstChild", qjsElGetFirstChild, nullptr);
+    qjsDefineAccessor(ctx, elProto, "lastChild", qjsElGetLastChild, nullptr);
+    qjsDefineAccessor(ctx, elProto, "nextSibling", qjsElGetNextSibling, nullptr);
+    qjsDefineAccessor(ctx, elProto, "previousSibling", qjsElGetPrevSibling, nullptr);
     qjsDefineAccessor(ctx, elProto, "tagName", qjsElGetTagName, nullptr);
     qjsDefineAccessor(ctx, elProto, "style", qjsElGetStyle, nullptr);
     qjsDefineAccessor(ctx, elProto, "parentNode", qjsElGetParent, nullptr);
@@ -2930,8 +3586,21 @@ static void qjsSetupDomProtos(JSContext* ctx) {
     JS_SetClassProto(ctx, g_qjsElementClassId, elProto);
 
     JSValue stProto = JS_NewObject(ctx);
-    qjsDefineAccessor(ctx, stProto, "display", qjsStyleGetDisplay, qjsStyleSetDisplay);
+    for (const char* pn : kCssProps) qjsDefineStyleProp(ctx, stProto, pn);
     JS_SetClassProto(ctx, g_qjsStyleClassId, stProto);
+
+    JSValue evProto = JS_NewObject(ctx);
+    qjsDefineAccessor(ctx, evProto, "type", qjsEvtGetType, nullptr);
+    qjsDefineAccessor(ctx, evProto, "bubbles", qjsEvtGetBubbles, nullptr);
+    qjsDefineAccessor(ctx, evProto, "cancelable", qjsEvtGetCancelable, nullptr);
+    qjsDefineAccessor(ctx, evProto, "defaultPrevented", qjsEvtGetDefaultPrevented, nullptr);
+    qjsDefineAccessor(ctx, evProto, "eventPhase", qjsEvtGetEventPhase, nullptr);
+    qjsDefineAccessor(ctx, evProto, "target", qjsEvtGetTarget, nullptr);
+    qjsDefineAccessor(ctx, evProto, "currentTarget", qjsEvtGetCurrentTarget, nullptr);
+    JS_SetPropertyStr(ctx, evProto, "preventDefault", JS_NewCFunction(ctx, qjsEvtPreventDefault, "preventDefault", 0));
+    JS_SetPropertyStr(ctx, evProto, "stopPropagation", JS_NewCFunction(ctx, qjsEvtStopPropagation, "stopPropagation", 0));
+    JS_SetPropertyStr(ctx, evProto, "stopImmediatePropagation", JS_NewCFunction(ctx, qjsEvtStopImmediatePropagation, "stopImmediatePropagation", 0));
+    JS_SetClassProto(ctx, g_qjsEventClassId, evProto);
 }
 
 static void qjsAddListener(JSContext* ctx, const std::string& key, JSValueConst fn) {
@@ -2940,12 +3609,47 @@ static void qjsAddListener(JSContext* ctx, const std::string& key, JSValueConst 
     }
 }
 
+// Defined below (after the simple dispatcher); declared here for element methods.
+static void qjsRemoveListener(JSContext* ctx, const std::string& key, JSValueConst fn);
+static bool qjsDispatchEvent(JSContext* ctx, int targetNodeId, JSValueConst evt,
+                             const std::string& type, bool bubbles);
+
 static JSValue qjsElAddEventListener(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    DomNode* n = qjsElNode(ctx, this_val);
-    if (!n || argc < 2 || !JS_IsFunction(ctx, argv[1])) return JS_UNDEFINED;
+    int nid = qjsElNodeId(this_val);
+    if (nid < 0 || argc < 2 || !JS_IsFunction(ctx, argv[1])) return JS_UNDEFINED;
     std::string type = jsToUtf8(ctx, argv[0]);
-    qjsAddListener(ctx, "el:" + domGetAttr(*n, "id") + ":" + type, argv[1]);
+    qjsAddListener(ctx, "node:" + std::to_string(nid) + ":" + type, argv[1]);
     return JS_UNDEFINED;
+}
+
+static JSValue qjsElRemoveEventListener(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    int nid = qjsElNodeId(this_val);
+    if (nid < 0 || argc < 2 || !JS_IsFunction(ctx, argv[1])) return JS_UNDEFINED;
+    std::string type = jsToUtf8(ctx, argv[0]);
+    qjsRemoveListener(ctx, "node:" + std::to_string(nid) + ":" + type, argv[1]);
+    return JS_UNDEFINED;
+}
+
+// element.dispatchEvent(evt): dispatch an Event through the bubbling path rooted
+// at this element. Returns !defaultPrevented.
+static JSValue qjsElDispatchEvent(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    int nid = qjsElNodeId(this_val);
+    if (nid < 0 || argc < 1) return JS_NewBool(ctx, 1);
+
+    std::string type;
+    bool bubbles = false;
+    QjsEventPriv* ep = qjsEvtPriv(argv[0]);
+    if (ep) {
+        type = ep->type;
+        bubbles = ep->bubbles;
+    } else {
+        // Best-effort for plain-object "events": read .type, assume non-bubbling.
+        JSValue tv = JS_GetPropertyStr(ctx, argv[0], "type");
+        type = jsToUtf8(ctx, tv);
+        JS_FreeValue(ctx, tv);
+    }
+    bool prevented = qjsDispatchEvent(ctx, nid, argv[0], type, bubbles);
+    return JS_NewBool(ctx, !prevented);
 }
 
 static JSValue qjsElAppendChild(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
@@ -3067,6 +3771,178 @@ static JSValue qjsNodeArray(JSContext* ctx, JsHost* host, const std::vector<int>
     return arr;
 }
 
+// ---------- Batch 1: DOM traversal / mutation / classList / style ----------
+
+static int qjsSiblingId(JsHost* host, int nid, int dir) {   // dir +1 next, -1 prev
+    DomNode* n = host->dom.get(nid);
+    if (!n || n->parent < 0) return -1;
+    DomNode* p = host->dom.get(n->parent);
+    if (!p) return -1;
+    auto& cs = p->children;
+    for (size_t i = 0; i < cs.size(); ++i) {
+        if (cs[i] == nid) {
+            int j = (int)i + dir;
+            return (j < 0 || j >= (int)cs.size()) ? -1 : cs[j];
+        }
+    }
+    return -1;
+}
+
+static JSValue qjsElGetChildNodes(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0) return JS_NewArray(ctx);
+    DomNode* n = host->dom.get(nid);
+    return qjsNodeArray(ctx, host, n ? n->children : std::vector<int>{});
+}
+static JSValue qjsElGetChildren(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0) return JS_NewArray(ctx);
+    std::vector<int> els;
+    if (DomNode* n = host->dom.get(nid))
+        for (int c : n->children) {
+            DomNode* cn = host->dom.get(c);
+            if (cn && cn->type == DomNodeType::Element) els.push_back(c);
+        }
+    return qjsNodeArray(ctx, host, els);
+}
+static JSValue qjsElGetFirstChild(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0) return JS_NULL;
+    DomNode* n = host->dom.get(nid);
+    return (!n || n->children.empty()) ? JS_NULL : qjsMakeElement(ctx, n->children.front());
+}
+static JSValue qjsElGetLastChild(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0) return JS_NULL;
+    DomNode* n = host->dom.get(nid);
+    return (!n || n->children.empty()) ? JS_NULL : qjsMakeElement(ctx, n->children.back());
+}
+static JSValue qjsElGetNextSibling(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0) return JS_NULL;
+    int s = qjsSiblingId(host, nid, +1);
+    return s < 0 ? JS_NULL : qjsMakeElement(ctx, s);
+}
+static JSValue qjsElGetPrevSibling(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0) return JS_NULL;
+    int s = qjsSiblingId(host, nid, -1);
+    return s < 0 ? JS_NULL : qjsMakeElement(ctx, s);
+}
+static JSValue qjsElGetClassName(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    DomNode* n = qjsElNode(ctx, this_val);
+    return JS_NewString(ctx, n ? domGetAttr(*n, "class").c_str() : "");
+}
+static JSValue qjsElSetClassName(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (DomNode* n = qjsElNode(ctx, this_val)) {
+        domSetAttr(*n, "class", (argc > 0) ? jsToUtf8(ctx, argv[0]) : "");
+        if (host) host->domDirty = true;
+    }
+    return JS_UNDEFINED;
+}
+static JSValue qjsElInsertBefore(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    int pid = qjsElNodeId(this_val);
+    if (!host || pid < 0 || argc < 1) return JS_UNDEFINED;
+    int newId = qjsElNodeId(argv[0]);
+    int refId = (argc >= 2) ? qjsElNodeId(argv[1]) : -1;
+    if (newId < 0) return JS_UNDEFINED;
+    domInsertBefore(host->dom, pid, newId, refId);
+    host->domDirty = true;
+    return JS_DupValue(ctx, argv[0]);
+}
+static JSValue qjsElReplaceChild(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    int pid = qjsElNodeId(this_val);
+    if (!host || pid < 0 || argc < 2) return JS_UNDEFINED;
+    int newId = qjsElNodeId(argv[0]);
+    int oldId = qjsElNodeId(argv[1]);
+    if (newId < 0 || oldId < 0) return JS_UNDEFINED;
+    domInsertBefore(host->dom, pid, newId, oldId);   // place new where old was
+    domRemoveChild(host->dom, pid, oldId);
+    host->domDirty = true;
+    return JS_DupValue(ctx, argv[1]);
+}
+static JSValue qjsElCloneNode(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0) return JS_NULL;
+    bool deep = (argc > 0) && JS_ToBool(ctx, argv[0]);
+    int cl = domCloneSubtree(host->dom, nid, deep);
+    return cl < 0 ? JS_NULL : qjsMakeElement(ctx, cl);
+}
+static JSValue qjsElHasAttribute(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    DomNode* n = qjsElNode(ctx, this_val);
+    if (!n || argc < 1) return JS_FALSE;
+    return domGetAttrPtr(*n, jsToUtf8(ctx, argv[0])) ? JS_TRUE : JS_FALSE;
+}
+static JSValue qjsElRemoveAttribute(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (DomNode* n = qjsElNode(ctx, this_val)) {
+        if (argc >= 1) { domRemoveAttr(*n, jsToUtf8(ctx, argv[0])); if (host) host->domDirty = true; }
+    }
+    return JS_UNDEFINED;
+}
+
+// classList: a plain object whose methods carry the node id via CFunctionData.
+static int qjsDataNodeId(JSContext* ctx, JSValue* data) { int v = -1; JS_ToInt32(ctx, &v, data[0]); return v; }
+static JSValue qjsClassListAdd(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv, int, JSValue* data) {
+    JsHost* host = qjsHost(ctx);
+    if (host) if (DomNode* n = host->dom.get(qjsDataNodeId(ctx, data)))
+        for (int i = 0; i < argc; ++i) { domClassAdd(*n, jsToUtf8(ctx, argv[i])); host->domDirty = true; }
+    return JS_UNDEFINED;
+}
+static JSValue qjsClassListRemove(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv, int, JSValue* data) {
+    JsHost* host = qjsHost(ctx);
+    if (host) if (DomNode* n = host->dom.get(qjsDataNodeId(ctx, data)))
+        for (int i = 0; i < argc; ++i) { domClassRemove(*n, jsToUtf8(ctx, argv[i])); host->domDirty = true; }
+    return JS_UNDEFINED;
+}
+static JSValue qjsClassListContains(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv, int, JSValue* data) {
+    JsHost* host = qjsHost(ctx);
+    if (host && argc >= 1) if (DomNode* n = host->dom.get(qjsDataNodeId(ctx, data)))
+        return domClassContains(*n, jsToUtf8(ctx, argv[0])) ? JS_TRUE : JS_FALSE;
+    return JS_FALSE;
+}
+static JSValue qjsClassListToggle(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv, int, JSValue* data) {
+    JsHost* host = qjsHost(ctx);
+    if (!host || argc < 1) return JS_FALSE;
+    DomNode* n = host->dom.get(qjsDataNodeId(ctx, data));
+    if (!n) return JS_FALSE;
+    std::string cls = jsToUtf8(ctx, argv[0]);
+    bool add = (argc >= 2) ? (bool)JS_ToBool(ctx, argv[1]) : !domClassContains(*n, cls);
+    if (add) domClassAdd(*n, cls); else domClassRemove(*n, cls);
+    host->domDirty = true;
+    return add ? JS_TRUE : JS_FALSE;
+}
+static JSValue qjsElGetClassList(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    int nid = qjsElNodeId(this_val);
+    JSValue o = JS_NewObject(ctx);
+    JSValue idv = JS_NewInt32(ctx, nid);
+    JSValueConst data[1] = { idv };
+    JS_SetPropertyStr(ctx, o, "add", JS_NewCFunctionData(ctx, qjsClassListAdd, 1, 0, 1, data));
+    JS_SetPropertyStr(ctx, o, "remove", JS_NewCFunctionData(ctx, qjsClassListRemove, 1, 0, 1, data));
+    JS_SetPropertyStr(ctx, o, "toggle", JS_NewCFunctionData(ctx, qjsClassListToggle, 2, 0, 1, data));
+    JS_SetPropertyStr(ctx, o, "contains", JS_NewCFunctionData(ctx, qjsClassListContains, 1, 0, 1, data));
+    JS_FreeValue(ctx, idv);
+    return o;
+}
+
+static JSValue qjsCreateTextNode(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (!host) return JS_NULL;
+    int nid = host->dom.alloc(DomNodeType::Text);
+    host->dom.nodes[nid].text = (argc > 0) ? jsToUtf8(ctx, argv[0]) : "";
+    return qjsMakeElement(ctx, nid);
+}
+
 static JSValue jsGetElementsByTagName(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
     JsHost* host = qjsHost(ctx);
     if (!host || argc < 1) return JS_NewArray(ctx);
@@ -3100,9 +3976,21 @@ static JSValue jsDocAddEventListener(JSContext* ctx, JSValueConst /*this_val*/, 
     return JS_UNDEFINED;
 }
 
+static JSValue jsDocRemoveEventListener(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    if (argc < 2 || !JS_IsFunction(ctx, argv[1])) return JS_UNDEFINED;
+    qjsRemoveListener(ctx, "document:" + jsToUtf8(ctx, argv[0]), argv[1]);
+    return JS_UNDEFINED;
+}
+
 static JSValue jsWinAddEventListener(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
     if (argc < 2 || !JS_IsFunction(ctx, argv[1])) return JS_UNDEFINED;
     qjsAddListener(ctx, "window:" + jsToUtf8(ctx, argv[0]), argv[1]);
+    return JS_UNDEFINED;
+}
+
+static JSValue jsWinRemoveEventListener(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    if (argc < 2 || !JS_IsFunction(ctx, argv[1])) return JS_UNDEFINED;
+    qjsRemoveListener(ctx, "window:" + jsToUtf8(ctx, argv[0]), argv[1]);
     return JS_UNDEFINED;
 }
 
@@ -3112,13 +4000,73 @@ static void jsDispatchEventSimple(JSContext* ctx, const std::string& key, JSValu
     auto it = host->listeners.find(key);
     if (it == host->listeners.end()) return;
 
+    QjsEventPriv* ep = qjsEvtPriv(evt); // may be null for plain-object events
     std::vector<JSValue> fns = it->second; // entries stay owned by host->listeners
     for (auto& fn : fns) {
         JSValueConst args[1] = { evt };
         JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 1, args);
         if (JS_IsException(r)) jsDumpException(ctx);
         JS_FreeValue(ctx, r);
+        if (ep && ep->immediateStopped) break; // stopImmediatePropagation()
     }
+}
+
+// Remove every listener stored under `key` whose function is identity-equal to
+// fn; the removed entries are freed.
+static void qjsRemoveListener(JSContext* ctx, const std::string& key, JSValueConst fn) {
+    JsHost* host = qjsHost(ctx);
+    if (!host) return;
+    auto it = host->listeners.find(key);
+    if (it == host->listeners.end()) return;
+    auto& vec = it->second;
+    for (size_t i = 0; i < vec.size();) {
+        if (JS_VALUE_GET_PTR(vec[i]) == JS_VALUE_GET_PTR(fn)) {
+            JS_FreeValue(ctx, vec[i]);
+            vec.erase(vec.begin() + i);
+        } else {
+            ++i;
+        }
+    }
+}
+
+// Unified DOM event dispatch with bubbling. Returns evt.defaultPrevented.
+static bool qjsDispatchEvent(JSContext* ctx, int targetNodeId, JSValueConst evt,
+                             const std::string& type, bool bubbles) {
+    JsHost* host = qjsHost(ctx);
+    if (!host) return false;
+    QjsEventPriv* ep = qjsEvtPriv(evt);
+    if (ep) {
+        ep->targetNodeId = targetNodeId;
+        ep->propagationStopped = false;
+        ep->immediateStopped = false;
+    }
+
+    // Propagation path: target, then its ancestors up to (not including) root.
+    std::vector<int> path;
+    if (targetNodeId >= 0) {
+        for (int n = targetNodeId; n >= 0 && n != host->dom.root;) {
+            path.push_back(n);
+            DomNode* dn = host->dom.get(n);
+            n = dn ? dn->parent : -1;
+        }
+    }
+
+    bool stopped = false;
+    for (size_t i = 0; i < path.size(); ++i) {
+        if (i > 0 && !bubbles) break; // non-bubbling: target only
+        if (ep) ep->currentTargetNodeId = path[i];
+        jsDispatchEventSimple(ctx, "node:" + std::to_string(path[i]) + ":" + type, evt);
+        if (ep && ep->propagationStopped) { stopped = true; break; }
+    }
+
+    if ((bubbles || path.empty()) && !stopped) {
+        if (ep) ep->currentTargetNodeId = -1;
+        jsDispatchEventSimple(ctx, "document:" + type, evt);
+        if (!(ep && ep->propagationStopped))
+            jsDispatchEventSimple(ctx, "window:" + type, evt);
+    }
+
+    return ep ? ep->defaultPrevented : false;
 }
 
 static void qjsFreeHostRefs(JsEngine& js) {
@@ -3302,8 +4250,10 @@ static void jsSetupPageGlobals(JSContext* ctx, const std::string& url, const std
     JSValue document = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, document, "title", JS_NewString(ctx, title.c_str()));
     JS_SetPropertyStr(ctx, document, "addEventListener", JS_NewCFunction(ctx, jsDocAddEventListener, "addEventListener", 2));
+    JS_SetPropertyStr(ctx, document, "removeEventListener", JS_NewCFunction(ctx, jsDocRemoveEventListener, "removeEventListener", 2));
     JS_SetPropertyStr(ctx, document, "getElementById", JS_NewCFunction(ctx, jsGetElementById, "getElementById", 1));
     JS_SetPropertyStr(ctx, document, "createElement", JS_NewCFunction(ctx, jsCreateElement, "createElement", 1));
+    JS_SetPropertyStr(ctx, document, "createTextNode", JS_NewCFunction(ctx, qjsCreateTextNode, "createTextNode", 1));
     JS_SetPropertyStr(ctx, document, "querySelector", JS_NewCFunction(ctx, jsQuerySelector, "querySelector", 1));
     JS_SetPropertyStr(ctx, document, "querySelectorAll", JS_NewCFunction(ctx, jsQuerySelectorAll, "querySelectorAll", 1));
     JS_SetPropertyStr(ctx, document, "getElementsByTagName", JS_NewCFunction(ctx, jsGetElementsByTagName, "getElementsByTagName", 1));
@@ -3329,6 +4279,13 @@ static void jsSetupPageGlobals(JSContext* ctx, const std::string& url, const std
 
     // window/global addEventListener (window === global here).
     JS_SetPropertyStr(ctx, global, "addEventListener", JS_NewCFunction(ctx, jsWinAddEventListener, "addEventListener", 2));
+    JS_SetPropertyStr(ctx, global, "removeEventListener", JS_NewCFunction(ctx, jsWinRemoveEventListener, "removeEventListener", 2));
+
+    // Event / CustomEvent constructors (native, usable with `new`).
+    JS_SetPropertyStr(ctx, global, "Event",
+                      JS_NewCFunction2(ctx, qjsEventCtor, "Event", 2, JS_CFUNC_constructor, 0));
+    JS_SetPropertyStr(ctx, global, "CustomEvent",
+                      JS_NewCFunction2(ctx, qjsCustomEventCtor, "CustomEvent", 2, JS_CFUNC_constructor, 0));
 
     // Image(): minimal HTMLImageElement constructor. Sites use `new Image()`
     // for preloading and tracking pixels (img.src = url). Delegates to
@@ -4615,41 +5572,7 @@ int main(int argc, char** argv) {
                     int my = e.button.y;
 
                     
-#ifdef NOCHROME_ENABLE_JS
-#if defined(NOCHROME_USE_JSC)
-                    // Dispatch click event (best-effort).
-                    {
-                        g_jsHost = &js.host;
-                        JSObjectRef evt = JSObjectMake(js.ctx, nullptr, nullptr);
-                        JSStringRef tn = JSStringCreateWithUTF8CString("type");
-                        JSObjectSetProperty(js.ctx, evt, tn, JSValueMakeString(js.ctx, JSStringCreateWithUTF8CString("click")), kJSPropertyAttributeNone, nullptr);
-                        JSStringRelease(tn);
-
-                        JSStringRef xn = JSStringCreateWithUTF8CString("clientX");
-                        JSObjectSetProperty(js.ctx, evt, xn, JSValueMakeNumber(js.ctx, (double)mx), kJSPropertyAttributeNone, nullptr);
-                        JSStringRelease(xn);
-
-                        JSStringRef yn = JSStringCreateWithUTF8CString("clientY");
-                        JSObjectSetProperty(js.ctx, evt, yn, JSValueMakeNumber(js.ctx, (double)my), kJSPropertyAttributeNone, nullptr);
-                        JSStringRelease(yn);
-
-                        jscDispatchEventSimple(js.ctx, "window:click", evt);
-                        jscDispatchEventSimple(js.ctx, "document:click", evt);
-                    }
-#else
-                    if (js.ctx) {
-                        JSValue evt = JS_NewObject(js.ctx);
-                        JS_SetPropertyStr(js.ctx, evt, "type", JS_NewString(js.ctx, "click"));
-                        JS_SetPropertyStr(js.ctx, evt, "clientX", JS_NewInt32(js.ctx, mx));
-                        JS_SetPropertyStr(js.ctx, evt, "clientY", JS_NewInt32(js.ctx, my));
-                        jsDispatchEventSimple(js.ctx, "window:click", evt);
-                        jsDispatchEventSimple(js.ctx, "document:click", evt);
-                        JS_FreeValue(js.ctx, evt);
-                        jsDrainJobs(js);
-                    }
-#endif
-#endif
-// Tabs bar interactions
+                    // Tabs bar interactions
                     if (my < tabBarH) {
                         if (e.button.button == SDL_BUTTON_LEFT) {
                             if (hitTestPlus(mx, my)) {
@@ -4699,6 +5622,10 @@ int main(int argc, char** argv) {
 
                         auto& page = tabs[activeTab].page;
 
+                        // Whether a JS click handler called preventDefault(); if so the
+                        // built-in link navigation / form submit below is suppressed.
+                        bool clickDefaultPrevented = false;
+
 #ifdef NOCHROME_ENABLE_JS
                         // Dispatch a click to the innermost element with an id under the cursor.
                         if (js.ctx && activeJsTab == activeTab) {
@@ -4715,24 +5642,27 @@ int main(int argc, char** argv) {
                                     }
                                 }
                             }
-                            if (!hitId.empty()) {
+                            // Resolve the hit element's nodeId (-1 => document/window only).
+                            int hitNid = hitId.empty()
+                                ? -1 : domFindById(page.dom, page.dom.root, hitId);
 #if defined(NOCHROME_USE_JSC)
-                                g_jsHost = &js.host;
-                                JSObjectRef evt = JSObjectMake(js.ctx, nullptr, nullptr);
-                                JSStringRef tn = JSStringCreateWithUTF8CString("type");
-                                JSObjectSetProperty(js.ctx, evt, tn, JSValueMakeString(js.ctx, JSStringCreateWithUTF8CString("click")), kJSPropertyAttributeNone, nullptr);
-                                JSStringRelease(tn);
-                                jscDispatchEventSimple(js.ctx, "el:" + hitId + ":click", evt);
+                            g_jsHost = &js.host;
+                            JSObjectRef evt = jscMakeEvent(js.ctx, "click", true, true);
+                            JSStringRef cxn = JSStringCreateWithUTF8CString("clientX");
+                            JSObjectSetProperty(js.ctx, evt, cxn, JSValueMakeNumber(js.ctx, mx), kJSPropertyAttributeNone, nullptr);
+                            JSStringRelease(cxn);
+                            JSStringRef cyn = JSStringCreateWithUTF8CString("clientY");
+                            JSObjectSetProperty(js.ctx, evt, cyn, JSValueMakeNumber(js.ctx, my), kJSPropertyAttributeNone, nullptr);
+                            JSStringRelease(cyn);
+                            clickDefaultPrevented = jscDispatchEvent(js.ctx, hitNid, evt, "click", true);
 #else
-                                JSValue evt = JS_NewObject(js.ctx);
-                                JS_SetPropertyStr(js.ctx, evt, "type", JS_NewString(js.ctx, "click"));
-                                JS_SetPropertyStr(js.ctx, evt, "clientX", JS_NewInt32(js.ctx, mx));
-                                JS_SetPropertyStr(js.ctx, evt, "clientY", JS_NewInt32(js.ctx, my));
-                                jsDispatchEventSimple(js.ctx, "el:" + hitId + ":click", evt);
-                                JS_FreeValue(js.ctx, evt);
-                                jsDrainJobs(js);
+                            JSValue evt = qjsMakeEvent(js.ctx, "click", true, true);
+                            JS_SetPropertyStr(js.ctx, evt, "clientX", JS_NewInt32(js.ctx, mx));
+                            JS_SetPropertyStr(js.ctx, evt, "clientY", JS_NewInt32(js.ctx, my));
+                            clickDefaultPrevented = qjsDispatchEvent(js.ctx, hitNid, evt, "click", true);
+                            JS_FreeValue(js.ctx, evt);
+                            jsDrainJobs(js);
 #endif
-                            }
                         }
 #endif
 
@@ -4757,7 +5687,7 @@ int main(int argc, char** argv) {
                                 }
                             } else if (ch.type == ControlType::Submit) {
                                 focusedCtrl = -1;
-                                submitForm(ch.nodeId);
+                                if (!clickDefaultPrevented) submitForm(ch.nodeId);
                             } else {
                                 focusedCtrl = -1; // button / select: no action yet
                             }
@@ -4768,7 +5698,7 @@ int main(int argc, char** argv) {
                             if (!addressFocused) SDL_StopTextInput();
                         }
 
-                        if (!ctrlHandled)
+                        if (!ctrlHandled && !clickDefaultPrevented)
                         for (const auto& hit : page.linkHits) {
                             SDL_Rect r = hit.rect;
 
@@ -4811,42 +5741,37 @@ int main(int argc, char** argv) {
                     bool ctrl = (e.key.keysym.mod & KMOD_CTRL);
                     bool shift = (e.key.keysym.mod & KMOD_SHIFT);
 
-#ifdef NOCHROME_ENABLE_JS
-#if defined(NOCHROME_USE_JSC)
-                    // Dispatch window/document keydown (best-effort, no target mapping).
-                    {
-                        g_jsHost = &js.host;
-                        JSObjectRef evt = JSObjectMake(js.ctx, nullptr, nullptr);
-                        JSStringRef tn = JSStringCreateWithUTF8CString("type");
-                        JSObjectSetProperty(js.ctx, evt, tn, JSValueMakeString(js.ctx, JSStringCreateWithUTF8CString("keydown")), kJSPropertyAttributeNone, nullptr);
-                        JSStringRelease(tn);
+                    // Set when a JS keydown handler called preventDefault(); used to
+                    // suppress the built-in ENTER-causes-submit behaviour below.
+                    bool keyDefaultPrevented = false;
 
-                        const char* keyName = SDL_GetKeyName(e.key.keysym.sym);
+#ifdef NOCHROME_ENABLE_JS
+                    // Target the focused control (so the event bubbles to document/window);
+                    // otherwise dispatch straight to document + window.
+                    int keyTargetNid = (focusedCtrl >= 0) ? focusedCtrl : -1;
+                    const char* keyName = SDL_GetKeyName(e.key.keysym.sym);
+#if defined(NOCHROME_USE_JSC)
+                    if (js.ctx) {
+                        g_jsHost = &js.host;
+                        JSObjectRef evt = jscMakeEvent(js.ctx, "keydown", true, true);
                         JSStringRef kn = JSStringCreateWithUTF8CString("key");
                         JSObjectSetProperty(js.ctx, evt, kn, JSValueMakeString(js.ctx, JSStringCreateWithUTF8CString(keyName ? keyName : "")), kJSPropertyAttributeNone, nullptr);
                         JSStringRelease(kn);
-
                         JSStringRef cn = JSStringCreateWithUTF8CString("ctrlKey");
                         JSObjectSetProperty(js.ctx, evt, cn, JSValueMakeBoolean(js.ctx, ctrl), kJSPropertyAttributeNone, nullptr);
                         JSStringRelease(cn);
-
                         JSStringRef sn = JSStringCreateWithUTF8CString("shiftKey");
                         JSObjectSetProperty(js.ctx, evt, sn, JSValueMakeBoolean(js.ctx, shift), kJSPropertyAttributeNone, nullptr);
                         JSStringRelease(sn);
-
-                        jscDispatchEventSimple(js.ctx, "window:keydown", evt);
-                        jscDispatchEventSimple(js.ctx, "document:keydown", evt);
+                        keyDefaultPrevented = jscDispatchEvent(js.ctx, keyTargetNid, evt, "keydown", true);
                     }
 #else
                     if (js.ctx) {
-                        JSValue evt = JS_NewObject(js.ctx);
-                        JS_SetPropertyStr(js.ctx, evt, "type", JS_NewString(js.ctx, "keydown"));
-                        const char* keyName = SDL_GetKeyName(e.key.keysym.sym);
+                        JSValue evt = qjsMakeEvent(js.ctx, "keydown", true, true);
                         JS_SetPropertyStr(js.ctx, evt, "key", JS_NewString(js.ctx, keyName ? keyName : ""));
                         JS_SetPropertyStr(js.ctx, evt, "ctrlKey", JS_NewBool(js.ctx, ctrl));
                         JS_SetPropertyStr(js.ctx, evt, "shiftKey", JS_NewBool(js.ctx, shift));
-                        jsDispatchEventSimple(js.ctx, "window:keydown", evt);
-                        jsDispatchEventSimple(js.ctx, "document:keydown", evt);
+                        keyDefaultPrevented = qjsDispatchEvent(js.ctx, keyTargetNid, evt, "keydown", true);
                         JS_FreeValue(js.ctx, evt);
                         jsDrainJobs(js);
                     }
@@ -4922,7 +5847,7 @@ int main(int argc, char** argv) {
                                 if (fn->tag == "textarea") {
                                     domSetAttr(*fn, "value", domGetAttr(*fn, "value") + "\n");
                                     rebuildTabLayout(activeTab);
-                                } else {
+                                } else if (!keyDefaultPrevented) {
                                     submitForm(focusedCtrl);
                                 }
                             }
