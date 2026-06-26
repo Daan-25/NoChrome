@@ -1363,6 +1363,9 @@ struct JsHost {
         JSObjectRef fn = nullptr;     // protected
         bool isCode = false;
         std::string code;
+        bool isInterval = false;      // setInterval: re-arm after firing
+        double intervalMs = 0.0;
+        bool isRaf = false;           // requestAnimationFrame: pass a timestamp arg
     };
 
     int nextTimerId = 1;
@@ -1486,6 +1489,42 @@ static JSValueRef jscSetTimeout(JSContextRef ctx, JSObjectRef, JSObjectRef, size
         }
     }
 
+    g_jsHost->timers.push_back(item);
+    return JSValueMakeNumber(ctx, (double)item.id);
+}
+
+static JSValueRef jscSetInterval(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost || argc < 1) return JSValueMakeNumber(ctx, 0);
+    double delay = (argc >= 2) ? JSValueToNumber(ctx, argv[1], nullptr) : 0.0;
+    if (delay < 4.0) delay = 4.0; // clamp like browsers (avoid a 0ms busy-loop)
+
+    JsHost::TimerItem item;
+    item.id = g_jsHost->nextTimerId++;
+    item.dueMs = jscNowMs() + delay;
+    item.isInterval = true;
+    item.intervalMs = delay;
+    if (JSValueIsString(ctx, argv[0])) {
+        item.isCode = true;
+        item.code = jsToUtf8(ctx, argv[0]);
+    } else if (JSValueIsObject(ctx, argv[0])) {
+        JSObjectRef fn = JSValueToObject(ctx, argv[0], nullptr);
+        if (fn && JSObjectIsFunction(ctx, fn)) { item.fn = fn; JSValueProtect(ctx, item.fn); }
+    }
+    g_jsHost->timers.push_back(item);
+    return JSValueMakeNumber(ctx, (double)item.id);
+}
+
+static JSValueRef jscRequestAnimationFrame(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost || argc < 1 || !JSValueIsObject(ctx, argv[0])) return JSValueMakeNumber(ctx, 0);
+    JSObjectRef fn = JSValueToObject(ctx, argv[0], nullptr);
+    if (!fn || !JSObjectIsFunction(ctx, fn)) return JSValueMakeNumber(ctx, 0);
+
+    JsHost::TimerItem item;
+    item.id = g_jsHost->nextTimerId++;
+    item.dueMs = jscNowMs() + 16.0; // ~next frame
+    item.isRaf = true;
+    item.fn = fn;
+    JSValueProtect(ctx, item.fn);
     g_jsHost->timers.push_back(item);
     return JSValueMakeNumber(ctx, (double)item.id);
 }
@@ -1775,6 +1814,24 @@ static void jsInstallBaseGlobals(JsEngine& js) {
         JSObjectRef ctFn = JSObjectMakeFunctionWithCallback(js.ctx, ctName, jscClearTimeout);
         JSObjectSetProperty(js.ctx, global, ctName, ctFn, kJSPropertyAttributeNone, nullptr);
         JSStringRelease(ctName);
+
+        // setInterval / clearInterval and requestAnimationFrame / cancelAnimationFrame
+        // (cancellation reuses clearTimeout's remove-by-id logic).
+        JSStringRef siName = JSStringCreateWithUTF8CString("setInterval");
+        JSObjectSetProperty(js.ctx, global, siName, JSObjectMakeFunctionWithCallback(js.ctx, siName, jscSetInterval), kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(siName);
+
+        JSStringRef ciName = JSStringCreateWithUTF8CString("clearInterval");
+        JSObjectSetProperty(js.ctx, global, ciName, JSObjectMakeFunctionWithCallback(js.ctx, ciName, jscClearTimeout), kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(ciName);
+
+        JSStringRef rafName = JSStringCreateWithUTF8CString("requestAnimationFrame");
+        JSObjectSetProperty(js.ctx, global, rafName, JSObjectMakeFunctionWithCallback(js.ctx, rafName, jscRequestAnimationFrame), kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(rafName);
+
+        JSStringRef cafName = JSStringCreateWithUTF8CString("cancelAnimationFrame");
+        JSObjectSetProperty(js.ctx, global, cafName, JSObjectMakeFunctionWithCallback(js.ctx, cafName, jscClearTimeout), kJSPropertyAttributeNone, nullptr);
+        JSStringRelease(cafName);
     }
 
     // fetch (very small subset): returns Promise<response>, response.text() returns Promise<string>
@@ -1894,6 +1951,22 @@ struct JscEventPriv {
 static JSClassRef g_jscElementClass = nullptr;
 static JSClassRef g_jscStyleClass = nullptr;
 static JSClassRef g_jscEventClass = nullptr;
+
+// Backing store for an XMLHttpRequest object. on* handlers (onload, onerror,
+// onreadystatechange) are NOT stored here; they are ordinary own JS properties
+// read back off the object during send().
+struct JscXhrPriv {
+    std::string method;
+    std::string url;
+    int readyState = 0;
+    int status = 0;
+    std::string statusText;
+    std::string responseText;
+    std::string responseType;
+    std::string responseHeaders; // raw header block from the last send()
+    bool sent = false;
+};
+static JSClassRef g_jscXhrClass = nullptr;
 
 static std::string jsStringToUtf8(JSStringRef s) {
     size_t maxSize = JSStringGetMaximumUTF8CStringSize(s);
@@ -2246,6 +2319,11 @@ static void jscFinalizeEvent(JSObjectRef object);
 static JSValueRef jscEventGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef* exception);
 static bool jscEventSetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef value, JSValueRef* exception);
 
+// XMLHttpRequest class handlers (defined below; declared here for jscEnsureDomClasses).
+static void jscFinalizeXhr(JSObjectRef object);
+static JSValueRef jscXhrGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef* exception);
+static bool jscXhrSetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef value, JSValueRef* exception);
+
 static void jscEnsureDomClasses() {
     if (!g_jscStyleClass) {
         JSClassDefinition def = kJSClassDefinitionEmpty;
@@ -2267,6 +2345,13 @@ static void jscEnsureDomClasses() {
         def.getProperty = jscEventGetProperty;
         def.setProperty = jscEventSetProperty;
         g_jscEventClass = JSClassCreate(&def);
+    }
+    if (!g_jscXhrClass) {
+        JSClassDefinition def = kJSClassDefinitionEmpty;
+        def.finalize = jscFinalizeXhr;
+        def.getProperty = jscXhrGetProperty;
+        def.setProperty = jscXhrSetProperty;
+        g_jscXhrClass = JSClassCreate(&def);
     }
 }
 
@@ -2401,6 +2486,174 @@ static JSValueRef jscMakeCustomEventNative(JSContextRef ctx, JSObjectRef /*funct
     JSObjectSetProperty(ctx, obj, dn, detail, kJSPropertyAttributeNone, nullptr);
     JSStringRelease(dn);
     return obj;
+}
+
+// -------------------- XMLHttpRequest object (JavaScriptCore) --------------------
+
+static void jscFinalizeXhr(JSObjectRef object) {
+    auto* priv = (JscXhrPriv*)JSObjectGetPrivate(object);
+    delete priv;
+}
+
+static JscXhrPriv* jscXhrPriv(JSObjectRef object) {
+    return (JscXhrPriv*)JSObjectGetPrivate(object);
+}
+
+// Read an on* handler back off the XHR object and, if callable, invoke it with
+// the XHR as `this` and no args. on* handlers are ordinary own properties.
+static void jscXhrFireHandler(JSContextRef ctx, JSObjectRef xhr, const char* name) {
+    JSStringRef nm = JSStringCreateWithUTF8CString(name);
+    JSValueRef h = JSObjectGetProperty(ctx, xhr, nm, nullptr);
+    JSStringRelease(nm);
+    if (!h || !JSValueIsObject(ctx, h)) return;
+    JSObjectRef fn = JSValueToObject(ctx, h, nullptr);
+    if (!fn || !JSObjectIsFunction(ctx, fn)) return;
+    JSValueRef exc = nullptr;
+    JSObjectCallAsFunction(ctx, fn, xhr, 0, nullptr, &exc);
+    if (exc) std::cerr << "[JS Exception] " << jsToUtf8(ctx, exc) << "\n";
+}
+
+// open(method, url, async?)
+static JSValueRef jscXhrOpen(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    auto* p = jscXhrPriv(thisObject);
+    if (!p) return JSValueMakeUndefined(ctx);
+    std::string method = (argc > 0) ? jsToUtf8(ctx, argv[0]) : "GET";
+    p->method = toUpperCopy(method);
+    std::string url = (argc > 1) ? jsToUtf8(ctx, argv[1]) : "";
+    std::string abs = g_jsHost ? resolveHref(g_jsHost->baseUrl, url) : url;
+    if (abs.empty()) abs = url;
+    p->url = abs;
+    p->readyState = 1;
+    p->sent = false;
+    return JSValueMakeUndefined(ctx);
+}
+
+// setRequestHeader(name, value): accepted and ignored (no-op).
+static JSValueRef jscXhrSetRequestHeader(JSContextRef ctx, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*) {
+    return JSValueMakeUndefined(ctx);
+}
+
+// send(body?): perform the request synchronously NOW, then fire callbacks.
+// The underlying transport is GET-only; for non-GET methods we still do a GET.
+static JSValueRef jscXhrSend(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t, const JSValueRef[], JSValueRef*) {
+    auto* p = jscXhrPriv(thisObject);
+    if (!p) return JSValueMakeUndefined(ctx);
+    p->sent = true;
+
+    std::string headers;
+    Url finalU;
+    std::string body;
+    try {
+        body = httpFetchProcessed(parseUrl(p->url), finalU, &headers);
+    } catch (...) {
+        body = "";
+    }
+
+    p->responseText = body;
+    p->responseHeaders = headers;
+    int code = parseStatusCode(headers);
+    if (code == 0 && !body.empty()) code = 200; // body but no parseable status
+    p->status = code;
+    if (code >= 200 && code < 300) p->statusText = "OK";
+    else p->statusText = "";
+    p->readyState = 4;
+
+    // Fire callbacks in order: onreadystatechange (sees readyState===4), then
+    // onload for 2xx else onerror.
+    jscXhrFireHandler(ctx, thisObject, "onreadystatechange");
+    if (code >= 200 && code < 300) jscXhrFireHandler(ctx, thisObject, "onload");
+    else jscXhrFireHandler(ctx, thisObject, "onerror");
+
+    return JSValueMakeUndefined(ctx);
+}
+
+// getAllResponseHeaders(): raw header block stored during send().
+static JSValueRef jscXhrGetAllResponseHeaders(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t, const JSValueRef[], JSValueRef*) {
+    auto* p = jscXhrPriv(thisObject);
+    std::string s = p ? p->responseHeaders : "";
+    JSStringRef v = JSStringCreateWithUTF8CString(s.c_str());
+    JSValueRef r = JSValueMakeString(ctx, v);
+    JSStringRelease(v);
+    return r;
+}
+
+// getResponseHeader(name): look up a single header in the stored block.
+static JSValueRef jscXhrGetResponseHeader(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    auto* p = jscXhrPriv(thisObject);
+    if (!p || argc < 1) return JSValueMakeNull(ctx);
+    std::string val = headerValueCI(p->responseHeaders, jsToUtf8(ctx, argv[0]));
+    if (val.empty()) return JSValueMakeNull(ctx);
+    JSStringRef v = JSStringCreateWithUTF8CString(val.c_str());
+    JSValueRef r = JSValueMakeString(ctx, v);
+    JSStringRelease(v);
+    return r;
+}
+
+// abort(): no-op (reset readyState).
+static JSValueRef jscXhrAbort(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t, const JSValueRef[], JSValueRef*) {
+    if (auto* p = jscXhrPriv(thisObject)) p->readyState = 0;
+    return JSValueMakeUndefined(ctx);
+}
+
+static JSValueRef jscXhrGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef* /*exception*/) {
+    auto* p = jscXhrPriv(object);
+    if (!p) return nullptr;
+    std::string prop = jsStringToUtf8(propertyName);
+
+    auto makeStr = [&](const std::string& s) -> JSValueRef {
+        JSStringRef v = JSStringCreateWithUTF8CString(s.c_str());
+        JSValueRef r = JSValueMakeString(ctx, v);
+        JSStringRelease(v);
+        return r;
+    };
+    auto makeFn = [&](const char* name, JSObjectCallAsFunctionCallback cb) -> JSValueRef {
+        JSStringRef nm = JSStringCreateWithUTF8CString(name);
+        JSObjectRef fn = JSObjectMakeFunctionWithCallback(ctx, nm, cb);
+        JSStringRelease(nm);
+        return fn;
+    };
+
+    if (prop == "readyState")   return JSValueMakeNumber(ctx, p->readyState);
+    if (prop == "status")       return JSValueMakeNumber(ctx, p->status);
+    if (prop == "statusText")   return makeStr(p->statusText);
+    if (prop == "responseText") return makeStr(p->responseText);
+    if (prop == "responseType") return makeStr(p->responseType);
+    if (prop == "response")     return makeStr(p->responseText); // text-equivalent
+    if (prop == "open")                   return makeFn("open", jscXhrOpen);
+    if (prop == "setRequestHeader")       return makeFn("setRequestHeader", jscXhrSetRequestHeader);
+    if (prop == "send")                   return makeFn("send", jscXhrSend);
+    if (prop == "getAllResponseHeaders")  return makeFn("getAllResponseHeaders", jscXhrGetAllResponseHeaders);
+    if (prop == "getResponseHeader")      return makeFn("getResponseHeader", jscXhrGetResponseHeader);
+    if (prop == "abort")                  return makeFn("abort", jscXhrAbort);
+
+    return nullptr; // unknown (on* handlers, etc.): normal own-property storage
+}
+
+static bool jscXhrSetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef value, JSValueRef*) {
+    auto* p = jscXhrPriv(object);
+    if (!p) return false;
+    std::string prop = jsStringToUtf8(propertyName);
+    if (prop == "responseType") { p->responseType = jsToUtf8(ctx, value); return true; }
+    // readyState/status/statusText/responseText/response and the methods are
+    // read-only; swallow writes. Everything else (on* handlers, ad-hoc props)
+    // delegates to normal own-property storage.
+    if (prop == "readyState" || prop == "status" || prop == "statusText" ||
+        prop == "responseText" || prop == "response" ||
+        prop == "open" || prop == "setRequestHeader" || prop == "send" ||
+        prop == "getAllResponseHeaders" || prop == "getResponseHeader" || prop == "abort")
+        return true;
+    return false;
+}
+
+// Build a backed XMLHttpRequest instance (no constructor body).
+static JSObjectRef jscMakeXhr(JSContextRef ctx) {
+    jscEnsureDomClasses();
+    return JSObjectMake(ctx, g_jscXhrClass, new JscXhrPriv());
+}
+
+// Native factory backing the XMLHttpRequest() constructor shim.
+static JSValueRef jscMakeXhrNative(JSContextRef ctx, JSObjectRef /*function*/, JSObjectRef /*thisObject*/, size_t, const JSValueRef[], JSValueRef* /*exception*/) {
+    return jscMakeXhr(ctx);
 }
 
 // Fire every listener registered under `key`, passing evt as the single arg.
@@ -2843,6 +3096,21 @@ static void jsSetupPageGlobals(JSContextRef ctx, const std::string& url, const s
         JSStringRelease(s);
     }
 
+    // XMLHttpRequest constructor. Hidden native factory + a real JS constructor
+    // function (typeof "function" AND `new`-able); `new` adopts the backed object.
+    {
+        jscEnsureDomClasses();
+        JSStringRef mk = JSStringCreateWithUTF8CString("__nochromeMakeXhr");
+        JSObjectSetProperty(ctx, global, mk, JSObjectMakeFunctionWithCallback(ctx, mk, jscMakeXhrNative), kJSPropertyAttributeDontEnum, nullptr);
+        JSStringRelease(mk);
+
+        static const char kXhrShim[] =
+            "function XMLHttpRequest(){return __nochromeMakeXhr();}";
+        JSStringRef s = JSStringCreateWithUTF8CString(kXhrShim);
+        JSEvaluateScript(ctx, s, nullptr, nullptr, 1, nullptr);
+        JSStringRelease(s);
+    }
+
     // Image(): minimal HTMLImageElement constructor. Sites use `new Image()`
     // for preloading and tracking pixels (img.src = url). Delegates to
     // createElement so it behaves like a real detached <img> node.
@@ -2937,13 +3205,20 @@ static void jsPumpTimers(JsEngine& js) {
     g_jsHost = &js.host;
 
     double now = jscNowMs();
-    // Execute due timers; copy due list to avoid reentrancy issues.
+    // Collect due timers; re-arm intervals (keep them, fn stays protected), drop
+    // one-shots. Copy the fire list so a callback that mutates timers can't
+    // invalidate iteration.
     std::vector<JsHost::TimerItem> due;
     for (auto it = js.host.timers.begin(); it != js.host.timers.end(); ) {
         if (it->dueMs <= now) {
             due.push_back(*it);
-            if (it->fn) JSValueUnprotect(js.ctx, it->fn);
-            it = js.host.timers.erase(it);
+            if (it->isInterval) {
+                it->dueMs = now + it->intervalMs;
+                ++it;
+            } else {
+                if (it->fn) JSValueUnprotect(js.ctx, it->fn);
+                it = js.host.timers.erase(it);
+            }
         } else {
             ++it;
         }
@@ -2957,7 +3232,12 @@ static void jsPumpTimers(JsEngine& js) {
             (void)JSEvaluateScript(js.ctx, script, nullptr, nullptr, 1, &exc);
             JSStringRelease(script);
         } else if (t.fn) {
-            JSObjectCallAsFunction(js.ctx, t.fn, nullptr, 0, nullptr, &exc);
+            if (t.isRaf) {
+                JSValueRef arg = JSValueMakeNumber(js.ctx, now);
+                JSObjectCallAsFunction(js.ctx, t.fn, nullptr, 1, &arg, &exc);
+            } else {
+                JSObjectCallAsFunction(js.ctx, t.fn, nullptr, 0, nullptr, &exc);
+            }
         }
 
         if (exc) {
@@ -2983,6 +3263,9 @@ struct JsHost {
         JSValue fn = JS_UNDEFINED; // duplicated; freed when the timer fires or is cleared
         bool isCode = false;
         std::string code;
+        bool isInterval = false;   // setInterval: re-arm after firing
+        double intervalMs = 0.0;
+        bool isRaf = false;        // requestAnimationFrame: pass a timestamp arg
     };
     int nextTimerId = 1;
     std::vector<TimerItem> timers;
@@ -3029,6 +3312,23 @@ struct QjsEventPriv {
     int eventPhase = 0;
     int targetNodeId = -1;
     int currentTargetNodeId = -1;
+};
+
+static JSClassID g_qjsXhrClassId = 0;
+
+// Backing store for an XMLHttpRequest object. on* handlers (onload, onerror,
+// onreadystatechange) are NOT stored here; they are ordinary own JS properties
+// read back off the object during send().
+struct QjsXhrPriv {
+    std::string method;
+    std::string url;
+    int readyState = 0;
+    int status = 0;
+    std::string statusText;
+    std::string responseText;
+    std::string responseType;
+    std::string responseHeaders; // raw header block from the last send()
+    bool sent = false;
 };
 
 static JsHost* qjsHost(JSContext* ctx) {
@@ -3148,6 +3448,49 @@ static JSValue jsSetTimeout(JSContext* ctx, JSValueConst /*this_val*/, int argc,
     return JS_NewInt32(ctx, timerId);
 }
 
+static JSValue jsSetInterval(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (!host || argc < 1) return JS_NewInt32(ctx, 0);
+
+    double delay = 0.0;
+    if (argc >= 2) JS_ToFloat64(ctx, &delay, argv[1]);
+    if (delay < 4.0) delay = 4.0; // clamp like browsers (avoid a 0ms busy-loop)
+
+    JsHost::TimerItem item;
+    int timerId = host->nextTimerId++;
+    item.id = timerId;
+    item.dueMs = qjsNowMs(host) + delay;
+    item.isInterval = true;
+    item.intervalMs = delay;
+
+    if (JS_IsString(argv[0])) {
+        item.isCode = true;
+        item.code = jsToUtf8(ctx, argv[0]);
+    } else if (JS_IsFunction(ctx, argv[0])) {
+        item.fn = JS_DupValue(ctx, argv[0]);
+    } else {
+        return JS_NewInt32(ctx, 0);
+    }
+
+    host->timers.push_back(std::move(item));
+    return JS_NewInt32(ctx, timerId);
+}
+
+static JSValue jsRequestAnimationFrame(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    if (!host || argc < 1 || !JS_IsFunction(ctx, argv[0])) return JS_NewInt32(ctx, 0);
+
+    JsHost::TimerItem item;
+    int timerId = host->nextTimerId++;
+    item.id = timerId;
+    item.dueMs = qjsNowMs(host) + 16.0; // ~next frame
+    item.isRaf = true;
+    item.fn = JS_DupValue(ctx, argv[0]);
+
+    host->timers.push_back(std::move(item));
+    return JS_NewInt32(ctx, timerId);
+}
+
 static JSValue jsClearTimeout(JSContext* ctx, JSValueConst /*this_val*/, int argc, JSValueConst* argv) {
     JsHost* host = qjsHost(ctx);
     if (!host || argc < 1) return JS_UNDEFINED;
@@ -3240,6 +3583,11 @@ static void qjsStyleFinalizer(JSRuntime* /*rt*/, JSValue val) {
 
 static void qjsEventFinalizer(JSRuntime* /*rt*/, JSValue val) {
     auto* p = (QjsEventPriv*)JS_GetOpaque(val, g_qjsEventClassId);
+    delete p;
+}
+
+static void qjsXhrFinalizer(JSRuntime* /*rt*/, JSValue val) {
+    auto* p = (QjsXhrPriv*)JS_GetOpaque(val, g_qjsXhrClassId);
     delete p;
 }
 
@@ -3449,6 +3797,138 @@ static JSValue qjsCustomEventCtor(JSContext* ctx, JSValueConst /*new_target*/, i
     return obj;
 }
 
+// -------------------- XMLHttpRequest object (QuickJS) --------------------
+
+static QjsXhrPriv* qjsXhrPriv(JSValueConst this_val) {
+    return (QjsXhrPriv*)JS_GetOpaque(this_val, g_qjsXhrClassId);
+}
+
+// Read-only property getters.
+static JSValue qjsXhrGetReadyState(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    QjsXhrPriv* p = qjsXhrPriv(this_val);
+    return JS_NewInt32(ctx, p ? p->readyState : 0);
+}
+static JSValue qjsXhrGetStatus(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    QjsXhrPriv* p = qjsXhrPriv(this_val);
+    return JS_NewInt32(ctx, p ? p->status : 0);
+}
+static JSValue qjsXhrGetStatusText(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    QjsXhrPriv* p = qjsXhrPriv(this_val);
+    return JS_NewString(ctx, p ? p->statusText.c_str() : "");
+}
+static JSValue qjsXhrGetResponseText(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    QjsXhrPriv* p = qjsXhrPriv(this_val);
+    return JS_NewString(ctx, p ? p->responseText.c_str() : "");
+}
+static JSValue qjsXhrGetResponse(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    QjsXhrPriv* p = qjsXhrPriv(this_val);
+    return JS_NewString(ctx, p ? p->responseText.c_str() : ""); // text-equivalent
+}
+static JSValue qjsXhrGetResponseType(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    QjsXhrPriv* p = qjsXhrPriv(this_val);
+    return JS_NewString(ctx, p ? p->responseType.c_str() : "");
+}
+static JSValue qjsXhrSetResponseType(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    QjsXhrPriv* p = qjsXhrPriv(this_val);
+    if (p && argc > 0) p->responseType = jsToUtf8(ctx, argv[0]);
+    return JS_UNDEFINED;
+}
+
+// open(method, url, async?)
+static JSValue qjsXhrOpen(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    QjsXhrPriv* p = qjsXhrPriv(this_val);
+    if (!p) return JS_UNDEFINED;
+    JsHost* host = qjsHost(ctx);
+    std::string method = (argc > 0) ? jsToUtf8(ctx, argv[0]) : "GET";
+    p->method = toUpperCopy(method);
+    std::string url = (argc > 1) ? jsToUtf8(ctx, argv[1]) : "";
+    std::string abs = host ? resolveHref(host->baseUrl, url) : url;
+    if (abs.empty()) abs = url;
+    p->url = abs;
+    p->readyState = 1;
+    p->sent = false;
+    return JS_UNDEFINED;
+}
+
+// setRequestHeader(name, value): accepted and ignored (no-op).
+static JSValue qjsXhrSetRequestHeader(JSContext* /*ctx*/, JSValueConst /*this_val*/, int /*argc*/, JSValueConst* /*argv*/) {
+    return JS_UNDEFINED;
+}
+
+// Read an on* handler back off the XHR object and, if callable, invoke it with
+// the XHR as `this` and no args. on* handlers are ordinary own properties.
+static void qjsXhrFireHandler(JSContext* ctx, JSValueConst xhr, const char* name) {
+    JSValue h = JS_GetPropertyStr(ctx, xhr, name);
+    if (JS_IsFunction(ctx, h)) {
+        JSValue ret = JS_Call(ctx, h, xhr, 0, nullptr);
+        if (JS_IsException(ret)) jsDumpException(ctx);
+        JS_FreeValue(ctx, ret);
+    }
+    JS_FreeValue(ctx, h);
+}
+
+// send(body?): perform the request synchronously NOW, then fire callbacks.
+// The underlying transport is GET-only; for non-GET methods we still do a GET.
+static JSValue qjsXhrSend(JSContext* ctx, JSValueConst this_val, int /*argc*/, JSValueConst* /*argv*/) {
+    QjsXhrPriv* p = qjsXhrPriv(this_val);
+    if (!p) return JS_UNDEFINED;
+    p->sent = true;
+
+    std::string headers;
+    Url finalU;
+    std::string body;
+    try {
+        body = httpFetchProcessed(parseUrl(p->url), finalU, &headers);
+    } catch (...) {
+        body = "";
+    }
+
+    p->responseText = body;
+    p->responseHeaders = headers;
+    int code = parseStatusCode(headers);
+    if (code == 0 && !body.empty()) code = 200; // body but no parseable status
+    p->status = code;
+    if (code >= 200 && code < 300) p->statusText = "OK";
+    else p->statusText = "";
+    p->readyState = 4;
+
+    // Fire callbacks in order: onreadystatechange (sees readyState===4), then
+    // onload for 2xx else onerror.
+    qjsXhrFireHandler(ctx, this_val, "onreadystatechange");
+    if (code >= 200 && code < 300) qjsXhrFireHandler(ctx, this_val, "onload");
+    else qjsXhrFireHandler(ctx, this_val, "onerror");
+
+    return JS_UNDEFINED;
+}
+
+// getAllResponseHeaders(): raw header block stored during send().
+static JSValue qjsXhrGetAllResponseHeaders(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    QjsXhrPriv* p = qjsXhrPriv(this_val);
+    return JS_NewString(ctx, p ? p->responseHeaders.c_str() : "");
+}
+
+// getResponseHeader(name): look up a single header in the stored block.
+static JSValue qjsXhrGetResponseHeader(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    QjsXhrPriv* p = qjsXhrPriv(this_val);
+    if (!p || argc < 1) return JS_NULL;
+    std::string val = headerValueCI(p->responseHeaders, jsToUtf8(ctx, argv[0]));
+    return val.empty() ? JS_NULL : JS_NewString(ctx, val.c_str());
+}
+
+// abort(): no-op (reset readyState).
+static JSValue qjsXhrAbort(JSContext* /*ctx*/, JSValueConst this_val, int, JSValueConst*) {
+    if (QjsXhrPriv* p = qjsXhrPriv(this_val)) p->readyState = 0;
+    return JS_UNDEFINED;
+}
+
+// new XMLHttpRequest()
+static JSValue qjsXhrCtor(JSContext* ctx, JSValueConst /*new_target*/, int /*argc*/, JSValueConst* /*argv*/) {
+    JSValue obj = JS_NewObjectClass(ctx, g_qjsXhrClassId);
+    if (JS_IsException(obj)) return obj;
+    JS_SetOpaque(obj, new QjsXhrPriv());
+    return obj;
+}
+
 // Forward declarations for element methods used while building the prototype.
 static JSValue qjsElAddEventListener(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
 static JSValue qjsElRemoveEventListener(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv);
@@ -3524,6 +4004,13 @@ static void qjsRegisterDomClasses(JSRuntime* rt) {
         def.class_name = "Event";
         def.finalizer = qjsEventFinalizer;
         JS_NewClass(rt, g_qjsEventClassId, &def);
+    }
+    if (g_qjsXhrClassId == 0) {
+        JS_NewClassID(&g_qjsXhrClassId);
+        JSClassDef def{};
+        def.class_name = "XMLHttpRequest";
+        def.finalizer = qjsXhrFinalizer;
+        JS_NewClass(rt, g_qjsXhrClassId, &def);
     }
 }
 
@@ -3601,6 +4088,21 @@ static void qjsSetupDomProtos(JSContext* ctx) {
     JS_SetPropertyStr(ctx, evProto, "stopPropagation", JS_NewCFunction(ctx, qjsEvtStopPropagation, "stopPropagation", 0));
     JS_SetPropertyStr(ctx, evProto, "stopImmediatePropagation", JS_NewCFunction(ctx, qjsEvtStopImmediatePropagation, "stopImmediatePropagation", 0));
     JS_SetClassProto(ctx, g_qjsEventClassId, evProto);
+
+    JSValue xhrProto = JS_NewObject(ctx);
+    qjsDefineAccessor(ctx, xhrProto, "readyState", qjsXhrGetReadyState, nullptr);
+    qjsDefineAccessor(ctx, xhrProto, "status", qjsXhrGetStatus, nullptr);
+    qjsDefineAccessor(ctx, xhrProto, "statusText", qjsXhrGetStatusText, nullptr);
+    qjsDefineAccessor(ctx, xhrProto, "responseText", qjsXhrGetResponseText, nullptr);
+    qjsDefineAccessor(ctx, xhrProto, "response", qjsXhrGetResponse, nullptr);
+    qjsDefineAccessor(ctx, xhrProto, "responseType", qjsXhrGetResponseType, qjsXhrSetResponseType);
+    JS_SetPropertyStr(ctx, xhrProto, "open", JS_NewCFunction(ctx, qjsXhrOpen, "open", 3));
+    JS_SetPropertyStr(ctx, xhrProto, "setRequestHeader", JS_NewCFunction(ctx, qjsXhrSetRequestHeader, "setRequestHeader", 2));
+    JS_SetPropertyStr(ctx, xhrProto, "send", JS_NewCFunction(ctx, qjsXhrSend, "send", 1));
+    JS_SetPropertyStr(ctx, xhrProto, "getAllResponseHeaders", JS_NewCFunction(ctx, qjsXhrGetAllResponseHeaders, "getAllResponseHeaders", 0));
+    JS_SetPropertyStr(ctx, xhrProto, "getResponseHeader", JS_NewCFunction(ctx, qjsXhrGetResponseHeader, "getResponseHeader", 1));
+    JS_SetPropertyStr(ctx, xhrProto, "abort", JS_NewCFunction(ctx, qjsXhrAbort, "abort", 0));
+    JS_SetClassProto(ctx, g_qjsXhrClassId, xhrProto);
 }
 
 static void qjsAddListener(JSContext* ctx, const std::string& key, JSValueConst fn) {
@@ -4095,11 +4597,24 @@ static void jsPumpTimers(JsEngine& js) {
     if (!js.ctx) return;
 
     double now = qjsNowMs(&js.host);
+    // Collect due timers; intervals fire a dup'd ref and stay armed, one-shots
+    // are moved out and erased.
     std::vector<JsHost::TimerItem> due;
     for (auto it = js.host.timers.begin(); it != js.host.timers.end(); ) {
         if (it->dueMs <= now) {
-            due.push_back(std::move(*it));
-            it = js.host.timers.erase(it);
+            if (it->isInterval) {
+                JsHost::TimerItem copy;
+                copy.isCode = it->isCode;
+                copy.code = it->code;
+                copy.isRaf = it->isRaf;
+                copy.fn = JS_IsUndefined(it->fn) ? JS_UNDEFINED : JS_DupValue(js.ctx, it->fn);
+                due.push_back(std::move(copy));
+                it->dueMs = now + it->intervalMs;
+                ++it;
+            } else {
+                due.push_back(std::move(*it));
+                it = js.host.timers.erase(it);
+            }
         } else {
             ++it;
         }
@@ -4110,7 +4625,13 @@ static void jsPumpTimers(JsEngine& js) {
         if (t.isCode) {
             r = JS_Eval(js.ctx, t.code.c_str(), t.code.size(), "<timeout>", JS_EVAL_TYPE_GLOBAL);
         } else if (!JS_IsUndefined(t.fn)) {
-            r = JS_Call(js.ctx, t.fn, JS_UNDEFINED, 0, nullptr);
+            if (t.isRaf) {
+                JSValue arg = JS_NewFloat64(js.ctx, now);
+                r = JS_Call(js.ctx, t.fn, JS_UNDEFINED, 1, &arg);
+                JS_FreeValue(js.ctx, arg);
+            } else {
+                r = JS_Call(js.ctx, t.fn, JS_UNDEFINED, 0, nullptr);
+            }
         } else {
             r = JS_UNDEFINED;
         }
@@ -4179,6 +4700,10 @@ static void jsResetContext(JsEngine& js) {
     // timers
     JS_SetPropertyStr(js.ctx, global, "setTimeout", JS_NewCFunction(js.ctx, jsSetTimeout, "setTimeout", 2));
     JS_SetPropertyStr(js.ctx, global, "clearTimeout", JS_NewCFunction(js.ctx, jsClearTimeout, "clearTimeout", 1));
+    JS_SetPropertyStr(js.ctx, global, "setInterval", JS_NewCFunction(js.ctx, jsSetInterval, "setInterval", 2));
+    JS_SetPropertyStr(js.ctx, global, "clearInterval", JS_NewCFunction(js.ctx, jsClearTimeout, "clearInterval", 1));
+    JS_SetPropertyStr(js.ctx, global, "requestAnimationFrame", JS_NewCFunction(js.ctx, jsRequestAnimationFrame, "requestAnimationFrame", 1));
+    JS_SetPropertyStr(js.ctx, global, "cancelAnimationFrame", JS_NewCFunction(js.ctx, jsClearTimeout, "cancelAnimationFrame", 1));
 
     // performance.now()
     JSValue perfObj = JS_NewObject(js.ctx);
@@ -4286,6 +4811,10 @@ static void jsSetupPageGlobals(JSContext* ctx, const std::string& url, const std
                       JS_NewCFunction2(ctx, qjsEventCtor, "Event", 2, JS_CFUNC_constructor, 0));
     JS_SetPropertyStr(ctx, global, "CustomEvent",
                       JS_NewCFunction2(ctx, qjsCustomEventCtor, "CustomEvent", 2, JS_CFUNC_constructor, 0));
+
+    // XMLHttpRequest constructor (native, usable with `new`).
+    JS_SetPropertyStr(ctx, global, "XMLHttpRequest",
+                      JS_NewCFunction2(ctx, qjsXhrCtor, "XMLHttpRequest", 0, JS_CFUNC_constructor, 0));
 
     // Image(): minimal HTMLImageElement constructor. Sites use `new Image()`
     // for preloading and tracking pixels (img.src = url). Delegates to
