@@ -1489,6 +1489,22 @@ static bool looksLikeHtmlNotJs(const std::string& code) {
     return !t.empty() && t[0] == '<' && t.compare(0, 4, "<!--") != 0;
 }
 
+// JS prelude installed (per page) on both backends right after document is set
+// up. Fills in commonly-used globals that would otherwise be ReferenceErrors;
+// stubs where a faithful implementation would need layout/threads we don't have.
+static const char kJsPrelude[] =
+    "function queueMicrotask(f){Promise.resolve().then(f);}"
+    "function matchMedia(q){return{media:q,matches:false,onchange:null,"
+    "addListener:function(){},removeListener:function(){},"
+    "addEventListener:function(){},removeEventListener:function(){}};}"
+    "var history={length:1,scrollRestoration:'auto',state:null,"
+    "pushState:function(s,t,u){history.state=s;},"
+    "replaceState:function(s,t,u){history.state=s;},"
+    "back:function(){},forward:function(){},go:function(){}};"
+    "function MutationObserver(c){this.observe=function(){};"
+    "this.disconnect=function(){};this.takeRecords=function(){return[];};}"
+    "try{document.readyState='complete';}catch(e){}";
+
 // -------------------- Page title helper --------------------
 
 static std::string extractTitleFromHtmlSimple(const std::string& html) {
@@ -3775,6 +3791,11 @@ static void jsSetupPageGlobals(JSContextRef ctx, const std::string& url, const s
         JSEvaluateScript(ctx, s, nullptr, nullptr, 1, nullptr);
         JSStringRelease(s);
     }
+    {
+        JSStringRef p = JSStringCreateWithUTF8CString(kJsPrelude);
+        JSEvaluateScript(ctx, p, nullptr, nullptr, 1, nullptr);
+        JSStringRelease(p);
+    }
 
     // localStorage / sessionStorage: one backed Storage object each, pointing at
     // the process-static stores (so they survive navigation).
@@ -5942,6 +5963,9 @@ static void jsSetupPageGlobals(JSContext* ctx, const std::string& url, const std
         "if(h!=null)e.setAttribute('height',h);return e;}";
     JSValue imgRes = JS_Eval(ctx, kImageShim, sizeof(kImageShim) - 1, "<builtin>", JS_EVAL_TYPE_GLOBAL);
     JS_FreeValue(ctx, imgRes);
+
+    JSValue prelRes = JS_Eval(ctx, kJsPrelude, sizeof(kJsPrelude) - 1, "<builtin>", JS_EVAL_TYPE_GLOBAL);
+    JS_FreeValue(ctx, prelRes);
 
     // localStorage / sessionStorage: backed Storage objects over the process
     // stores (persist across navigation).
