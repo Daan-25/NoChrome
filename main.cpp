@@ -7044,11 +7044,16 @@ int main(int argc, char** argv) {
             n = nd->parent;
         }
 
-        std::string query;
-        collectFormFields(d, formId >= 0 ? formId : d.root, query);
+        // A submit control outside any <form> submits nothing (matches real
+        // browsers). Without this, a plain <button> with no type attribute --
+        // which classifies as a submit button -- would reload the current page
+        // and wipe the app's state on every click.
+        if (formId < 0) return;
 
-        std::string action;
-        if (formId >= 0) action = trimCopy(domGetAttr(*d.get(formId), "action"));
+        std::string query;
+        collectFormFields(d, formId, query);
+
+        std::string action = trimCopy(domGetAttr(*d.get(formId), "action"));
         std::string target = action.empty() ? pg.urlString : resolveHref(pg.baseUrl, action);
         if (target.empty()) target = pg.urlString;
 
