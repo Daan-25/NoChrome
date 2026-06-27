@@ -1026,6 +1026,7 @@ struct StyleRule {
     std::optional<SDL_Color> borderColor;
     std::optional<int> width;                // content width, px
     std::optional<int> widthPct;             // width as a percentage
+    std::optional<int> height;               // content height, px (min-height too)
     std::optional<int> textAlign;            // 0 left, 1 center, 2 right
     std::optional<bool> displayNone;
 };
@@ -1180,6 +1181,9 @@ static void applyDeclarationsToRule(StyleRule& rule, const std::string& declsRaw
                 try { rule.widthPct = std::clamp((int)std::lround(std::stod(v.substr(0, v.size() - 1))), 0, 100); }
                 catch (...) {}
             } else { auto w = cssLenPx(val); if (w) rule.width = *w; }
+        }
+        else if (key == "height" || key == "min-height") {
+            auto h = cssLenPx(val); if (h) rule.height = *h;
         }
         else if (key == "text-align") {
             std::string v = trimCopy(toLowerCopy(val));
@@ -1361,6 +1365,7 @@ struct BoxStyle {
     SDL_Color bg {0, 0, 0, 0};
     int width = -1;      // content width in px, -1 = auto
     int widthPct = -1;   // width as %, -1 = none
+    int height = -1;     // content height in px, -1 = auto (min-height)
     int textAlign = -1;  // -1 inherit, 0 left, 1 center, 2 right
     bool displayNone = false;
 };
@@ -1392,6 +1397,7 @@ static void applyBoxRuleProps(const StyleRule& r, BoxStyle& b) {
     if (r.backgroundColor) { b.hasBg = true; b.bg = *r.backgroundColor; }
     if (r.width) { b.width = *r.width; b.widthPct = -1; }
     if (r.widthPct) { b.widthPct = *r.widthPct; b.width = -1; }
+    if (r.height) b.height = *r.height;
     if (r.textAlign) b.textAlign = *r.textAlign;
     if (r.displayNone) b.displayNone = *r.displayNone;
 }
@@ -6501,7 +6507,7 @@ struct BoxLayout {
             if (label.empty()) label = (type == "submit" || (tag == "button" && type.empty())) ? "Submit" : "Button";
             int tw = 0, th = 0;
             SDL_Texture* tex = makeText(label, SDL_Color{20,20,25,255}, &tw, &th);
-            int h = std::max(32, th + 12);
+            int h = (box.height >= 0) ? box.height : std::max(32, th + 12);
             int w = (box.width >= 0) ? box.width : std::min(avail, tw + 28);
             SDL_Rect r{ left, top, w, h };
             RenderItem b; b.kind = ItemKind::Box; b.rect = r; b.hasBg = true; b.bg = {228,228,232,255};
@@ -6516,7 +6522,7 @@ struct BoxLayout {
         if (tag == "textarea") {
             int w = (box.width >= 0) ? box.width : std::min(avail, 460);
             int rows = domIntAttr(domGetAttr(*node, "rows")); if (rows <= 0) rows = 4;
-            int h = rows * (st.fontSize + 8) + 12;
+            int h = (box.height >= 0) ? box.height : rows * (st.fontSize + 8) + 12;
             SDL_Rect r{ left, top, w, h };
             RenderItem b; b.kind = ItemKind::Box; b.rect = r; b.hasBg = true; b.bg = {255,255,255,255};
             b.borderW = 1; b.borderColor = {150,150,150,255}; items.push_back(b);
@@ -6543,7 +6549,7 @@ struct BoxLayout {
             }
             int tw = 0, th = 0;
             SDL_Texture* tex = makeText(label.empty() ? " " : label, SDL_Color{30,30,30,255}, &tw, &th);
-            int h = std::max(32, th + 12);
+            int h = (box.height >= 0) ? box.height : std::max(32, th + 12);
             int w = (box.width >= 0) ? box.width : std::min(avail, std::max(120, tw + 40));
             SDL_Rect r{ left, top, w, h };
             RenderItem b; b.kind = ItemKind::Box; b.rect = r; b.hasBg = true; b.bg = {245,245,247,255};
@@ -6555,7 +6561,7 @@ struct BoxLayout {
 
         // text-like input (text/search/email/url/tel/number/password/empty/unknown)
         int w = (box.width >= 0) ? box.width : std::min(avail, 300);
-        int h = std::max(34, st.fontSize + 16);
+        int h = (box.height >= 0) ? box.height : std::max(34, st.fontSize + 16);
         SDL_Rect r{ left, top, w, h };
         RenderItem b; b.kind = ItemKind::Box; b.rect = r; b.hasBg = true; b.bg = {255,255,255,255};
         b.borderW = 1; b.borderColor = {150,150,150,255}; items.push_back(b);
@@ -6666,6 +6672,10 @@ struct BoxLayout {
         flushInline();
 
         int contentBottom = curY;
+        // Honour an explicit CSS height/min-height: the content area is at least
+        // box.height tall, so the rendered box and the hit rect grow to match.
+        if (box.height >= 0)
+            contentBottom = std::max(contentBottom, contentTop + box.height);
         int boxBottom = contentBottom + box.pBottom + box.borderW;
 
         if (drawBox) {
