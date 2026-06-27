@@ -2130,6 +2130,13 @@ struct JscStoragePriv {
 };
 static JSClassRef g_jscStorageClass = nullptr;
 
+// Backing for an element.dataset object: arbitrary-key access maps camelCase
+// keys to the owning element's data-* attributes (Batch 5).
+struct JscDatasetPriv {
+    int nodeId = -1;
+};
+static JSClassRef g_jscDatasetClass = nullptr;
+
 // Backing for a URLSearchParams instance: ordered, percent-decoded pairs.
 struct JscUspPriv {
     std::vector<std::pair<std::string, std::string>> pairs;
@@ -2235,6 +2242,10 @@ static JSValueRef jscElementCloneNode(JSContextRef, JSObjectRef, JSObjectRef, si
 static JSValueRef jscElementHasAttribute(JSContextRef, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*);
 static JSValueRef jscElementRemoveAttribute(JSContextRef, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*);
 static JSObjectRef jscMakeClassList(JSContextRef, int);
+// Batch 5: matches/closest methods and dataset accessor.
+static JSValueRef jscElementMatches(JSContextRef, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*);
+static JSValueRef jscElementClosest(JSContextRef, JSObjectRef, JSObjectRef, size_t, const JSValueRef[], JSValueRef*);
+static JSObjectRef jscMakeDataset(JSContextRef, int);
 #endif
 
 static JSValueRef jscElementGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef* /*exception*/) {
@@ -2314,6 +2325,11 @@ static JSValueRef jscElementGetProperty(JSContextRef ctx, JSObjectRef object, JS
     if (prop == "cloneNode")       return makeFn("cloneNode", jscElementCloneNode);
     if (prop == "hasAttribute")    return makeFn("hasAttribute", jscElementHasAttribute);
     if (prop == "removeAttribute") return makeFn("removeAttribute", jscElementRemoveAttribute);
+
+    // --- selector matching + dataset (Batch 5) ---
+    if (prop == "matches")  return makeFn("matches", jscElementMatches);
+    if (prop == "closest")  return makeFn("closest", jscElementClosest);
+    if (prop == "dataset")  return jscMakeDataset(ctx, nid);
 
     return nullptr; // delegate (stored props / prototype)
 }
@@ -2498,6 +2514,10 @@ static JSValueRef jscStorageGetProperty(JSContextRef ctx, JSObjectRef object, JS
 static bool jscStorageSetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef value, JSValueRef* exception);
 static void jscFinalizeUsp(JSObjectRef object);
 static JSValueRef jscUspGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef* exception);
+// element.dataset class handlers (Batch 5; defined below).
+static void jscFinalizeDataset(JSObjectRef object);
+static JSValueRef jscDatasetGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef* exception);
+static bool jscDatasetSetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef value, JSValueRef* exception);
 
 static void jscEnsureDomClasses() {
     if (!g_jscStyleClass) {
@@ -2534,6 +2554,13 @@ static void jscEnsureDomClasses() {
         def.getProperty = jscStorageGetProperty;
         def.setProperty = jscStorageSetProperty;
         g_jscStorageClass = JSClassCreate(&def);
+    }
+    if (!g_jscDatasetClass) {
+        JSClassDefinition def = kJSClassDefinitionEmpty;
+        def.finalize = jscFinalizeDataset;
+        def.getProperty = jscDatasetGetProperty;
+        def.setProperty = jscDatasetSetProperty;
+        g_jscDatasetClass = JSClassCreate(&def);
     }
     if (!g_jscUspClass) {
         JSClassDefinition def = kJSClassDefinitionEmpty;
@@ -2951,6 +2978,45 @@ static JSObjectRef jscMakeStorage(JSContextRef ctx, OrderedStore* store) {
     return JSObjectMake(ctx, g_jscStorageClass, p);
 }
 
+// -------------------- element.dataset (JavaScriptCore, Batch 5) --------------------
+// camelCase key -> "data-" + kebab(key). e.g. fooBar -> data-foo-bar, id -> data-id.
+static std::string datasetKeyToAttr(const std::string& key) {
+    return "data-" + cssCamelToKebab(key);
+}
+
+static void jscFinalizeDataset(JSObjectRef object) {
+    delete (JscDatasetPriv*)JSObjectGetPrivate(object);
+}
+static JSValueRef jscDatasetGetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef*) {
+    auto* p = (JscDatasetPriv*)JSObjectGetPrivate(object);
+    if (!p || !g_jsHost) return nullptr;
+    DomNode* n = g_jsHost->dom.get(p->nodeId);
+    if (!n) return nullptr;
+    std::string key = jsStringToUtf8(propertyName);
+    const std::string* v = domGetAttrPtr(*n, datasetKeyToAttr(key));
+    if (!v) return nullptr; // unset key -> undefined (delegate)
+    JSStringRef s = JSStringCreateWithUTF8CString(v->c_str());
+    JSValueRef r = JSValueMakeString(ctx, s);
+    JSStringRelease(s);
+    return r;
+}
+static bool jscDatasetSetProperty(JSContextRef ctx, JSObjectRef object, JSStringRef propertyName, JSValueRef value, JSValueRef*) {
+    auto* p = (JscDatasetPriv*)JSObjectGetPrivate(object);
+    if (!p || !g_jsHost) return false;
+    DomNode* n = g_jsHost->dom.get(p->nodeId);
+    if (!n) return false;
+    std::string key = jsStringToUtf8(propertyName);
+    domSetAttr(*n, datasetKeyToAttr(key), jsToUtf8(ctx, value));
+    g_jsHost->domDirty = true;
+    return true;
+}
+static JSObjectRef jscMakeDataset(JSContextRef ctx, int nodeId) {
+    jscEnsureDomClasses();
+    auto* p = new JscDatasetPriv();
+    p->nodeId = nodeId;
+    return JSObjectMake(ctx, g_jscDatasetClass, p);
+}
+
 // -------------------- URLSearchParams (JavaScriptCore) --------------------
 
 static void jscFinalizeUsp(JSObjectRef object) {
@@ -3159,12 +3225,19 @@ static void jscFireListeners(JSContextRef ctx, const std::string& key, JSObjectR
     auto it = g_jsHost->listeners.find(key);
     if (it == g_jsHost->listeners.end()) return;
     auto* ep = (JscEventPriv*)JSObjectGetPrivate(evt); // may be null for plain events
+    // `this` for an element listener is the element it's registered on
+    // (the event's currentTarget). For document/window listeners
+    // (currentTargetNodeId < 0) or plain-object events (no Event priv),
+    // leave `this` undefined.
+    JSObjectRef thisObj = nullptr;
+    if (ep && ep->currentTargetNodeId >= 0)
+        thisObj = JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ ep->currentTargetNodeId });
     std::vector<JSObjectRef> fns = it->second; // copy (handler may mutate the map)
     for (auto* fn : fns) {
         if (!fn) continue;
         JSValueRef exc = nullptr;
         JSValueRef arg = evt;
-        JSObjectCallAsFunction(ctx, fn, nullptr, 1, &arg, &exc);
+        JSObjectCallAsFunction(ctx, fn, thisObj, 1, &arg, &exc);
         if (exc) std::cerr << "[JS Exception] " << jsToUtf8(ctx, exc) << "\n";
         if (ep && ep->immediateStopped) break; // stopImmediatePropagation()
     }
@@ -3319,6 +3392,23 @@ static JSValueRef jscElementRemoveAttribute(JSContextRef ctx, JSObjectRef, JSObj
         if (g_jsHost) g_jsHost->domDirty = true;
     }
     return JSValueMakeUndefined(ctx);
+}
+
+// element.matches(selector) -> boolean (Batch 5)
+static JSValueRef jscElementMatches(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost || argc < 1) return JSValueMakeBoolean(ctx, false);
+    int nid = jscElNodeId(thisObject);
+    if (nid < 0) return JSValueMakeBoolean(ctx, false);
+    return JSValueMakeBoolean(ctx, domElementMatches(g_jsHost->dom, nid, jsToUtf8(ctx, argv[0])));
+}
+// element.closest(selector) -> element | null (Batch 5)
+static JSValueRef jscElementClosest(JSContextRef ctx, JSObjectRef, JSObjectRef thisObject, size_t argc, const JSValueRef argv[], JSValueRef*) {
+    if (!g_jsHost || argc < 1) return JSValueMakeNull(ctx);
+    int nid = jscElNodeId(thisObject);
+    if (nid < 0) return JSValueMakeNull(ctx);
+    int hit = domElementClosest(g_jsHost->dom, nid, jsToUtf8(ctx, argv[0]));
+    if (hit < 0) return JSValueMakeNull(ctx);
+    return JSObjectMake(ctx, g_jscElementClass, new JscElementPriv{ hit });
 }
 
 // classList: a plain object carrying its element id in a hidden "_nid" property.
@@ -3916,12 +4006,16 @@ struct QjsXhrPriv {
 // Storage (localStorage / sessionStorage) and URLSearchParams backing.
 static JSClassID g_qjsStorageClassId = 0;
 static JSClassID g_qjsUspClassId = 0;
+static JSClassID g_qjsDatasetClassId = 0;
 
 struct QjsStoragePriv {
     OrderedStore* store = nullptr; // points at a process-static store
 };
 struct QjsUspPriv {
     std::vector<std::pair<std::string, std::string>> pairs;
+};
+struct QjsDatasetPriv {
+    int nodeId = -1; // element whose data-* attributes this dataset maps
 };
 
 static JsHost* qjsHost(JSContext* ctx) {
@@ -4621,6 +4715,73 @@ static JSValue qjsMakeStorage(JSContext* ctx, OrderedStore* store) {
     return obj;
 }
 
+// -------------------- element.dataset / matches / closest (QuickJS, Batch 5) --------------------
+
+static QjsDatasetPriv* qjsDatasetPriv(JSValueConst v) {
+    return (QjsDatasetPriv*)JS_GetOpaque(v, g_qjsDatasetClassId);
+}
+static void qjsDatasetFinalizer(JSRuntime* /*rt*/, JSValue val) {
+    delete (QjsDatasetPriv*)JS_GetOpaque(val, g_qjsDatasetClassId);
+}
+// Exotic key access: camelCase key <-> "data-" + kebab on the owning element.
+static int qjsDatasetGetOwn(JSContext* ctx, JSPropertyDescriptor* desc, JSValueConst obj, JSAtom prop) {
+    auto* p = qjsDatasetPriv(obj);
+    JsHost* host = qjsHost(ctx);
+    if (!p || !host) return 0;
+    DomNode* n = host->dom.get(p->nodeId);
+    if (!n) return 0;
+    const char* cname = JS_AtomToCString(ctx, prop);
+    if (!cname) return 0;
+    std::string key(cname);
+    JS_FreeCString(ctx, cname);
+    const std::string* v = domGetAttrPtr(*n, "data-" + cssCamelToKebab(key));
+    if (!v) return 0; // unset key -> undefined (delegate to prototype)
+    if (desc) {
+        desc->flags = JS_PROP_C_W_E;
+        desc->value = JS_NewString(ctx, v->c_str());
+        desc->getter = JS_UNDEFINED;
+        desc->setter = JS_UNDEFINED;
+    }
+    return 1;
+}
+static int qjsDatasetSetExotic(JSContext* ctx, JSValueConst obj, JSAtom atom,
+                               JSValueConst value, JSValueConst /*receiver*/, int /*flags*/) {
+    auto* p = qjsDatasetPriv(obj);
+    JsHost* host = qjsHost(ctx);
+    if (!p || !host) return 0;
+    DomNode* n = host->dom.get(p->nodeId);
+    if (!n) return 0;
+    const char* cname = JS_AtomToCString(ctx, atom);
+    if (!cname) return 0;
+    std::string key(cname);
+    JS_FreeCString(ctx, cname);
+    domSetAttr(*n, "data-" + cssCamelToKebab(key), jsToUtf8(ctx, value));
+    host->domDirty = true;
+    return 1;
+}
+static JSValue qjsElGetDataset(JSContext* ctx, JSValueConst this_val, int, JSValueConst*) {
+    int nid = qjsElNodeId(this_val);
+    JSValue obj = JS_NewObjectClass(ctx, g_qjsDatasetClassId);
+    if (JS_IsException(obj)) return obj;
+    auto* p = new QjsDatasetPriv();
+    p->nodeId = nid;
+    JS_SetOpaque(obj, p);
+    return obj;
+}
+static JSValue qjsElMatches(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0 || argc < 1) return JS_FALSE;
+    return domElementMatches(host->dom, nid, jsToUtf8(ctx, argv[0])) ? JS_TRUE : JS_FALSE;
+}
+static JSValue qjsElClosest(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    JsHost* host = qjsHost(ctx);
+    int nid = qjsElNodeId(this_val);
+    if (!host || nid < 0 || argc < 1) return JS_NULL;
+    int hit = domElementClosest(host->dom, nid, jsToUtf8(ctx, argv[0]));
+    return hit < 0 ? JS_NULL : qjsMakeElement(ctx, hit);
+}
+
 // -------------------- URLSearchParams (QuickJS) --------------------
 
 static QjsUspPriv* qjsUspPriv(JSValueConst v) {
@@ -4886,6 +5047,17 @@ static void qjsRegisterDomClasses(JSRuntime* rt) {
         def.finalizer = qjsUspFinalizer;
         JS_NewClass(rt, g_qjsUspClassId, &def);
     }
+    if (g_qjsDatasetClassId == 0) {
+        JS_NewClassID(&g_qjsDatasetClassId);
+        static JSClassExoticMethods exotic{};
+        exotic.get_own_property = qjsDatasetGetOwn;
+        exotic.set_property = qjsDatasetSetExotic;
+        JSClassDef def{};
+        def.class_name = "DOMStringMap";
+        def.finalizer = qjsDatasetFinalizer;
+        def.exotic = &exotic;
+        JS_NewClass(rt, g_qjsDatasetClassId, &def);
+    }
 }
 
 static void qjsDefineAccessor(JSContext* ctx, JSValueConst proto, const char* name,
@@ -4924,7 +5096,10 @@ static void qjsSetupDomProtos(JSContext* ctx) {
     JS_SetPropertyStr(ctx, elProto, "cloneNode", JS_NewCFunction(ctx, qjsElCloneNode, "cloneNode", 1));
     JS_SetPropertyStr(ctx, elProto, "hasAttribute", JS_NewCFunction(ctx, qjsElHasAttribute, "hasAttribute", 1));
     JS_SetPropertyStr(ctx, elProto, "removeAttribute", JS_NewCFunction(ctx, qjsElRemoveAttribute, "removeAttribute", 1));
+    JS_SetPropertyStr(ctx, elProto, "matches", JS_NewCFunction(ctx, qjsElMatches, "matches", 1));
+    JS_SetPropertyStr(ctx, elProto, "closest", JS_NewCFunction(ctx, qjsElClosest, "closest", 1));
     qjsDefineAccessor(ctx, elProto, "id", qjsElGetId, qjsElSetId);
+    qjsDefineAccessor(ctx, elProto, "dataset", qjsElGetDataset, nullptr);
     qjsDefineAccessor(ctx, elProto, "className", qjsElGetClassName, qjsElSetClassName);
     qjsDefineAccessor(ctx, elProto, "classList", qjsElGetClassList, nullptr);
     qjsDefineAccessor(ctx, elProto, "childNodes", qjsElGetChildNodes, nullptr);
@@ -5399,14 +5574,23 @@ static void jsDispatchEventSimple(JSContext* ctx, const std::string& key, JSValu
     if (it == host->listeners.end()) return;
 
     QjsEventPriv* ep = qjsEvtPriv(evt); // may be null for plain-object events
+    // `this` for an element listener is the element it's registered on
+    // (the event's currentTarget). For document/window listeners
+    // (currentTargetNodeId < 0) or plain-object events (no Event priv),
+    // leave `this` undefined. We own thisObj and must free it after the calls
+    // (JS_Call does not consume the this arg).
+    JSValue thisObj = JS_UNDEFINED;
+    if (ep && ep->currentTargetNodeId >= 0)
+        thisObj = qjsMakeElement(ctx, ep->currentTargetNodeId);
     std::vector<JSValue> fns = it->second; // entries stay owned by host->listeners
     for (auto& fn : fns) {
         JSValueConst args[1] = { evt };
-        JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 1, args);
+        JSValue r = JS_Call(ctx, fn, thisObj, 1, args);
         if (JS_IsException(r)) jsDumpException(ctx);
         JS_FreeValue(ctx, r);
         if (ep && ep->immediateStopped) break; // stopImmediatePropagation()
     }
+    JS_FreeValue(ctx, thisObj);
 }
 
 // Remove every listener stored under `key` whose function is identity-equal to
