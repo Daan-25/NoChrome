@@ -470,6 +470,94 @@ static void domClassRemove(DomNode& n, const std::string& cls) {
     domSetAttr(n, "class", out);
 }
 
+// -------------------- simple selector matching (Batch 5) --------------------
+// Match a single COMPOUND selector (no combinators) against one element.
+// Supports: tag, .class, #id, [attr], [attr=value], and concatenations of
+// those on one element (e.g. "div.box", ".a.b", "tag#id", "div[data-x=1]").
+// Returns false on text nodes, empty selectors, or any whitespace combinator.
+static bool domMatchCompound(const DomNode& n, const std::string& selRaw) {
+    if (n.type != DomNodeType::Element) return false;
+    std::string sel = trimCopy(selRaw);
+    if (sel.empty()) return false;
+    // A whitespace combinator (descendant) is not supported: bail false.
+    for (char c : sel) if (c == ' ' || c == '\t' || c == '\n' || c == '\r') return false;
+
+    size_t i = 0;
+    while (i < sel.size()) {
+        char c = sel[i];
+        if (c == '.') {                       // .class
+            size_t j = i + 1;
+            while (j < sel.size() && sel[j] != '.' && sel[j] != '#' && sel[j] != '[') j++;
+            std::string cls = toLowerCopy(sel.substr(i + 1, j - (i + 1)));
+            if (cls.empty() || !domClassContains(n, cls)) return false;
+            i = j;
+        } else if (c == '#') {                 // #id
+            size_t j = i + 1;
+            while (j < sel.size() && sel[j] != '.' && sel[j] != '#' && sel[j] != '[') j++;
+            std::string id = sel.substr(i + 1, j - (i + 1));
+            if (id.empty() || domGetAttr(n, "id") != id) return false;
+            i = j;
+        } else if (c == '[') {                 // [attr] or [attr=value]
+            size_t close = sel.find(']', i);
+            if (close == std::string::npos) return false;
+            std::string body = trimCopy(sel.substr(i + 1, close - (i + 1)));
+            size_t eq = body.find('=');
+            if (eq == std::string::npos) {     // [attr]
+                std::string attr = toLowerCopy(trimCopy(body));
+                if (attr.empty() || domGetAttrPtr(n, attr) == nullptr) return false;
+            } else {                           // [attr=value]
+                std::string attr = toLowerCopy(trimCopy(body.substr(0, eq)));
+                std::string val  = trimCopy(body.substr(eq + 1));
+                if (val.size() >= 2 && (val.front() == '"' || val.front() == '\'') &&
+                    val.back() == val.front())
+                    val = val.substr(1, val.size() - 2);
+                const std::string* p = domGetAttrPtr(n, attr);
+                if (attr.empty() || !p || *p != val) return false;
+            }
+            i = close + 1;
+        } else {                               // tag
+            size_t j = i;
+            while (j < sel.size() && sel[j] != '.' && sel[j] != '#' && sel[j] != '[') j++;
+            std::string tag = toLowerCopy(sel.substr(i, j - i));
+            if (!tag.empty() && tag != "*") {
+                std::string nt = n.tag.empty() ? std::string("div") : n.tag;
+                if (nt != tag) return false;
+            }
+            i = j;
+        }
+    }
+    return true;
+}
+
+// element.matches: allow a comma-separated selector list (match-any). Each
+// comma group is a single compound selector (see domMatchCompound).
+static bool domElementMatches(const DomTree& dom, int nodeId, const std::string& selector) {
+    const DomNode* n = dom.get(nodeId);
+    if (!n) return false;
+    size_t i = 0;
+    while (i <= selector.size()) {
+        size_t comma = selector.find(',', i);
+        std::string part = selector.substr(i, (comma == std::string::npos ? selector.size() : comma) - i);
+        if (domMatchCompound(*n, part)) return true;
+        if (comma == std::string::npos) break;
+        i = comma + 1;
+    }
+    return false;
+}
+
+// element.closest: walk from nodeId up through parents (including self),
+// returning the first matching node id, or -1.
+static int domElementClosest(const DomTree& dom, int nodeId, const std::string& selector) {
+    int cur = nodeId;
+    while (cur >= 0) {
+        const DomNode* n = dom.get(cur);
+        if (!n) break;
+        if (n->type == DomNodeType::Element && domElementMatches(dom, cur, selector)) return cur;
+        cur = n->parent;
+    }
+    return -1;
+}
+
 // JS style properties are camelCase (backgroundColor); CSS is kebab
 // (background-color). Convert for storage in the inline "style" attribute.
 static std::string cssCamelToKebab(const std::string& s) {
