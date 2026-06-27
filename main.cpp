@@ -1489,6 +1489,22 @@ static bool looksLikeHtmlNotJs(const std::string& code) {
     return !t.empty() && t[0] == '<' && t.compare(0, 4, "<!--") != 0;
 }
 
+// JS prelude installed (per page) on both backends right after document is set
+// up. Fills in commonly-used globals that would otherwise be ReferenceErrors;
+// stubs where a faithful implementation would need layout/threads we don't have.
+static const char kJsPrelude[] =
+    "function queueMicrotask(f){Promise.resolve().then(f);}"
+    "function matchMedia(q){return{media:q,matches:false,onchange:null,"
+    "addListener:function(){},removeListener:function(){},"
+    "addEventListener:function(){},removeEventListener:function(){}};}"
+    "var history={length:1,scrollRestoration:'auto',state:null,"
+    "pushState:function(s,t,u){history.state=s;},"
+    "replaceState:function(s,t,u){history.state=s;},"
+    "back:function(){},forward:function(){},go:function(){}};"
+    "function MutationObserver(c){this.observe=function(){};"
+    "this.disconnect=function(){};this.takeRecords=function(){return[];};}"
+    "try{document.readyState='complete';}catch(e){}";
+
 // -------------------- Page title helper --------------------
 
 static std::string extractTitleFromHtmlSimple(const std::string& html) {
@@ -3659,15 +3675,26 @@ static void jsSetupPageGlobals(JSContextRef ctx, const std::string& url, const s
         JSStringRelease(s);
     }
 
-    // location.href
+    // location: href + URL components (protocol/host/hostname/port/origin/pathname/search/hash)
     JSObjectRef location = JSObjectMake(ctx, nullptr, nullptr);
     {
-        JSStringRef k = JSStringCreateWithUTF8CString("href");
-        JSStringRef v = JSStringCreateWithUTF8CString(url.c_str());
-        JSValueRef vStr = JSValueMakeString(ctx, v);
-        JSObjectSetProperty(ctx, location, k, vStr, kJSPropertyAttributeNone, nullptr);
-        JSStringRelease(v);
-        JSStringRelease(k);
+        UrlParts lp = decomposeUrl(url);
+        auto setStr = [&](const char* key, const std::string& val) {
+            JSStringRef k = JSStringCreateWithUTF8CString(key);
+            JSStringRef v = JSStringCreateWithUTF8CString(val.c_str());
+            JSObjectSetProperty(ctx, location, k, JSValueMakeString(ctx, v), kJSPropertyAttributeNone, nullptr);
+            JSStringRelease(v);
+            JSStringRelease(k);
+        };
+        setStr("href", lp.valid ? lp.href : url);
+        setStr("protocol", lp.protocol);
+        setStr("host", lp.host);
+        setStr("hostname", lp.hostname);
+        setStr("port", lp.port);
+        setStr("origin", lp.origin);
+        setStr("pathname", lp.pathname);
+        setStr("search", lp.search);
+        setStr("hash", lp.hash);
     }
     JSStringRef locName = JSStringCreateWithUTF8CString("location");
     JSObjectSetProperty(ctx, global, locName, location, kJSPropertyAttributeNone, nullptr);
@@ -3763,6 +3790,11 @@ static void jsSetupPageGlobals(JSContextRef ctx, const std::string& url, const s
         JSStringRef s = JSStringCreateWithUTF8CString(kImageShim);
         JSEvaluateScript(ctx, s, nullptr, nullptr, 1, nullptr);
         JSStringRelease(s);
+    }
+    {
+        JSStringRef p = JSStringCreateWithUTF8CString(kJsPrelude);
+        JSEvaluateScript(ctx, p, nullptr, nullptr, 1, nullptr);
+        JSStringRelease(p);
     }
 
     // localStorage / sessionStorage: one backed Storage object each, pointing at
@@ -5890,7 +5922,18 @@ static void jsSetupPageGlobals(JSContext* ctx, const std::string& url, const std
     JS_SetPropertyStr(ctx, global, "document", document);
 
     JSValue location = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, location, "href", JS_NewString(ctx, url.c_str()));
+    {
+        UrlParts lp = decomposeUrl(url);
+        JS_SetPropertyStr(ctx, location, "href", JS_NewString(ctx, (lp.valid ? lp.href : url).c_str()));
+        JS_SetPropertyStr(ctx, location, "protocol", JS_NewString(ctx, lp.protocol.c_str()));
+        JS_SetPropertyStr(ctx, location, "host", JS_NewString(ctx, lp.host.c_str()));
+        JS_SetPropertyStr(ctx, location, "hostname", JS_NewString(ctx, lp.hostname.c_str()));
+        JS_SetPropertyStr(ctx, location, "port", JS_NewString(ctx, lp.port.c_str()));
+        JS_SetPropertyStr(ctx, location, "origin", JS_NewString(ctx, lp.origin.c_str()));
+        JS_SetPropertyStr(ctx, location, "pathname", JS_NewString(ctx, lp.pathname.c_str()));
+        JS_SetPropertyStr(ctx, location, "search", JS_NewString(ctx, lp.search.c_str()));
+        JS_SetPropertyStr(ctx, location, "hash", JS_NewString(ctx, lp.hash.c_str()));
+    }
     JS_SetPropertyStr(ctx, global, "location", location);
 
     JSValue navigator = JS_NewObject(ctx);
@@ -5920,6 +5963,9 @@ static void jsSetupPageGlobals(JSContext* ctx, const std::string& url, const std
         "if(h!=null)e.setAttribute('height',h);return e;}";
     JSValue imgRes = JS_Eval(ctx, kImageShim, sizeof(kImageShim) - 1, "<builtin>", JS_EVAL_TYPE_GLOBAL);
     JS_FreeValue(ctx, imgRes);
+
+    JSValue prelRes = JS_Eval(ctx, kJsPrelude, sizeof(kJsPrelude) - 1, "<builtin>", JS_EVAL_TYPE_GLOBAL);
+    JS_FreeValue(ctx, prelRes);
 
     // localStorage / sessionStorage: backed Storage objects over the process
     // stores (persist across navigation).
