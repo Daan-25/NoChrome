@@ -157,13 +157,24 @@ static Url parseUrl(const std::string& input) {
     return u;
 }
 
+static std::string urlEncode(const std::string& s); // defined later (shared)
+
 static std::string normalizeUserUrl(std::string s) {
     s = trimCopy(s);
     if (s.empty()) return "http://example.com/";
 
-    if (s.find("://") == std::string::npos) {
-        s = "http://" + s;
+    bool hasScheme   = s.find("://") != std::string::npos;
+    bool hasSpace    = s.find(' ') != std::string::npos;
+    bool hasDot      = s.find('.') != std::string::npos;
+    bool isLocalhost = (s.rfind("localhost", 0) == 0);
+
+    // Omnibox: input that isn't clearly a URL becomes a web search. Google's
+    // results page can't render (its SPA needs a full browser); DuckDuckGo's
+    // no-JS endpoint returns server-rendered HTML that NoChrome can display.
+    if (!hasScheme && (hasSpace || (!hasDot && !isLocalhost))) {
+        return "https://lite.duckduckgo.com/lite/?q=" + urlEncode(s);
     }
+    if (!hasScheme) s = "http://" + s;
     return s;
 }
 
